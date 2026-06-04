@@ -1,0 +1,28 @@
+# Build/log clutter
+obj/
+*.pdb
+*.ilk
+*.user
+*.suo
+.vs/
+
+# Keep the intentionally archived runnable EXE
+!build/
+!build/MichStartupMaster.exe
+
+# Runtime-generated logs/temp
+*.log
+*.tmp
+*.cache
+
+# Secret/config safety
+.env
+*.key
+*.pem
+secrets.*
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
