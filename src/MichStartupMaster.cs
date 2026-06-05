@@ -28,6 +28,7 @@ namespace MichStartupMaster
         [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
         public static readonly string DisabledStore = Path.Combine(AppData, "disabled-items.tsv");
+        public static readonly string ProtectedDisabledStore = Path.Combine(AppData, "protected-disabled-items.tsv");
         public static readonly string DisabledStartupFolder = Path.Combine(AppData, "DisabledStartupFolderItems");
         public static readonly string ManagedTaskRoot = @"\MichStartupMaster\";
         private static Icon _appIcon;
@@ -68,6 +69,8 @@ namespace MichStartupMaster
                 if (cmd == "--add-test-task-normal") return CliAddTestTask(args, false);
                 if (cmd == "--remove-task") return CliRemoveTask(args);
                 if (cmd == "--ui-contract") { Console.WriteLine(MainForm.UiContractJson()); return 0; }
+                if (cmd == "--protect-disabled") { Console.WriteLine(ProtectedDisabledService.ProtectCurrentDisabled()); return 0; }
+                if (cmd == "--enforce-disabled") { Console.WriteLine(ProtectedDisabledService.EnforceProtected()); return 0; }
                 if (cmd == "--toggle-popup") return CliTogglePopup(args);
                 if (cmd == "--tray-run") { TrayRunner.Run(args.Skip(1).ToArray()); return 0; }
                 if (cmd == "--start-in-tray")
@@ -315,10 +318,12 @@ foreach($t in Get-ScheduledTask){
             else if (item.Id.StartsWith("folder|")) DisableStartupFolder(item);
             else if (item.Id.StartsWith("task|")) RunChecked("schtasks.exe", "/Change /TN " + Q(item.Location) + " /Disable");
             else throw new InvalidOperationException("Unsupported item: " + item.Id);
+            ProtectedDisabledService.Protect(item);
         }
 
         public static void Enable(StartupItem item)
         {
+            ProtectedDisabledService.Unprotect(item);
             if (item.Id.StartsWith("disabled|reg|")) RestoreRegistry(item);
             else if (item.Id.StartsWith("disabled|folder|")) RestoreStartupFolder(item);
             else if (item.Id.StartsWith("task|")) RunChecked("schtasks.exe", "/Change /TN " + Q(item.Location) + " /Enable");
@@ -596,6 +601,120 @@ foreach($t in Get-ScheduledTask){
         private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
     }
 
+    internal static class ProtectedDisabledService
+    {
+        private static string Key(StartupItem item)
+        {
+            if (item == null) return "";
+            if (item.Id.StartsWith("disabled|reg|")) return "reg|" + item.Scope + "|" + (item.Status ?? "").Split('\t')[0];
+            if (item.Id.StartsWith("reg|")) return item.Id;
+            if (item.Id.StartsWith("disabled|folder|")) return "folder|" + item.Scope + "|" + item.Status;
+            if (item.Id.StartsWith("folder|")) return item.Id;
+            if (item.Id.StartsWith("task|")) return "task|" + item.Location;
+            return item.Id;
+        }
+
+        public static void Protect(StartupItem item)
+        {
+            if (item == null) return;
+            string key = Key(item);
+            if (string.IsNullOrWhiteSpace(key)) return;
+            Directory.CreateDirectory(Program.AppData);
+            var rows = LoadRows().Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList();
+            rows.Add(Row.FromItem(key, item));
+            SaveRows(rows);
+        }
+
+        public static void Unprotect(StartupItem item)
+        {
+            string key = Key(item);
+            if (string.IsNullOrWhiteSpace(key) || !File.Exists(Program.ProtectedDisabledStore)) return;
+            SaveRows(LoadRows().Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList());
+        }
+
+        public static string ProtectCurrentDisabled()
+        {
+            int count = 0;
+            foreach (var item in StartupService.ScanAll().Where(x => !x.Enabled && !x.Id.StartsWith("error|"))) { Protect(item); count++; }
+            return "PROTECT_DISABLED count=" + count + " store=" + Program.ProtectedDisabledStore;
+        }
+
+        public static string EnforceProtected()
+        {
+            int disabled = 0, failures = 0;
+            foreach (var r in LoadRows())
+            {
+                try { if (EnforceRow(r)) disabled++; }
+                catch { failures++; }
+            }
+            return "ENFORCE_DISABLED protected=" + LoadRows().Count + " actions=" + disabled + " failures=" + failures;
+        }
+
+        private static bool EnforceRow(Row r)
+        {
+            if (r.Key.StartsWith("task|", StringComparison.OrdinalIgnoreCase))
+            {
+                RunHidden("schtasks.exe", "/Change /TN " + Q(r.Location) + " /Disable");
+                return true;
+            }
+            if (r.Key.StartsWith("reg|", StringComparison.OrdinalIgnoreCase) || r.Type == "Registry Run")
+            {
+                string valueName = (r.Status ?? "").Split('\t')[0];
+                if (string.IsNullOrWhiteSpace(valueName)) valueName = r.Name;
+                RegistryKey root = (r.Scope ?? "").Equals("Machine", StringComparison.OrdinalIgnoreCase) ? Registry.LocalMachine : Registry.CurrentUser;
+                using (var key = root.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
+                {
+                    if (key != null && key.GetValueNames().Any(n => string.Equals(n, valueName, StringComparison.OrdinalIgnoreCase))) { key.DeleteValue(valueName, false); return true; }
+                }
+                return false;
+            }
+            if (r.Key.StartsWith("folder|", StringComparison.OrdinalIgnoreCase) || r.Type == "Startup Folder")
+            {
+                string original = !string.IsNullOrWhiteSpace(r.Status) ? r.Status : r.Command;
+                if (!string.IsNullOrWhiteSpace(original) && File.Exists(original))
+                {
+                    Directory.CreateDirectory(Program.DisabledStartupFolder);
+                    string dest = Path.Combine(Program.DisabledStartupFolder, Path.GetFileName(original) + ".protected." + DateTime.Now.Ticks + ".disabled");
+                    File.Move(original, dest);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static List<Row> LoadRows()
+        {
+            var list = new List<Row>();
+            if (!File.Exists(Program.ProtectedDisabledStore)) return list;
+            foreach (var line in File.ReadAllLines(Program.ProtectedDisabledStore))
+            {
+                var p = line.Split('\t'); if (p.Length < 8) continue;
+                list.Add(new Row { Key = UnB64(p[0]), Id = UnB64(p[1]), Type = UnB64(p[2]), Name = UnB64(p[3]), Scope = UnB64(p[4]), Command = UnB64(p[5]), Location = UnB64(p[6]), Status = UnB64(p[7]) });
+            }
+            return list;
+        }
+
+        private static void SaveRows(List<Row> rows)
+        {
+            Directory.CreateDirectory(Program.AppData);
+            File.WriteAllLines(Program.ProtectedDisabledStore, rows.Select(r => string.Join("\t", new[] { B64(r.Key), B64(r.Id), B64(r.Type), B64(r.Name), B64(r.Scope), B64(r.Command), B64(r.Location), B64(r.Status) })), Encoding.UTF8);
+        }
+
+        private static void RunHidden(string exe, string args)
+        {
+            var psi = new ProcessStartInfo(exe, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            using (var p = Process.Start(psi)) { p.WaitForExit(15000); }
+        }
+        private static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "\\\"") + "\""; }
+        private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
+        private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
+        private sealed class Row
+        {
+            public string Key, Id, Type, Name, Scope, Command, Location, Status;
+            public static Row FromItem(string key, StartupItem item) { return new Row { Key = key, Id = item.Id, Type = item.Source, Name = item.Name, Scope = item.Scope, Command = item.Command, Location = item.Location, Status = item.Status }; }
+        }
+    }
+
     internal static class TrayRunner
     {
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -670,6 +789,7 @@ foreach($t in Get-ScheduledTask){
         private Label _summary, _visibleValue, _enabledValue, _disabledValue, _reviewValue, _managedValue, _hint;
         private Button _refresh, _disable, _enable, _add, _deleteManaged, _clearSearch;
         private NotifyIcon _tray;
+        private Timer _guardTimer;
         private bool _reallyExit;
         private readonly bool _startInTray;
         private readonly Color Bg = Color.FromArgb(8, 12, 26), Surface = Color.FromArgb(17, 24, 44), Surface2 = Color.FromArgb(24, 33, 58), Accent = Color.FromArgb(99, 102, 241), TextMain = Color.FromArgb(245, 247, 255), Muted = Color.FromArgb(156, 166, 195), Good = Color.FromArgb(52, 211, 153), Danger = Color.FromArgb(248, 113, 113), Warn = Color.FromArgb(251, 191, 36);
@@ -686,7 +806,10 @@ foreach($t in Get-ScheduledTask){
             Width = 1320; Height = 860; MinimumSize = new Size(1060, 720);
             BackColor = Bg; Font = new Font("Segoe UI", 10f); DoubleBuffered = true; Icon = Program.AppIcon;
             BuildUi(); BuildTray();
-            Load += (s, e) => RefreshItems();
+            Load += (s, e) => { ProtectedDisabledService.EnforceProtected(); RefreshItems(); ProtectedDisabledService.ProtectCurrentDisabled(); };
+            _guardTimer = new Timer { Interval = 30000 };
+            _guardTimer.Tick += (s, e) => ProtectedDisabledService.EnforceProtected();
+            _guardTimer.Start();
             FormClosing += OnClosingToTray;
             Resize += (s, e) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
             Shown += (s, e) => { if (_startInTray) BeginInvoke(new Action(HideToTray)); };
