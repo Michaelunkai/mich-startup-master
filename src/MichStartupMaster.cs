@@ -18,7 +18,15 @@ namespace MichStartupMaster
     internal static class Program
     {
         public static readonly string AppName = "MichStartupMaster";
+        public static readonly string AppUserModelId = "Mich.MichStartupMaster";
         public static readonly string AppData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppName);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int SetCurrentProcessExplicitAppUserModelID(string appID);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+        [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
         public static readonly string DisabledStore = Path.Combine(AppData, "disabled-items.tsv");
         public static readonly string DisabledStartupFolder = Path.Combine(AppData, "DisabledStartupFolderItems");
         public static readonly string ManagedTaskRoot = @"\MichStartupMaster\";
@@ -48,6 +56,7 @@ namespace MichStartupMaster
         [STAThread]
         private static int Main(string[] args)
         {
+            SetCurrentProcessExplicitAppUserModelID(AppUserModelId);
             Directory.CreateDirectory(AppData);
             if (args.Length > 0)
             {
@@ -58,7 +67,21 @@ namespace MichStartupMaster
                 if (cmd == "--add-test-task-tray") return CliAddTestTask(args, true);
                 if (cmd == "--add-test-task-normal") return CliAddTestTask(args, false);
                 if (cmd == "--remove-task") return CliRemoveTask(args);
+                if (cmd == "--ui-contract") { Console.WriteLine(MainForm.UiContractJson()); return 0; }
+                if (cmd == "--toggle-popup") return CliTogglePopup(args);
                 if (cmd == "--tray-run") { TrayRunner.Run(args.Skip(1).ToArray()); return 0; }
+                if (cmd == "--start-in-tray")
+                {
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    bool createdNew;
+                    using (var singleInstance = new System.Threading.Mutex(true, @"Local\MichStartupMaster.MainInstance", out createdNew))
+                    {
+                        if (!createdNew) return 0;
+                        Application.Run(new MainForm(true));
+                    }
+                    return 0;
+                }
                 if (cmd == "--show-add-dialog")
                 {
                     Application.EnableVisualStyles();
@@ -70,8 +93,28 @@ namespace MichStartupMaster
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
+            bool createdMain;
+            using (var singleInstance = new System.Threading.Mutex(true, @"Local\MichStartupMaster.MainInstance", out createdMain))
+            {
+                if (!createdMain)
+                {
+                    TryShowExistingMainWindow();
+                    return 0;
+                }
+                Application.Run(new MainForm());
+            }
             return 0;
+        }
+
+        private static void TryShowExistingMainWindow()
+        {
+            IntPtr h = FindWindow(null, "Mich Startup Master — Windows Boot Control");
+            if (h == IntPtr.Zero) h = FindWindow(null, "Mich Startup Master - Windows Boot Control");
+            if (h != IntPtr.Zero)
+            {
+                ShowWindowAsync(h, 9);
+                SetForegroundWindow(h);
+            }
         }
 
         private static int Smoke()
@@ -96,9 +139,21 @@ namespace MichStartupMaster
         {
             if (args.Length < 2) { Console.WriteLine("missing task name"); return 2; }
             StartupService.DeleteManagedTask(args[1]);
-            bool exists = StartupService.ScanAll().Any(x => x.Name == args[1]);
+            bool exists = StartupService.ScanAll().Any(x => x.Name == args[1] || x.Location == args[1]);
             Console.WriteLine("REMOVE_TASK " + args[1] + " exists=" + exists);
             return exists ? 3 : 0;
+        }
+
+        private static int CliTogglePopup(string[] args)
+        {
+            if (args.Length < 2) { Console.WriteLine("missing startup item name/location"); return 2; }
+            string key = args[1];
+            var item = StartupService.ScanAll().FirstOrDefault(x => x.Location.Equals(key, StringComparison.OrdinalIgnoreCase) || x.Name.Equals(key.TrimStart('\\'), StringComparison.OrdinalIgnoreCase));
+            if (item == null) { Console.WriteLine("startup item not found: " + key); return 4; }
+            StartupService.TogglePopupMode(item);
+            var updated = StartupService.ScanAll().FirstOrDefault(x => x.Location.Equals(item.Location, StringComparison.OrdinalIgnoreCase) || x.Name.Equals(item.Name, StringComparison.OrdinalIgnoreCase));
+            Console.WriteLine("TOGGLE_POPUP " + item.Location + " popup=" + (updated == null ? "changed" : updated.PopupLabel()));
+            return 0;
         }
     }
 
@@ -114,6 +169,16 @@ namespace MichStartupMaster
         public bool CanDisable;
         public bool IsManaged;
         public string Status;
+
+        public string PopupLabel()
+        {
+            return StartupService.CommandUsesTrayWrapper(Command) ? "Disabled" : "Enabled";
+        }
+
+        public bool PopupEnabled()
+        {
+            return PopupLabel() == "Enabled";
+        }
 
         public string RiskLabel()
         {
@@ -315,19 +380,29 @@ foreach($t in Get-ScheduledTask){
             if (trayMode)
             {
                 execute = Process.GetCurrentProcess().MainModule.FileName;
-                string payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(targetPath + "\n" + (arguments ?? "")));
-                actionArgs = "--tray-run " + payload;
+                if (IsSelfTarget(targetPath)) actionArgs = "--start-in-tray";
+                else
+                {
+                    string payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(targetPath + "\n" + (arguments ?? "")));
+                    actionArgs = "--tray-run " + payload;
+                }
             }
             else { execute = targetPath; actionArgs = arguments ?? ""; }
-            RegisterLogonTask(safeName, execute, actionArgs);
+            RegisterLogonTaskAt(Program.ManagedTaskRoot + safeName, execute, actionArgs);
             if (!noDelay) { /* Task Scheduler has no explicit Delay either way; this app always uses immediate logon triggers. */ }
         }
 
-        private static void RegisterLogonTask(string taskName, string execute, string arguments)
+        private static void RegisterLogonTaskAt(string fullTaskName, string execute, string arguments)
         {
+            string normalized = fullTaskName.StartsWith("\\") ? fullTaskName : Program.ManagedTaskRoot + fullTaskName.Trim('\\');
+            int split = normalized.LastIndexOf('\\');
+            string path = split >= 0 ? normalized.Substring(0, split + 1) : Program.ManagedTaskRoot;
+            string taskName = split >= 0 ? normalized.Substring(split + 1) : normalized.Trim('\\');
+            if (string.IsNullOrWhiteSpace(path)) path = Program.ManagedTaskRoot;
+            if (string.IsNullOrWhiteSpace(taskName)) throw new ArgumentException("Task name is required");
             string script =
                 "$ErrorActionPreference='Stop';" +
-                "$path='\\MichStartupMaster\\';" +
+                "$path='" + PsSingle(path) + "';" +
                 "$action=New-ScheduledTaskAction -Execute '" + PsSingle(execute) + "'" + (string.IsNullOrWhiteSpace(arguments) ? ";" : " -Argument '" + PsSingle(arguments) + "';") +
                 "$trigger=New-ScheduledTaskTrigger -AtLogOn;" +
                 "$principal=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited;" +
@@ -339,10 +414,112 @@ foreach($t in Get-ScheduledTask){
 
         private static string PsSingle(string value) { return (value ?? "").Replace("'", "''"); }
 
+        private static bool IsSelfTarget(string targetPath)
+        {
+            try
+            {
+                string self = Path.GetFullPath(Process.GetCurrentProcess().MainModule.FileName).TrimEnd('\\');
+                string target = Path.GetFullPath(targetPath ?? "").TrimEnd('\\');
+                return string.Equals(self, target, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
         public static void DeleteManagedTask(string nameOrTask)
         {
             string tn = nameOrTask.StartsWith("\\") ? nameOrTask : Program.ManagedTaskRoot + nameOrTask.Replace(Program.ManagedTaskRoot.Trim('\\'), "").Trim('\\');
             RunChecked("schtasks.exe", "/Delete /F /TN " + Q(tn));
+        }
+
+        public static bool CommandUsesTrayWrapper(string command)
+        {
+            return Regex.IsMatch(command ?? "", @"--tray-run\s+[A-Za-z0-9+/=]+|--start-in-tray\b", RegexOptions.IgnoreCase);
+        }
+
+        public static void TogglePopupMode(StartupItem item)
+        {
+            SetPopupMode(item, !item.PopupEnabled());
+        }
+
+        public static void SetPopupMode(StartupItem item, bool popupEnabled)
+        {
+            string target, arguments;
+            ResolveLaunchTarget(item, out target, out arguments);
+            string execute = popupEnabled ? target : Process.GetCurrentProcess().MainModule.FileName;
+            string actionArgs = popupEnabled ? (IsSelfTarget(target) ? "" : (arguments ?? "")) : (IsSelfTarget(target) ? "--start-in-tray" : "--tray-run " + Convert.ToBase64String(Encoding.UTF8.GetBytes(target + "\n" + (arguments ?? ""))));
+
+            if (item.Id.StartsWith("task|") && item.IsManaged)
+            {
+                RegisterLogonTaskAt(item.Location, execute, actionArgs);
+                return;
+            }
+
+            if (item.Enabled && item.CanDisable) Disable(item);
+            else if (item.Enabled && !item.CanDisable) throw new InvalidOperationException("This startup source is read-only here. Select its matching Registry Run, Startup Folder, or Scheduled Task row if Windows exposes one.");
+
+            AddManagedStartup(item.Name, target, arguments, !popupEnabled, true);
+        }
+
+        public static void ResolveLaunchTarget(StartupItem item, out string targetPath, out string arguments)
+        {
+            targetPath = ""; arguments = "";
+            if (item == null) throw new ArgumentException("No startup item selected");
+            string command = item.Command ?? "";
+            if (item.Source == "Startup Folder" && command.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+            {
+                ResolveShortcut(command, out targetPath, out arguments);
+                if (File.Exists(targetPath)) return;
+            }
+            if (TryDecodeTrayPayload(command, out targetPath, out arguments) && File.Exists(targetPath)) return;
+            if (!TrySplitCommand(command, out targetPath, out arguments)) throw new InvalidOperationException("Could not parse executable from command");
+            if (targetPath.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) ResolveShortcut(targetPath, out targetPath, out arguments);
+            if (!File.Exists(targetPath) || !targetPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) throw new FileNotFoundException("Resolved startup target is not a local .exe", targetPath);
+        }
+
+        private static bool TryDecodeTrayPayload(string command, out string targetPath, out string arguments)
+        {
+            targetPath = ""; arguments = "";
+            Match m = Regex.Match(command ?? "", @"--tray-run\s+(?<payload>[A-Za-z0-9+/=]+)", RegexOptions.IgnoreCase);
+            if (!m.Success) return false;
+            try
+            {
+                string decoded = Encoding.UTF8.GetString(Convert.FromBase64String(m.Groups["payload"].Value));
+                string[] lines = decoded.Split(new[] { '\n' }, 2);
+                targetPath = lines[0]; arguments = lines.Length > 1 ? lines[1] : "";
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool TrySplitCommand(string command, out string exe, out string args)
+        {
+            exe = ""; args = "";
+            command = (command ?? "").Trim();
+            if (command.Length == 0) return false;
+            if (command.StartsWith("\"", StringComparison.Ordinal))
+            {
+                int end = command.IndexOf('"', 1);
+                if (end > 1) { exe = command.Substring(1, end - 1); args = command.Substring(end + 1).Trim(); return true; }
+            }
+            Match m = Regex.Match(command, @"^(?<exe>.+?\.exe|.+?\.lnk)(?:\s+(?<args>.*))?$", RegexOptions.IgnoreCase);
+            if (m.Success) { exe = m.Groups["exe"].Value.Trim(); args = m.Groups["args"].Value.Trim(); return true; }
+            if (File.Exists(command)) { exe = command; args = ""; return true; }
+            return false;
+        }
+
+        private static void ResolveShortcut(string shortcutPath, out string targetPath, out string arguments)
+        {
+            targetPath = shortcutPath; arguments = "";
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) return;
+                dynamic shell = Activator.CreateInstance(shellType);
+                dynamic shortcut = shell.CreateShortcut(shortcutPath);
+                targetPath = Convert.ToString(shortcut.TargetPath ?? shortcutPath);
+                arguments = Convert.ToString(shortcut.Arguments ?? "");
+            }
+            catch { }
         }
 
         public static string ToJson(List<StartupItem> items)
@@ -351,7 +528,7 @@ foreach($t in Get-ScheduledTask){
             for (int i = 0; i < items.Count; i++)
             {
                 if (i > 0) sb.Append(','); var x = items[i];
-                sb.Append("{\"name\":\"").Append(Esc(x.Name)).Append("\",\"source\":\"").Append(Esc(x.Source)).Append("\",\"enabled\":").Append(x.Enabled ? "true" : "false").Append(",\"command\":\"").Append(Esc(x.Command)).Append("\"}");
+                sb.Append("{\"name\":\"").Append(Esc(x.Name)).Append("\",\"source\":\"").Append(Esc(x.Source)).Append("\",\"enabled\":").Append(x.Enabled ? "true" : "false").Append(",\"command\":\"").Append(Esc(x.Command)).Append("\",\"popup\":\"").Append(x.PopupLabel()).Append("\"}");
             }
             sb.Append("]"); return sb.ToString();
         }
@@ -421,6 +598,14 @@ foreach($t in Get-ScheduledTask){
 
     internal static class TrayRunner
     {
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+        private const int SW_HIDE = 0;
+        private const int SW_MINIMIZE = 6;
+
         public static void Run(string[] args)
         {
             if (args.Length < 1) return;
@@ -428,24 +613,52 @@ foreach($t in Get-ScheduledTask){
             try { decoded = Encoding.UTF8.GetString(Convert.FromBase64String(args[0])); }
             catch { return; }
             string[] lines = decoded.Split(new[] { '\n' }, 2);
-            string target = lines[0]; string targetArgs = lines.Length > 1 ? lines[1] : "";
-            Application.EnableVisualStyles();
-            var ctx = new ApplicationContext();
-            var icon = new NotifyIcon();
-            icon.Icon = Program.AppIcon;
-            icon.Text = "Mich Startup Master: " + Path.GetFileName(target);
-            icon.Visible = true;
-            icon.ContextMenu = new ContextMenu(new[] { new MenuItem("Open manager", (s, e) => Process.Start(Process.GetCurrentProcess().MainModule.FileName)), new MenuItem("Exit tray wrapper", (s, e) => { icon.Visible = false; icon.Dispose(); ctx.ExitThread(); }) });
+            string target = lines[0];
+            string targetArgs = lines.Length > 1 ? lines[1] : "";
             try
             {
                 string full = Path.GetFullPath(target);
-                if (!File.Exists(full) || !full.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) throw new FileNotFoundException("Tray mode target must be a local .exe", target);
-                var psi = new ProcessStartInfo(full, targetArgs) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Minimized };
-                Process.Start(psi);
-                icon.ShowBalloonTip(2500, "Startup launched quietly", Path.GetFileName(target) + " was started minimized from tray mode.", ToolTipIcon.Info);
+                if (!File.Exists(full) || !full.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return;
+                var psi = new ProcessStartInfo(full, targetArgs)
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    WorkingDirectory = Path.GetDirectoryName(full)
+                };
+                Process child = Process.Start(psi);
+                if (child != null) HideProcessWindows(child, TimeSpan.FromSeconds(30));
             }
-            catch (Exception ex) { icon.ShowBalloonTip(5000, "Startup launch failed", ex.Message, ToolTipIcon.Error); }
-            Application.Run(ctx);
+            catch { }
+        }
+
+        private static void HideProcessWindows(Process child, TimeSpan duration)
+        {
+            DateTime until = DateTime.UtcNow.Add(duration);
+            int pid = child.Id;
+            while (DateTime.UtcNow < until)
+            {
+                try { if (child.HasExited) return; child.Refresh(); } catch { return; }
+                HideWindowsForPid(pid);
+                System.Threading.Thread.Sleep(250);
+            }
+            HideWindowsForPid(pid);
+        }
+
+        private static void HideWindowsForPid(int pid)
+        {
+            EnumWindows((hWnd, lParam) =>
+            {
+                uint owner;
+                GetWindowThreadProcessId(hWnd, out owner);
+                if (owner == pid && IsWindowVisible(hWnd))
+                {
+                    ShowWindowAsync(hWnd, SW_HIDE);
+                    ShowWindowAsync(hWnd, SW_MINIMIZE);
+                    ShowWindowAsync(hWnd, SW_HIDE);
+                }
+                return true;
+            }, IntPtr.Zero);
         }
     }
 
@@ -457,16 +670,26 @@ foreach($t in Get-ScheduledTask){
         private Label _summary, _visibleValue, _enabledValue, _disabledValue, _reviewValue, _managedValue, _hint;
         private Button _refresh, _disable, _enable, _add, _deleteManaged, _clearSearch;
         private NotifyIcon _tray;
+        private bool _reallyExit;
+        private readonly bool _startInTray;
         private readonly Color Bg = Color.FromArgb(8, 12, 26), Surface = Color.FromArgb(17, 24, 44), Surface2 = Color.FromArgb(24, 33, 58), Accent = Color.FromArgb(99, 102, 241), TextMain = Color.FromArgb(245, 247, 255), Muted = Color.FromArgb(156, 166, 195), Good = Color.FromArgb(52, 211, 153), Danger = Color.FromArgb(248, 113, 113), Warn = Color.FromArgb(251, 191, 36);
 
-        public MainForm()
+        public static string UiContractJson()
         {
+            return "{\"columns\":[\"Status\",\"App / item\",\"Source\",\"Trust\",\"Location\",\"Popup\",\"Launch command\"],\"popupEnabledLabel\":\"Enabled\",\"popupDisabledLabel\":\"Disabled\",\"oneClickPopupToggle\":true,\"trayIcon\":true,\"trayDoubleClickOpens\":true,\"startInTrayArgument\":\"--start-in-tray\"}";
+        }
+
+        public MainForm(bool startInTray = false)
+        {
+            _startInTray = startInTray;
             Text = "Mich Startup Master — Windows Boot Control";
             Width = 1320; Height = 860; MinimumSize = new Size(1060, 720);
             BackColor = Bg; Font = new Font("Segoe UI", 10f); DoubleBuffered = true; Icon = Program.AppIcon;
             BuildUi(); BuildTray();
             Load += (s, e) => RefreshItems();
             FormClosing += OnClosingToTray;
+            Resize += (s, e) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
+            Shown += (s, e) => { if (_startInTray) BeginInvoke(new Action(HideToTray)); };
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -506,13 +729,13 @@ foreach($t in Get-ScheduledTask){
 
             var listCard = Card(new Rectangle(28, 382, Width - 72, Height - 438));
             listCard.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom; Controls.Add(listCard);
-            _hint = new Label { Text = "Select an item to enable, disable, or inspect its command. Review badges mark scripts, temp paths, terminals, or command shells.", ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI", 9.5f), Location = new Point(18, 12), AutoSize = true }; listCard.Controls.Add(_hint);
+            _hint = new Label { Text = "Popup shows whether startup can pop a window: Enabled = normal launch, Disabled = silent tray wrapper. Click the Popup value once to switch.", ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI", 9.5f), Location = new Point(18, 12), AutoSize = true }; listCard.Controls.Add(_hint);
             _list = new ListView { Location = new Point(18, 42), Size = new Size(listCard.Width - 36, listCard.Height - 60), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom, View = View.Details, FullRowSelect = true, BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(12, 18, 34), ForeColor = TextMain, Font = new Font("Segoe UI", 9.7f), HideSelection = false, OwnerDraw = true };
             _list.SmallImageList = new ImageList { ImageSize = new Size(1, 34) };
-            _list.Columns.Add("Status", 105); _list.Columns.Add("App / item", 250); _list.Columns.Add("Source", 150); _list.Columns.Add("Trust", 100); _list.Columns.Add("Launch command", 520); _list.Columns.Add("Location", 260);
+            _list.Columns.Add("Status", 105); _list.Columns.Add("App / item", 230); _list.Columns.Add("Source", 135); _list.Columns.Add("Trust", 85); _list.Columns.Add("Popup", 125); _list.Columns.Add("Location", 240); _list.Columns.Add("Launch command", 430);
             _list.DrawColumnHeader += (s, e) => { using (var b = new SolidBrush(Surface2)) e.Graphics.FillRectangle(b, e.Bounds); TextRenderer.DrawText(e.Graphics, e.Header.Text, new Font(Font, FontStyle.Bold), new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width, e.Bounds.Height), Color.White, TextFormatFlags.VerticalCenter | TextFormatFlags.Left); };
-            _list.DrawSubItem += DrawSubItem; _list.SelectedIndexChanged += (s, e) => UpdateButtons();
-            _list.Resize += (s, e) => { if (_list.Columns.Count > 4) _list.Columns[4].Width = Math.Max(360, _list.Width - 875); };
+            _list.DrawSubItem += DrawSubItem; _list.SelectedIndexChanged += (s, e) => UpdateButtons(); _list.MouseUp += ListMouseUpPopupToggle;
+            _list.Resize += (s, e) => { if (_list.Columns.Count > 6) _list.Columns[6].Width = Math.Max(300, _list.Width - 1030); };
             listCard.Controls.Add(_list);
         }
 
@@ -536,11 +759,32 @@ foreach($t in Get-ScheduledTask){
             var item = (StartupItem)e.Item.Tag; bool selected = e.Item.Selected;
             Color row = selected ? Color.FromArgb(52, 64, 116) : (e.ItemIndex % 2 == 0 ? Color.FromArgb(13, 20, 38) : Color.FromArgb(16, 24, 45));
             using (var b = new SolidBrush(row)) e.Graphics.FillRectangle(b, e.Bounds);
+            if (e.ColumnIndex == 4) { DrawPopupToggle(e.Graphics, e.Bounds, item); return; }
             Color c = TextMain; string text = e.SubItem.Text;
             if (e.ColumnIndex == 0) { c = item.Enabled ? Good : Danger; text = item.Enabled ? "● Enabled" : "● Disabled"; }
             if (e.ColumnIndex == 3) c = item.RiskLabel() == "Review" ? Warn : Good;
-            if (e.ColumnIndex == 4 || e.ColumnIndex == 5) c = Muted;
+            if (e.ColumnIndex == 5 || e.ColumnIndex == 6) c = Muted;
             TextRenderer.DrawText(e.Graphics, text, _list.Font, new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height), c, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.Left);
+        }
+
+        private void DrawPopupToggle(Graphics g, Rectangle bounds, StartupItem item)
+        {
+            bool popupEnabled = item.PopupEnabled();
+            Rectangle r = PopupButtonRect(bounds);
+            Color color = popupEnabled ? Warn : Good;
+            string text = popupEnabled ? "Enabled" : "Disabled";
+            using (var b = new SolidBrush(color)) g.FillRectangle(b, r);
+            using (var p = new Pen(Color.FromArgb(190, Color.White))) g.DrawRectangle(p, r);
+            TextRenderer.DrawText(g, text, new Font(_list.Font, FontStyle.Bold), r, Color.FromArgb(10, 14, 28), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        }
+
+        private Rectangle PopupButtonRect(Rectangle bounds)
+        {
+            int w = Math.Max(92, bounds.Width - 18);
+            int h = Math.Min(26, bounds.Height - 8);
+            int y = bounds.Y + (bounds.Height - h) / 2;
+            int x = bounds.X + Math.Max(6, (bounds.Width - w) / 2);
+            return new Rectangle(x, y, w, h);
         }
 
         private TextBox StyledTextBox() { return new TextBox { BorderStyle = BorderStyle.FixedSingle, BackColor = Color.FromArgb(10, 16, 31), ForeColor = Color.White, Font = new Font("Segoe UI", 11f), Height = 30 }; }
@@ -553,22 +797,66 @@ foreach($t in Get-ScheduledTask){
         private void BuildTray()
         {
             _tray = new NotifyIcon { Icon = Program.AppIcon, Text = "Mich Startup Master", Visible = true };
-            _tray.DoubleClick += (s, e) => { Show(); WindowState = FormWindowState.Normal; Activate(); };
-            _tray.ContextMenu = new ContextMenu(new[] { new MenuItem("Open Startup Master", (s, e) => { Show(); WindowState = FormWindowState.Normal; Activate(); }), new MenuItem("Refresh inventory", (s, e) => RefreshItems()), new MenuItem("Exit", (s, e) => { _tray.Visible = false; _tray.Dispose(); Application.Exit(); }) });
+            _tray.DoubleClick += (s, e) => OpenFromTray();
+            _tray.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left) OpenFromTray(); };
+            _tray.ContextMenu = new ContextMenu(new[] { new MenuItem("Open Startup Master", (s, e) => OpenFromTray()), new MenuItem("Refresh inventory", (s, e) => RefreshItems()), new MenuItem("Exit", (s, e) => { _reallyExit = true; if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } Application.Exit(); }) });
         }
-        private void OnClosingToTray(object sender, FormClosingEventArgs e) { if (_tray != null && _tray.Visible && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); _tray.ShowBalloonTip(1800, "Still running", "Startup Master is safely tucked into the system tray.", ToolTipIcon.Info); } }
+        private void OpenFromTray()
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired) { BeginInvoke(new Action(OpenFromTray)); return; }
+            ShowInTaskbar = true;
+            Show();
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            BringToFront();
+            Activate();
+            TopMost = true;
+            TopMost = false;
+        }
+        private void HideToTray()
+        {
+            if (_tray != null) _tray.Visible = true;
+            ShowInTaskbar = false;
+            Hide();
+        }
+        private void OnClosingToTray(object sender, FormClosingEventArgs e) { if (!_reallyExit && _tray != null && _tray.Visible && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; HideToTray(); } }
         private void RefreshItems() { Cursor = Cursors.WaitCursor; try { _items = StartupService.ScanAll(); RenderList(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Refresh failed", MessageBoxButtons.OK, MessageBoxIcon.Error); } finally { Cursor = Cursors.Default; } }
         private void RenderList()
         {
             string q = (_search.Text ?? "").Trim().ToLowerInvariant();
             var rows = _items.Where(x => string.IsNullOrEmpty(q) || (x.Name + " " + x.Command + " " + x.Source + " " + x.Location).ToLowerInvariant().Contains(q)).ToList();
-            _list.BeginUpdate(); _list.Items.Clear(); foreach (var x in rows) { var li = new ListViewItem(x.Enabled ? "Enabled" : "Disabled") { Tag = x }; li.SubItems.Add(x.Name); li.SubItems.Add(x.Source); li.SubItems.Add(x.RiskLabel()); li.SubItems.Add(x.Command); li.SubItems.Add(x.Location); _list.Items.Add(li); } _list.EndUpdate();
+            _list.BeginUpdate(); _list.Items.Clear(); foreach (var x in rows) { var li = new ListViewItem(x.Enabled ? "Enabled" : "Disabled") { Tag = x }; li.SubItems.Add(x.Name); li.SubItems.Add(x.Source); li.SubItems.Add(x.RiskLabel()); li.SubItems.Add(x.PopupLabel()); li.SubItems.Add(x.Location); li.SubItems.Add(x.Command); _list.Items.Add(li); } _list.EndUpdate();
             int review = rows.Count(x => x.RiskLabel() == "Review");
             _summary.Text = rows.Count + " visible • " + _items.Count(x => x.Enabled) + " enabled • " + _items.Count(x => !x.Enabled) + " disabled • " + _items.Count(x => x.IsManaged) + " managed";
             _visibleValue.Text = rows.Count.ToString(); _enabledValue.Text = _items.Count(x => x.Enabled).ToString(); _disabledValue.Text = _items.Count(x => !x.Enabled).ToString(); _reviewValue.Text = review.ToString(); _managedValue.Text = _items.Count(x => x.IsManaged).ToString();
-            _hint.Text = rows.Count == 0 ? "No startup items match this search. Clear the search to return to the full boot inventory." : "Select an item to enable, disable, or inspect its command. Review badges mark scripts, temp paths, terminals, or command shells.";
+            _hint.Text = rows.Count == 0 ? "No startup items match this search. Clear the search to return to the full boot inventory." : "Popup: Enabled means normal startup may show a window; Disabled means Startup Master's tray wrapper starts it quietly. Click a Popup cell once to switch.";
             UpdateButtons();
         }
+        private void ListMouseUpPopupToggle(object sender, MouseEventArgs e)
+        {
+            var hit = _list.HitTest(e.Location);
+            if (hit.Item == null || hit.SubItem == null) return;
+            int col = hit.Item.SubItems.IndexOf(hit.SubItem);
+            if (col != 4) return;
+            if (!PopupButtonRect(hit.SubItem.Bounds).Contains(e.Location)) return;
+            ToggleItemPopupState((StartupItem)hit.Item.Tag);
+        }
+
+        private void ToggleItemPopupState(StartupItem item)
+        {
+            try
+            {
+                bool wasEnabled = item.PopupEnabled();
+                StartupService.TogglePopupMode(item);
+                _hint.Text = item.Name + " popup is now " + (wasEnabled ? "Disabled — it will start through the silent tray wrapper." : "Enabled — it will start normally and may show a window.");
+                RefreshItems();
+            }
+            catch (Exception ex)
+            {
+                _hint.Text = "Could not change Popup for " + item.Name + ": " + ex.Message;
+            }
+        }
+
         private void UpdateButtons() { var x = Selected(); bool any = x != null; _disable.Enabled = any && x.Enabled; _enable.Enabled = any && !x.Enabled; _deleteManaged.Enabled = any && x.IsManaged && x.Source == "Scheduled Task"; }
         private StartupItem Selected() { return _list.SelectedItems.Count == 0 ? null : (StartupItem)_list.SelectedItems[0].Tag; }
         private void DisableSelected() { var x = Selected(); if (x == null) return; if (MessageBox.Show("Disable '" + x.Name + "' from Windows startup?", "Confirm disable", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return; try { StartupService.Disable(x); Toast("Disabled", x.Name + " will not run next boot."); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Disable failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); } }
@@ -583,7 +871,7 @@ foreach($t in Get-ScheduledTask){
                 catch (Exception ex) { MessageBox.Show(ex.Message, "Add failed", MessageBoxButtons.OK, MessageBoxIcon.Error); }
             }
         }
-        private void Toast(string title, string body) { if (_tray != null) _tray.ShowBalloonTip(2200, title, body, ToolTipIcon.Info); }
+        private void Toast(string title, string body) { _hint.Text = title + ": " + body; }
     }
 
     internal sealed class AddStartupForm : Form
