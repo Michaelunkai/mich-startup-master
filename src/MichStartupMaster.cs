@@ -22,6 +22,28 @@ namespace MichStartupMaster
         public static readonly string DisabledStore = Path.Combine(AppData, "disabled-items.tsv");
         public static readonly string DisabledStartupFolder = Path.Combine(AppData, "DisabledStartupFolderItems");
         public static readonly string ManagedTaskRoot = @"\MichStartupMaster\";
+        private static Icon _appIcon;
+
+        public static Icon AppIcon
+        {
+            get
+            {
+                if (_appIcon != null) return _appIcon;
+                try
+                {
+                    Icon extracted = Icon.ExtractAssociatedIcon(Process.GetCurrentProcess().MainModule.FileName);
+                    if (extracted != null)
+                    {
+                        _appIcon = (Icon)extracted.Clone();
+                        extracted.Dispose();
+                        return _appIcon;
+                    }
+                }
+                catch { }
+                _appIcon = (Icon)SystemIcons.Shield.Clone();
+                return _appIcon;
+            }
+        }
 
         [STAThread]
         private static int Main(string[] args)
@@ -32,9 +54,18 @@ namespace MichStartupMaster
                 string cmd = args[0].ToLowerInvariant();
                 if (cmd == "--smoke") return Smoke();
                 if (cmd == "--list") { Console.WriteLine(StartupService.ToJson(StartupService.ScanAll())); return 0; }
-                if (cmd == "--add-test-task") return CliAddTestTask(args);
+                if (cmd == "--add-test-task") return CliAddTestTask(args, true);
+                if (cmd == "--add-test-task-tray") return CliAddTestTask(args, true);
+                if (cmd == "--add-test-task-normal") return CliAddTestTask(args, false);
                 if (cmd == "--remove-task") return CliRemoveTask(args);
                 if (cmd == "--tray-run") { TrayRunner.Run(args.Skip(1).ToArray()); return 0; }
+                if (cmd == "--show-add-dialog")
+                {
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    using (var dialog = new AddStartupForm()) dialog.ShowDialog();
+                    return 0;
+                }
             }
 
             Application.EnableVisualStyles();
@@ -50,14 +81,14 @@ namespace MichStartupMaster
             return items.Count >= 0 ? 0 : 1;
         }
 
-        private static int CliAddTestTask(string[] args)
+        private static int CliAddTestTask(string[] args, bool trayMode)
         {
             string exe = Process.GetCurrentProcess().MainModule.FileName;
-            string name = "HermesSmoke-" + DateTime.Now.ToString("yyyyMMddHHmmss");
+            string name = (trayMode ? "HermesSmokeTray-" : "HermesSmokeNormal-") + DateTime.Now.ToString("yyyyMMddHHmmss");
             string target = args.Length > 1 ? args[1] : exe;
-            StartupService.AddManagedStartup(name, target, "--smoke", true, true);
+            StartupService.AddManagedStartup(name, target, "--smoke", trayMode, true);
             bool exists = StartupService.ScanAll().Any(x => x.Name.EndsWith(name, StringComparison.OrdinalIgnoreCase) && x.Source == "Scheduled Task" && x.Enabled);
-            Console.WriteLine("ADD_TEST_TASK " + name + " exists=" + exists);
+            Console.WriteLine("ADD_TEST_TASK " + name + " mode=" + (trayMode ? "tray" : "normal") + " exists=" + exists);
             return exists ? 0 : 2;
         }
 
@@ -393,19 +424,23 @@ foreach($t in Get-ScheduledTask){
         public static void Run(string[] args)
         {
             if (args.Length < 1) return;
-            string decoded = Encoding.UTF8.GetString(Convert.FromBase64String(args[0]));
+            string decoded;
+            try { decoded = Encoding.UTF8.GetString(Convert.FromBase64String(args[0])); }
+            catch { return; }
             string[] lines = decoded.Split(new[] { '\n' }, 2);
             string target = lines[0]; string targetArgs = lines.Length > 1 ? lines[1] : "";
             Application.EnableVisualStyles();
             var ctx = new ApplicationContext();
             var icon = new NotifyIcon();
-            icon.Icon = SystemIcons.Application;
+            icon.Icon = Program.AppIcon;
             icon.Text = "Mich Startup Master: " + Path.GetFileName(target);
             icon.Visible = true;
             icon.ContextMenu = new ContextMenu(new[] { new MenuItem("Open manager", (s, e) => Process.Start(Process.GetCurrentProcess().MainModule.FileName)), new MenuItem("Exit tray wrapper", (s, e) => { icon.Visible = false; icon.Dispose(); ctx.ExitThread(); }) });
             try
             {
-                var psi = new ProcessStartInfo(target, targetArgs) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Minimized };
+                string full = Path.GetFullPath(target);
+                if (!File.Exists(full) || !full.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) throw new FileNotFoundException("Tray mode target must be a local .exe", target);
+                var psi = new ProcessStartInfo(full, targetArgs) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Minimized };
                 Process.Start(psi);
                 icon.ShowBalloonTip(2500, "Startup launched quietly", Path.GetFileName(target) + " was started minimized from tray mode.", ToolTipIcon.Info);
             }
@@ -417,78 +452,134 @@ foreach($t in Get-ScheduledTask){
     internal sealed class MainForm : Form
     {
         private List<StartupItem> _items = new List<StartupItem>();
-        private ListView _list; private TextBox _search; private Label _summary; private Button _refresh; private Button _disable; private Button _enable; private Button _add; private Button _deleteManaged; private NotifyIcon _tray;
-        private readonly Color Bg = Color.FromArgb(10, 14, 28), Panel = Color.FromArgb(21, 28, 51), Panel2 = Color.FromArgb(29, 39, 70), Accent = Color.FromArgb(99, 102, 241), TextMain = Color.FromArgb(245, 247, 255), Muted = Color.FromArgb(156, 166, 195), Good = Color.FromArgb(52, 211, 153), Danger = Color.FromArgb(248, 113, 113);
+        private ListView _list;
+        private TextBox _search;
+        private Label _summary, _visibleValue, _enabledValue, _disabledValue, _reviewValue, _managedValue, _hint;
+        private Button _refresh, _disable, _enable, _add, _deleteManaged, _clearSearch;
+        private NotifyIcon _tray;
+        private readonly Color Bg = Color.FromArgb(8, 12, 26), Surface = Color.FromArgb(17, 24, 44), Surface2 = Color.FromArgb(24, 33, 58), Accent = Color.FromArgb(99, 102, 241), TextMain = Color.FromArgb(245, 247, 255), Muted = Color.FromArgb(156, 166, 195), Good = Color.FromArgb(52, 211, 153), Danger = Color.FromArgb(248, 113, 113), Warn = Color.FromArgb(251, 191, 36);
+
         public MainForm()
         {
-            Text = "Mich Startup Master — Windows Boot Control"; Width = 1180; Height = 760; MinimumSize = new Size(960, 620); BackColor = Bg; Font = new Font("Segoe UI", 10f); DoubleBuffered = true; Icon = SystemIcons.Shield;
-            BuildUi(); BuildTray(); Load += (s, e) => RefreshItems(); FormClosing += OnClosingToTray;
+            Text = "Mich Startup Master — Windows Boot Control";
+            Width = 1320; Height = 860; MinimumSize = new Size(1060, 720);
+            BackColor = Bg; Font = new Font("Segoe UI", 10f); DoubleBuffered = true; Icon = Program.AppIcon;
+            BuildUi(); BuildTray();
+            Load += (s, e) => RefreshItems();
+            FormClosing += OnClosingToTray;
         }
+
         protected override void OnPaint(PaintEventArgs e)
         {
-            using (var b = new LinearGradientBrush(ClientRectangle, Color.FromArgb(8, 12, 26), Color.FromArgb(30, 18, 62), 35f)) e.Graphics.FillRectangle(b, ClientRectangle);
-            using (var pen = new Pen(Color.FromArgb(40, 255, 255, 255))) e.Graphics.DrawLine(pen, 32, 132, Width - 48, 132);
+            using (var b = new LinearGradientBrush(ClientRectangle, Color.FromArgb(6, 10, 24), Color.FromArgb(36, 23, 72), 35f)) e.Graphics.FillRectangle(b, ClientRectangle);
+            using (var glow = new SolidBrush(Color.FromArgb(45, 99, 102, 241))) e.Graphics.FillEllipse(glow, Width - 360, -160, 520, 360);
             base.OnPaint(e);
         }
+
         private void BuildUi()
         {
-            var title = new Label { Text = "Every Windows boot item, one beautiful control room", ForeColor = TextMain, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 23f), AutoSize = true, Location = new Point(32, 24) };
-            var sub = new Label { Text = "Disable registry Run keys, Startup-folder entries, and logon scheduled tasks. Add zero-delay normal or tray-mode launches.", ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI", 11f), AutoSize = true, Location = new Point(36, 72) };
-            _summary = new Label { ForeColor = Color.White, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 11f), AutoSize = true, Location = new Point(36, 107) };
-            Controls.Add(title); Controls.Add(sub); Controls.Add(_summary);
-            _search = StyledTextBox("Search name, command, source..."); _search.Location = new Point(32, 150); _search.Width = 390; _search.TextChanged += (s, e) => RenderList(); Controls.Add(_search);
-            _refresh = Button("Refresh", Accent); _refresh.Location = new Point(438, 148); _refresh.Click += (s, e) => RefreshItems(); Controls.Add(_refresh);
-            _disable = Button("Disable selected", Danger); _disable.Location = new Point(548, 148); _disable.Click += (s, e) => DisableSelected(); Controls.Add(_disable);
-            _enable = Button("Enable selected", Good); _enable.Location = new Point(704, 148); _enable.Click += (s, e) => EnableSelected(); Controls.Add(_enable);
-            _add = Button("+ Add boot app", Accent); _add.Location = new Point(850, 148); _add.Click += (s, e) => AddBootApp(); Controls.Add(_add);
-            _deleteManaged = Button("Delete managed", Color.FromArgb(234, 179, 8)); _deleteManaged.Location = new Point(994, 148); _deleteManaged.Click += (s, e) => DeleteManaged(); Controls.Add(_deleteManaged);
-            _list = new ListView { Location = new Point(32, 204), Size = new Size(Width - 82, Height - 270), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom, View = View.Details, FullRowSelect = true, GridLines = false, BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(15, 21, 39), ForeColor = TextMain, Font = new Font("Segoe UI", 9.7f), HideSelection = false, OwnerDraw = true };
-            _list.Columns.Add("State", 85); _list.Columns.Add("Name", 230); _list.Columns.Add("Source", 140); _list.Columns.Add("Risk", 90); _list.Columns.Add("Command / target", 560); _list.Columns.Add("Location", 260);
-            _list.DrawColumnHeader += (s, e) => { using (var b = new SolidBrush(Panel2)) e.Graphics.FillRectangle(b, e.Bounds); TextRenderer.DrawText(e.Graphics, e.Header.Text, new Font(Font, FontStyle.Bold), e.Bounds, Color.White, TextFormatFlags.VerticalCenter | TextFormatFlags.Left); };
-            _list.DrawSubItem += DrawSubItem; _list.Resize += (s, e) => { if (_list.Columns.Count > 4) _list.Columns[4].Width = Math.Max(380, _list.Width - 845); };
-            Controls.Add(_list);
+            var hero = Card(new Rectangle(28, 24, Width - 72, 144));
+            hero.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            Controls.Add(hero);
+            var title = new Label { Text = "Startup Master", ForeColor = TextMain, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 28f), AutoSize = true, Location = new Point(24, 18) };
+            var sub = new Label { Text = "A beautiful control room for everything that runs when Windows starts — registry, folders, scheduled tasks, normal launch, or quiet tray launch.", ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI", 11.5f), AutoSize = false, Width = 820, Height = 44, Location = new Point(28, 68) };
+            _summary = new Label { ForeColor = Color.White, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 10.5f), AutoSize = true, Location = new Point(280, 112) };
+            hero.Controls.Add(title); hero.Controls.Add(sub); hero.Controls.Add(_summary);
+            _add = Button("＋ Add app: Normal or Tray", Accent, 230); _add.Location = new Point(28, 100); _add.Click += (s, e) => AddBootApp(); hero.Controls.Add(_add);
+            _refresh = Button("Refresh", Color.FromArgb(59, 130, 246), 120); _refresh.Location = new Point(hero.Width - 170, 92); _refresh.Anchor = AnchorStyles.Top | AnchorStyles.Right; _refresh.Click += (s, e) => RefreshItems(); hero.Controls.Add(_refresh);
+
+            int cardTop = 188, cardW = 184, gap = 14;
+            _visibleValue = MetricCard("Visible", "startup items in view", Color.FromArgb(129, 140, 248), 28 + (cardW + gap) * 0, cardTop, cardW);
+            _enabledValue = MetricCard("Enabled", "will run at boot", Good, 28 + (cardW + gap) * 1, cardTop, cardW);
+            _disabledValue = MetricCard("Disabled", "kept from startup", Danger, 28 + (cardW + gap) * 2, cardTop, cardW);
+            _reviewValue = MetricCard("Review", "commands to inspect", Warn, 28 + (cardW + gap) * 3, cardTop, cardW);
+            _managedValue = MetricCard("Managed", "created here", Accent, 28 + (cardW + gap) * 4, cardTop, cardW);
+
+            var toolbar = Card(new Rectangle(28, 292, Width - 72, 70));
+            toolbar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right; Controls.Add(toolbar);
+            var searchLabel = new Label { Text = "Search", ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 9f), Location = new Point(18, 8), AutoSize = true }; toolbar.Controls.Add(searchLabel);
+            _search = StyledTextBox(); _search.Location = new Point(18, 30); _search.Width = 410; _search.TextChanged += (s, e) => RenderList(); toolbar.Controls.Add(_search);
+            _clearSearch = Button("Clear", Surface2, 82); _clearSearch.Location = new Point(440, 26); _clearSearch.Height = 32; _clearSearch.Click += (s, e) => { _search.Text = ""; }; toolbar.Controls.Add(_clearSearch);
+            _disable = Button("Disable selected", Danger, 150); _disable.Location = new Point(toolbar.Width - 470, 18); _disable.Anchor = AnchorStyles.Top | AnchorStyles.Right; _disable.Click += (s, e) => DisableSelected(); toolbar.Controls.Add(_disable);
+            _enable = Button("Enable selected", Good, 145); _enable.Location = new Point(toolbar.Width - 310, 18); _enable.Anchor = AnchorStyles.Top | AnchorStyles.Right; _enable.Click += (s, e) => EnableSelected(); toolbar.Controls.Add(_enable);
+            _deleteManaged = Button("Delete managed", Color.FromArgb(234, 179, 8), 145); _deleteManaged.Location = new Point(toolbar.Width - 155, 18); _deleteManaged.Anchor = AnchorStyles.Top | AnchorStyles.Right; _deleteManaged.Click += (s, e) => DeleteManaged(); toolbar.Controls.Add(_deleteManaged);
+
+            var listCard = Card(new Rectangle(28, 382, Width - 72, Height - 438));
+            listCard.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom; Controls.Add(listCard);
+            _hint = new Label { Text = "Select an item to enable, disable, or inspect its command. Review badges mark scripts, temp paths, terminals, or command shells.", ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI", 9.5f), Location = new Point(18, 12), AutoSize = true }; listCard.Controls.Add(_hint);
+            _list = new ListView { Location = new Point(18, 42), Size = new Size(listCard.Width - 36, listCard.Height - 60), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom, View = View.Details, FullRowSelect = true, BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(12, 18, 34), ForeColor = TextMain, Font = new Font("Segoe UI", 9.7f), HideSelection = false, OwnerDraw = true };
+            _list.SmallImageList = new ImageList { ImageSize = new Size(1, 34) };
+            _list.Columns.Add("Status", 105); _list.Columns.Add("App / item", 250); _list.Columns.Add("Source", 150); _list.Columns.Add("Trust", 100); _list.Columns.Add("Launch command", 520); _list.Columns.Add("Location", 260);
+            _list.DrawColumnHeader += (s, e) => { using (var b = new SolidBrush(Surface2)) e.Graphics.FillRectangle(b, e.Bounds); TextRenderer.DrawText(e.Graphics, e.Header.Text, new Font(Font, FontStyle.Bold), new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width, e.Bounds.Height), Color.White, TextFormatFlags.VerticalCenter | TextFormatFlags.Left); };
+            _list.DrawSubItem += DrawSubItem; _list.SelectedIndexChanged += (s, e) => UpdateButtons();
+            _list.Resize += (s, e) => { if (_list.Columns.Count > 4) _list.Columns[4].Width = Math.Max(360, _list.Width - 875); };
+            listCard.Controls.Add(_list);
         }
+
+        private Panel Card(Rectangle bounds)
+        {
+            return new Panel { Bounds = bounds, BackColor = Color.FromArgb(220, Surface), BorderStyle = BorderStyle.FixedSingle };
+        }
+
+        private Label MetricCard(string title, string helper, Color accent, int x, int y, int w)
+        {
+            var card = Card(new Rectangle(x, y, w, 84)); card.Anchor = AnchorStyles.Top | AnchorStyles.Left; Controls.Add(card);
+            var stripe = new Panel { BackColor = accent, Location = new Point(0, 0), Size = new Size(5, 84) }; card.Controls.Add(stripe);
+            var value = new Label { Text = "0", ForeColor = TextMain, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 22f), Location = new Point(18, 8), AutoSize = true }; card.Controls.Add(value);
+            card.Controls.Add(new Label { Text = title, ForeColor = accent, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 9.5f), Location = new Point(20, 50), AutoSize = true });
+            card.Controls.Add(new Label { Text = helper, ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI", 8.5f), Location = new Point(20, 66), AutoSize = true });
+            return value;
+        }
+
         private void DrawSubItem(object sender, DrawListViewSubItemEventArgs e)
         {
             var item = (StartupItem)e.Item.Tag; bool selected = e.Item.Selected;
-            Color row = selected ? Color.FromArgb(52, 64, 116) : (e.ItemIndex % 2 == 0 ? Color.FromArgb(15, 21, 39) : Color.FromArgb(18, 25, 46));
+            Color row = selected ? Color.FromArgb(52, 64, 116) : (e.ItemIndex % 2 == 0 ? Color.FromArgb(13, 20, 38) : Color.FromArgb(16, 24, 45));
             using (var b = new SolidBrush(row)) e.Graphics.FillRectangle(b, e.Bounds);
-            Color c = e.ColumnIndex == 0 ? (item.Enabled ? Good : Danger) : (e.ColumnIndex == 3 && item.RiskLabel() == "Review" ? Color.FromArgb(251, 191, 36) : TextMain);
-            string text = e.SubItem.Text;
-            if (e.ColumnIndex == 0) text = item.Enabled ? "● Enabled" : "● Disabled";
-            TextRenderer.DrawText(e.Graphics, text, _list.Font, new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width - 10, e.Bounds.Height), c, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.Left);
+            Color c = TextMain; string text = e.SubItem.Text;
+            if (e.ColumnIndex == 0) { c = item.Enabled ? Good : Danger; text = item.Enabled ? "● Enabled" : "● Disabled"; }
+            if (e.ColumnIndex == 3) c = item.RiskLabel() == "Review" ? Warn : Good;
+            if (e.ColumnIndex == 4 || e.ColumnIndex == 5) c = Muted;
+            TextRenderer.DrawText(e.Graphics, text, _list.Font, new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height), c, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.Left);
         }
-        private TextBox StyledTextBox(string placeholder) { var t = new TextBox { BorderStyle = BorderStyle.FixedSingle, BackColor = Color.FromArgb(17, 24, 44), ForeColor = Color.White, Font = new Font("Segoe UI", 11f), Height = 32 }; return t; }
-        private Button Button(string text, Color color)
+
+        private TextBox StyledTextBox() { return new TextBox { BorderStyle = BorderStyle.FixedSingle, BackColor = Color.FromArgb(10, 16, 31), ForeColor = Color.White, Font = new Font("Segoe UI", 11f), Height = 30 }; }
+        private Button Button(string text, Color color, int width)
         {
-            var b = new Button { Text = text, Width = 130, Height = 38, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 9.5f), Cursor = Cursors.Hand };
-            b.FlatAppearance.BorderSize = 0; b.MouseEnter += (s, e) => b.BackColor = ControlPaint.Light(color, .12f); b.MouseLeave += (s, e) => b.BackColor = color; return b;
+            var b = new Button { Text = text, Width = width, Height = 40, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 9.5f), Cursor = Cursors.Hand };
+            b.FlatAppearance.BorderSize = 0; b.MouseEnter += (s, e) => b.BackColor = ControlPaint.Light(color, .10f); b.MouseLeave += (s, e) => b.BackColor = color; return b;
         }
+
         private void BuildTray()
         {
-            _tray = new NotifyIcon { Icon = SystemIcons.Shield, Text = "Mich Startup Master", Visible = true };
+            _tray = new NotifyIcon { Icon = Program.AppIcon, Text = "Mich Startup Master", Visible = true };
             _tray.DoubleClick += (s, e) => { Show(); WindowState = FormWindowState.Normal; Activate(); };
             _tray.ContextMenu = new ContextMenu(new[] { new MenuItem("Open Startup Master", (s, e) => { Show(); WindowState = FormWindowState.Normal; Activate(); }), new MenuItem("Refresh inventory", (s, e) => RefreshItems()), new MenuItem("Exit", (s, e) => { _tray.Visible = false; _tray.Dispose(); Application.Exit(); }) });
         }
-        private void OnClosingToTray(object sender, FormClosingEventArgs e) { if (_tray != null && _tray.Visible && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); _tray.ShowBalloonTip(1800, "Still running", "Startup Master is in the system tray.", ToolTipIcon.Info); } }
+        private void OnClosingToTray(object sender, FormClosingEventArgs e) { if (_tray != null && _tray.Visible && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); _tray.ShowBalloonTip(1800, "Still running", "Startup Master is safely tucked into the system tray.", ToolTipIcon.Info); } }
         private void RefreshItems() { Cursor = Cursors.WaitCursor; try { _items = StartupService.ScanAll(); RenderList(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Refresh failed", MessageBoxButtons.OK, MessageBoxIcon.Error); } finally { Cursor = Cursors.Default; } }
         private void RenderList()
         {
             string q = (_search.Text ?? "").Trim().ToLowerInvariant();
-            var rows = _items.Where(x => string.IsNullOrEmpty(q) || (x.Name + " " + x.Command + " " + x.Source).ToLowerInvariant().Contains(q)).ToList();
+            var rows = _items.Where(x => string.IsNullOrEmpty(q) || (x.Name + " " + x.Command + " " + x.Source + " " + x.Location).ToLowerInvariant().Contains(q)).ToList();
             _list.BeginUpdate(); _list.Items.Clear(); foreach (var x in rows) { var li = new ListViewItem(x.Enabled ? "Enabled" : "Disabled") { Tag = x }; li.SubItems.Add(x.Name); li.SubItems.Add(x.Source); li.SubItems.Add(x.RiskLabel()); li.SubItems.Add(x.Command); li.SubItems.Add(x.Location); _list.Items.Add(li); } _list.EndUpdate();
+            int review = rows.Count(x => x.RiskLabel() == "Review");
             _summary.Text = rows.Count + " visible • " + _items.Count(x => x.Enabled) + " enabled • " + _items.Count(x => !x.Enabled) + " disabled • " + _items.Count(x => x.IsManaged) + " managed";
+            _visibleValue.Text = rows.Count.ToString(); _enabledValue.Text = _items.Count(x => x.Enabled).ToString(); _disabledValue.Text = _items.Count(x => !x.Enabled).ToString(); _reviewValue.Text = review.ToString(); _managedValue.Text = _items.Count(x => x.IsManaged).ToString();
+            _hint.Text = rows.Count == 0 ? "No startup items match this search. Clear the search to return to the full boot inventory." : "Select an item to enable, disable, or inspect its command. Review badges mark scripts, temp paths, terminals, or command shells.";
+            UpdateButtons();
         }
+        private void UpdateButtons() { var x = Selected(); bool any = x != null; _disable.Enabled = any && x.Enabled; _enable.Enabled = any && !x.Enabled; _deleteManaged.Enabled = any && x.IsManaged && x.Source == "Scheduled Task"; }
         private StartupItem Selected() { return _list.SelectedItems.Count == 0 ? null : (StartupItem)_list.SelectedItems[0].Tag; }
-        private void DisableSelected() { var x = Selected(); if (x == null) return; try { StartupService.Disable(x); Toast("Disabled", x.Name + " will not run next boot."); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Disable failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); } }
+        private void DisableSelected() { var x = Selected(); if (x == null) return; if (MessageBox.Show("Disable '" + x.Name + "' from Windows startup?", "Confirm disable", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return; try { StartupService.Disable(x); Toast("Disabled", x.Name + " will not run next boot."); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Disable failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); } }
         private void EnableSelected() { var x = Selected(); if (x == null) return; try { StartupService.Enable(x); Toast("Enabled", x.Name + " will run next boot."); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Enable failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); } }
-        private void DeleteManaged() { var x = Selected(); if (x == null || !x.IsManaged || x.Source != "Scheduled Task") { MessageBox.Show("Select a MichStartupMaster managed scheduled task."); return; } try { StartupService.DeleteManagedTask(x.Location); RefreshItems(); Toast("Deleted", x.Name); } catch (Exception ex) { MessageBox.Show(ex.Message, "Delete failed"); } }
+        private void DeleteManaged() { var x = Selected(); if (x == null || !x.IsManaged || x.Source != "Scheduled Task") { MessageBox.Show("Select a MichStartupMaster managed scheduled task."); return; } if (MessageBox.Show("Delete managed startup task '" + x.Name + "'?", "Confirm delete", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return; try { StartupService.DeleteManagedTask(x.Location); RefreshItems(); Toast("Deleted", x.Name); } catch (Exception ex) { MessageBox.Show(ex.Message, "Delete failed"); } }
         private void AddBootApp()
         {
             using (var d = new AddStartupForm())
             {
                 if (d.ShowDialog(this) != DialogResult.OK) return;
-                try { StartupService.AddManagedStartup(d.AppTitle, d.AppPath, d.AppArguments, d.TrayMode, true); Toast("Added zero-delay boot app", d.AppTitle); RefreshItems(); }
+                try { StartupService.AddManagedStartup(d.AppTitle, d.AppPath, d.AppArguments, d.TrayMode, true); Toast("Added zero-delay boot app", d.AppTitle + (d.TrayMode ? " will start quietly through tray mode." : " will start normally.")); RefreshItems(); }
                 catch (Exception ex) { MessageBox.Show(ex.Message, "Add failed", MessageBoxButtons.OK, MessageBoxIcon.Error); }
             }
         }
@@ -497,17 +588,43 @@ foreach($t in Get-ScheduledTask){
 
     internal sealed class AddStartupForm : Form
     {
-        public string AppTitle { get { return _name.Text.Trim(); } } public string AppPath { get { return _path.Text.Trim(); } } public string AppArguments { get { return _args.Text; } } public bool TrayMode { get { return _tray.Checked; } }
-        private TextBox _name, _path, _args; private CheckBox _tray;
+        public string AppTitle { get { return _name.Text.Trim(); } }
+        public string AppPath { get { return _path.Text.Trim(); } }
+        public string AppArguments { get { return _args.Text; } }
+        public bool TrayMode { get { return _trayMode.Checked; } }
+        private TextBox _name, _path, _args;
+        private RadioButton _normalMode, _trayMode;
+        private readonly Color Bg = Color.FromArgb(10, 14, 28), Surface = Color.FromArgb(21, 28, 51), TextMain = Color.FromArgb(245, 247, 255), Muted = Color.FromArgb(156, 166, 195), Accent = Color.FromArgb(99, 102, 241);
+
         public AddStartupForm()
         {
-            Text = "Add zero-delay boot application"; Width = 640; Height = 360; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; BackColor = Color.FromArgb(13, 18, 34); ForeColor = Color.White; Font = new Font("Segoe UI", 10f); StartPosition = FormStartPosition.CenterParent;
-            AddLabel("Application name", 28); _name = Box(52); AddLabel("Executable path", 92); _path = Box(116); var browse = new Button { Text = "Browse", Left = 512, Top = 114, Width = 86, Height = 30 }; browse.Click += Browse; Controls.Add(browse); AddLabel("Arguments (optional)", 156); _args = Box(180);
-            _tray = new CheckBox { Text = "Run through Startup Master tray wrapper: launch minimized and prevent a boot popup where Windows/app supports it", Left = 28, Top = 222, Width = 570, ForeColor = Color.FromArgb(196, 207, 235), Checked = true }; Controls.Add(_tray);
-            var ok = new Button { Text = "Add at next boot", Left = 342, Top = 270, Width = 130, Height = 36, DialogResult = DialogResult.OK, BackColor = Color.FromArgb(99, 102, 241), ForeColor = Color.White, FlatStyle = FlatStyle.Flat }; var cancel = new Button { Text = "Cancel", Left = 486, Top = 270, Width = 90, Height = 36, DialogResult = DialogResult.Cancel }; Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
+            Text = "Add app to Windows startup"; Width = 720; Height = 520; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; BackColor = Bg; ForeColor = Color.White; Font = new Font("Segoe UI", 10f); StartPosition = FormStartPosition.CenterParent; Icon = Program.AppIcon;
+            Controls.Add(new Label { Text = "Add an app to startup", Left = 28, Top = 24, AutoSize = true, ForeColor = TextMain, Font = new Font("Segoe UI Semibold", 22f) });
+            Controls.Add(new Label { Text = "Choose an executable, then decide if it should open normally or quietly through Startup Master's tray wrapper.", Left = 30, Top = 66, Width = 620, Height = 40, ForeColor = Muted, Font = new Font("Segoe UI", 10.5f) });
+            AddLabel("Friendly name", 118); _name = Box(144, 470);
+            AddLabel("Executable path", 184); _path = Box(210, 510); var browse = Button("Browse", Accent, 92); browse.Left = 558; browse.Top = 208; browse.Click += Browse; Controls.Add(browse);
+            AddLabel("Optional arguments", 250); _args = Box(276, 622);
+            AddLabel("Startup mode", 318);
+            _normalMode = new RadioButton { Text = "Start normally — run the app directly at Windows logon", Left = 34, Top = 346, Width = 610, ForeColor = TextMain, BackColor = Bg, Checked = false };
+            _trayMode = new RadioButton { Text = "Start quietly in tray mode — no terminal, minimized launch, controller tray icon", Left = 34, Top = 378, Width = 630, ForeColor = TextMain, BackColor = Bg, Checked = true };
+            Controls.Add(_normalMode); Controls.Add(_trayMode);
+            Controls.Add(new Label { Text = "Quiet tray mode is the safest generic no-popup startup path; apps that force their own window may still show it.", Left = 54, Top = 406, Width = 590, Height = 34, ForeColor = Muted, Font = new Font("Segoe UI", 9f) });
+            var ok = Button("Add at next boot", Accent, 150); ok.Left = 390; ok.Top = 452; ok.DialogResult = DialogResult.OK; ok.Click += ValidateBeforeClose;
+            var cancel = Button("Cancel", Surface, 100); cancel.Left = 550; cancel.Top = 452; cancel.DialogResult = DialogResult.Cancel;
+            Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
         }
-        private void AddLabel(string text, int top) { Controls.Add(new Label { Text = text, Left = 28, Top = top, AutoSize = true, ForeColor = Color.FromArgb(156, 166, 195) }); }
-        private TextBox Box(int top) { var t = new TextBox { Left = 28, Top = top, Width = 470, Height = 28, BackColor = Color.FromArgb(24, 33, 58), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle }; Controls.Add(t); return t; }
-        private void Browse(object sender, EventArgs e) { using (var ofd = new OpenFileDialog { Filter = "Applications (*.exe)|*.exe|All files|*.*" }) if (ofd.ShowDialog(this) == DialogResult.OK) { _path.Text = ofd.FileName; if (string.IsNullOrWhiteSpace(_name.Text)) _name.Text = Path.GetFileNameWithoutExtension(ofd.FileName); } }
+        private void ValidateBeforeClose(object sender, EventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(AppTitle) || string.IsNullOrWhiteSpace(AppPath) || !File.Exists(AppPath) || !AppPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show("Choose a valid .exe and friendly name before adding startup.", "Missing app", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                DialogResult = DialogResult.None;
+            }
+        }
+        private void AddLabel(string text, int top) { Controls.Add(new Label { Text = text, Left = 30, Top = top, AutoSize = true, ForeColor = Muted, Font = new Font("Segoe UI Semibold", 9.5f) }); }
+        private TextBox Box(int top, int width) { var t = new TextBox { Left = 30, Top = top, Width = width, Height = 30, BackColor = Color.FromArgb(17, 24, 44), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10.5f) }; Controls.Add(t); return t; }
+        private Button Button(string text, Color color, int width) { var b = new Button { Text = text, Width = width, Height = 38, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 9.5f), Cursor = Cursors.Hand }; b.FlatAppearance.BorderSize = 0; return b; }
+        private void Browse(object sender, EventArgs e) { using (var ofd = new OpenFileDialog { Filter = "Applications (*.exe)|*.exe", Title = "Choose app to start with Windows" }) if (ofd.ShowDialog(this) == DialogResult.OK) { _path.Text = ofd.FileName; if (string.IsNullOrWhiteSpace(_name.Text)) _name.Text = Path.GetFileNameWithoutExtension(ofd.FileName); } }
     }
+
 }
