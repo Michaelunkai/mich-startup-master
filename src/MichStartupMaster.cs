@@ -71,7 +71,7 @@ namespace MichStartupMaster
                 if (cmd == "--add-test-task-normal") return CliAddTestTask(args, false);
                 if (cmd == "--add-startup") return CliAddStartup(args);
                 if (cmd == "--remove-task") return CliRemoveTask(args);
-                if (cmd == "--ui-contract") { Console.WriteLine(WpfStartupShell.UiContractJson()); return 0; }
+                if (cmd == "--ui-contract") { Console.WriteLine(MainForm.UiContractJson()); return 0; }
                 if (cmd == "--protect-disabled") { Console.WriteLine(ProtectedDisabledService.ProtectCurrentDisabled()); return 0; }
                 if (cmd == "--enforce-disabled") { Console.WriteLine(ProtectedDisabledService.EnforceProtected()); return 0; }
                 if (cmd == "--enforce-quiet") { Console.WriteLine(ProtectedQuietService.EnforceProtected()); return 0; }
@@ -80,20 +80,27 @@ namespace MichStartupMaster
                 if (cmd == "--tray-run") { TrayRunner.Run(args.Skip(1).ToArray()); return 0; }
                 if (cmd == "--start-in-tray")
                 {
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
                     bool createdNew;
                     using (var singleInstance = new System.Threading.Mutex(true, @"Local\MichStartupMaster.MainInstance", out createdNew))
                     {
                         if (!createdNew) return 0;
-                        return WpfStartupShell.Run(true);
+                        Application.Run(new MainForm(true));
                     }
+                    return 0;
                 }
                 if (cmd == "--show-add-dialog")
                 {
-                    WpfStartupShell.ShowAddDialog();
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    using (var dialog = new AddStartupForm()) dialog.ShowDialog();
                     return 0;
                 }
             }
 
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
             bool createdMain;
             using (var singleInstance = new System.Threading.Mutex(true, @"Local\MichStartupMaster.MainInstance", out createdMain))
             {
@@ -102,8 +109,9 @@ namespace MichStartupMaster
                     TryShowExistingMainWindow();
                     return 0;
                 }
-                return WpfStartupShell.Run(false);
+                Application.Run(new MainForm());
             }
+            return 0;
         }
 
         private static void TryShowExistingMainWindow()
