@@ -1,6 +1,7 @@
 $ErrorActionPreference='Stop'
 $Root = Split-Path -Path $PSScriptRoot -Parent
 $Src = Join-Path $Root 'src\MichStartupMaster.cs'
+$WpfSrc = Join-Path $Root 'src\WpfStartupShell.cs'
 $Icon = Join-Path $Root 'assets\MichStartupMaster.ico'
 $OutDir = Join-Path $Root 'build'
 $Out = Join-Path $OutDir 'MichStartupMaster.exe'
@@ -13,11 +14,20 @@ $candidates = @(
 )
 $csc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if(-not $csc){ throw 'C# compiler csc.exe was not found. Install/enable .NET Framework developer tools.' }
+$frameworkDir = Split-Path -Path $csc -Parent
+$wpfDir = Join-Path $frameworkDir 'WPF'
+foreach($required in @('PresentationCore.dll','PresentationFramework.dll','WindowsBase.dll')){
+  if(-not (Test-Path -LiteralPath (Join-Path $wpfDir $required))){ throw "WPF reference missing: $required in $wpfDir" }
+}
 $cscArgs = @(
-  '/nologo','/target:winexe','/platform:anycpu','/optimize+',
+  '/nologo','/target:winexe','/platform:x64','/optimize+',
   "/out:$Out", "/win32icon:$Icon",
   '/reference:System.dll','/reference:System.Core.dll','/reference:System.Drawing.dll','/reference:System.Windows.Forms.dll','/reference:System.Management.dll','/reference:Microsoft.CSharp.dll',
-  $Src
+  '/reference:System.Xaml.dll',
+  "/reference:$(Join-Path $wpfDir 'PresentationCore.dll')",
+  "/reference:$(Join-Path $wpfDir 'PresentationFramework.dll')",
+  "/reference:$(Join-Path $wpfDir 'WindowsBase.dll')",
+  $Src, $WpfSrc
 )
 & $csc @cscArgs
 if($LASTEXITCODE -ne 0){ throw "csc failed with exit $LASTEXITCODE" }
