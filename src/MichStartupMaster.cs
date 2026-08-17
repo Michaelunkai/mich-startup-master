@@ -19,11 +19,8 @@ namespace MichStartupMaster
     internal static class Program
     {
         public static readonly string AppName = "MichStartupMaster";
-        public static readonly string AppUserModelId = "Mich.MichStartupMaster";
         public static readonly string AppData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppName);
 
-        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern int SetCurrentProcessExplicitAppUserModelID(string appID);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
         [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
@@ -42,6 +39,12 @@ namespace MichStartupMaster
                 if (_appIcon != null) return _appIcon;
                 try
                 {
+                    string bundledIcon = Path.Combine(AppContext.BaseDirectory, "MichStartupMaster.ico");
+                    if (File.Exists(bundledIcon))
+                    {
+                        _appIcon = new Icon(bundledIcon);
+                        return _appIcon;
+                    }
                     Icon extracted = Icon.ExtractAssociatedIcon(Process.GetCurrentProcess().MainModule.FileName);
                     if (extracted != null)
                     {
@@ -59,12 +62,12 @@ namespace MichStartupMaster
         [STAThread]
         private static int Main(string[] args)
         {
-            SetCurrentProcessExplicitAppUserModelID(AppUserModelId);
             Directory.CreateDirectory(AppData);
             if (args.Length > 0)
             {
                 string cmd = args[0].ToLowerInvariant();
                 if (cmd == "--smoke") return Smoke();
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster GitHub recovery build"); return 0; }
                 if (cmd == "--list") { Console.WriteLine(StartupService.ToJson(StartupService.ScanAll())); return 0; }
                 if (cmd == "--add-test-task") return CliAddTestTask(args, true);
                 if (cmd == "--add-test-task-tray") return CliAddTestTask(args, true);
@@ -78,7 +81,7 @@ namespace MichStartupMaster
                 if (cmd == "--toggle-popup") return CliTogglePopup(args);
                 if (cmd == "--set-enabled") return CliSetEnabled(args);
                 if (cmd == "--tray-run") { TrayRunner.Run(args.Skip(1).ToArray()); return 0; }
-                if (cmd == "--start-in-tray")
+                if (cmd == "--start-in-tray" || cmd == "--agent")
                 {
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
@@ -1588,26 +1591,25 @@ foreach($t in Get-ScheduledTask){
             _list.Columns.Add("Status", 105); _list.Columns.Add("Application", 250); _list.Columns.Add("Startup entry", 220); _list.Columns.Add("Source", 145); _list.Columns.Add("Risk", 112); _list.Columns.Add("Cleanup", 112); _list.Columns.Add("Popup", 112); _list.Columns.Add("Location", 250); _list.Columns.Add("Launch command", 430);
             _list.DrawColumnHeader += (s, e) => { using (var b = new SolidBrush(Surface2)) e.Graphics.FillRectangle(b, e.Bounds); TextRenderer.DrawText(e.Graphics, e.Header.Text, new Font(Font, FontStyle.Bold), new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width, e.Bounds.Height), Color.White, TextFormatFlags.VerticalCenter | TextFormatFlags.Left); };
             _list.DrawSubItem += DrawSubItem; _list.SelectedIndexChanged += (s, e) => UpdateButtons(); _list.MouseDown += SelectListItemOnRightClick; _list.MouseUp += ListMouseUpPopupToggle; _list.DoubleClick += (s, e) => EditSelected();
-            _list.ContextMenu = BuildListContextMenu();
+            _list.ContextMenuStrip = BuildListContextMenu();
             _list.Resize += (s, e) => { if (_list.Columns.Count > 8) _list.Columns[8].Width = Math.Max(300, _list.Width - 1306); };
             listCard.Controls.Add(_list);
         }
 
-        private ContextMenu BuildListContextMenu()
+        private ContextMenuStrip BuildListContextMenu()
         {
-            return new ContextMenu(new[]
-            {
-                new MenuItem("Edit startup", (s, e) => EditSelected()),
-                new MenuItem("Remove from startup", (s, e) => DisableSelected()),
-                new MenuItem("Restore startup", (s, e) => EnableSelected()),
-                new MenuItem("-"),
-                new MenuItem("Make quiet", (s, e) => MakeSelectedQuiet()),
-                new MenuItem("Launch now", (s, e) => LaunchSelectedNow()),
-                new MenuItem("Open location", (s, e) => OpenSelectedLocation()),
-                new MenuItem("Copy launch command", (s, e) => CopySelectedCommand()),
-                new MenuItem("-"),
-                new MenuItem("Refresh", (s, e) => RefreshItems())
-            });
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("Edit startup", null, (s, e) => EditSelected());
+            menu.Items.Add("Remove from startup", null, (s, e) => DisableSelected());
+            menu.Items.Add("Restore startup", null, (s, e) => EnableSelected());
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("Make quiet", null, (s, e) => MakeSelectedQuiet());
+            menu.Items.Add("Launch now", null, (s, e) => LaunchSelectedNow());
+            menu.Items.Add("Open location", null, (s, e) => OpenSelectedLocation());
+            menu.Items.Add("Copy launch command", null, (s, e) => CopySelectedCommand());
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("Refresh", null, (s, e) => RefreshItems());
+            return menu;
         }
 
         private Panel Card(Rectangle bounds)
@@ -1674,7 +1676,12 @@ foreach($t in Get-ScheduledTask){
             _tray = new NotifyIcon { Icon = Program.AppIcon, Text = "Mich Startup Master", Visible = true };
             _tray.DoubleClick += (s, e) => OpenFromTray();
             _tray.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left) OpenFromTray(); };
-            _tray.ContextMenu = new ContextMenu(new[] { new MenuItem("Open Startup Master", (s, e) => OpenFromTray()), new MenuItem("Refresh inventory", (s, e) => RefreshItems()), new MenuItem("Enforce quiet + disabled guards", (s, e) => RunGuardsAsync(true)), new MenuItem("Exit", (s, e) => { _reallyExit = true; if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } Application.Exit(); }) });
+            var trayMenu = new ContextMenuStrip();
+            trayMenu.Items.Add("Open Startup Master", null, (s, e) => OpenFromTray());
+            trayMenu.Items.Add("Refresh inventory", null, (s, e) => RefreshItems());
+            trayMenu.Items.Add("Enforce quiet + disabled guards", null, (s, e) => RunGuardsAsync(true));
+            trayMenu.Items.Add("Exit", null, (s, e) => { _reallyExit = true; if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } Application.Exit(); });
+            _tray.ContextMenuStrip = trayMenu;
         }
         private void OpenFromTray()
         {
