@@ -1,143 +1,221 @@
-# Mich Startup Master
+<div align="center">
 
-Mich Startup Master is a Windows-native startup-control application. It gives you one polished place to see and manage what runs when Windows starts or when you log in.
+# 🚀 Mich Startup Master
 
-This version fixes the taskbar/pinned-app icon by embedding a real native `.ico` into the compiled EXE, upgrades the UI into a friendlier dashboard-style control room, and verifies both startup-add modes: normal launch and quiet tray-wrapper launch.
+**Take full control of everything that starts with Windows.**
 
-## Runnable app
+A native **Windows** startup manager with a dark dashboard UI, a self-repairing boot agent,
+quiet tray-launch mode, and a built-in audit that **proves** every boot source is visible
+and every tray app runs exactly once.
 
-```powershell
-& 'F:\study\Windows\Applications\Desktop\Utilities\System\Startup\Managers\mich-startup-master\build\MichStartupMaster.exe'
-```
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](#)
+[![Language](https://img.shields.io/badge/language-C%23%20WinForms-informational)](#)
+[![Framework](https://img.shields.io/badge/.NET-10-green)](#)
+[![Build](https://img.shields.io/badge/build-dotnet%20publish-success)](#)
+[![License](https://img.shields.io/badge/license-MIT-yellow)](#license)
 
-## What it does
+</div>
 
-- Shows Windows startup entries from `Win32_StartupCommand`.
-- Shows Registry Run, RunOnce, RunServices, policy Run, and 32-bit Wow6432Node startup entries from HKCU and HKLM.
-- Shows user/common Startup-folder entries.
-- Shows enabled and disabled logon Scheduled Tasks by inspecting real `Get-ScheduledTask` trigger objects instead of fragile localized `schtasks` schedule text.
-- Shows auto-start Windows services and boot/system/auto-start drivers, including service-backed apps such as Malwarebytes.
-- Shows Active Setup, Winlogon autostart, AppInit DLL, and Explorer StartupApproved disabled metadata so obscure startup mechanisms are visible instead of hidden.
-- Resolves a human-readable application name for every row using shortcut targets, tray-wrapper payloads, executable metadata, service display names, and cleaned fallbacks, while preserving the raw startup entry name for exact control.
-- Lets you disable/enable supported startup entries.
-- Lets you disable/enable reversible startup sources, including Registry startup values, Startup folder items, Scheduled Tasks, Active Setup StubPath values, Windows services, and system drivers when running elevated.
-- Lets you add executable startup targets with no Task Scheduler delay: `.exe`, `.cmd`, `.bat`, `.ps1`, and `.lnk`.
-- Lets you edit app startup entries from the main window. Managed scheduled tasks are updated in place; editable registry/folder/task entries can be removed and replaced with a managed entry.
-- Lets every added app choose one of two startup modes:
-  - **Start normally** — runs the selected executable directly at Windows logon.
-  - **Start quietly in tray mode** — starts through Mich Startup Master’s GUI-subsystem tray wrapper, launches minimized, avoids terminal popups, and keeps a controller tray icon.
-- Protects quiet popup-disabled startup tasks in `%LOCALAPPDATA%\MichStartupMaster\protected-quiet-popup-items.tsv`; if another tool changes a protected task back to normal launch, `--enforce-quiet` restores the tray-wrapper action.
-- Keeps manual opening separate from quiet startup: launching `MichStartupMaster.exe` normally opens the GUI, while its startup self-task uses `--start-in-tray`.
-- Marks genuinely high-consequence startup mechanisms in red: boot/system/auto drivers, Winlogon/AppInit startup points, security/core services, and Microsoft boot/startup infrastructure tasks. Normal user app startup is not marked red just because it starts with Windows.
-- Marks conservative green cleanup suggestions only when the entry is enabled, non-critical, and strongly matches optional-startup patterns such as updater wake tasks, tray-icon helpers, telemetry/crash reporters, or installer/watchdog helpers. Normal useful app startup is not marked green by default.
-- Loads the startup inventory asynchronously so the window remains responsive while services, drivers, scheduled tasks, and registry startup surfaces are scanned.
-- The Add/Edit dialog explicitly offers both choices for every startup target you add: **Start normally** or **Start quietly in tray mode**.
-- Includes a real embedded application icon for the EXE, window, tray icon, and taskbar/pinned shortcut path.
-- Includes a tray icon for Mich Startup Master itself; closing the window hides it to the tray instead of killing it.
+---
 
-## UI upgrades
+## ✨ Highlights
 
-The main window is now a dashboard-style control room:
+- **One place for every startup source** — registry `Run`/`RunOnce`/`RunServices`, policy runs,
+  Startup folders, logon & boot scheduled tasks, auto services, boot/system/auto drivers,
+  Winlogon autostart, Active Setup, AppInit DLLs, and disabled-item metadata.
+- **Start quietly in the tray** — launch any app hidden at logon with **its own real tray icon**
+  (never a duplicate or broken wrapper icon), and pop its window open only when you want to.
+- **Guaranteed to run at every boot** — a hidden agent re-asserts your enabled list every 30 s,
+  recreating deleted tasks, re-enabling disabled ones, and launching anything it repairs right away.
+- **Disable that actually sticks** — quiet apps included. A hung `schtasks` can never freeze the
+  UI or silently re-enable an item you turned off.
+- **Provable coverage** — the built-in **Coverage** check (`--audit-boot`) verifies
+  `gaps=0` (every boot source is shown) and `findings=0` (no duplicate tray icons / wrapper icons).
+- **One row per app** — duplicate launchers, WMI mirrors, and stale records are collapsed, while
+  legacy items you once configured stay visible as **Legacy v2** rows you can restore.
 
-- Embedded branded app icon in the title bar, tray, and EXE/taskbar resource.
-- Large friendly header with plain-language explanation.
-- Metric cards for visible, enabled, disabled, review, and managed items.
-- Cleaner command center with search, all/high-risk/suggested-cleanup/disabled filters, add quiet startup, refresh, make quiet, disable, enable, managed-task delete, protect disabled, enforce now, and open startup folders.
-- More readable startup table with status/trust emphasis and approachable helper copy.
-- Application-first table: `Application`, `Startup entry`, `Source`, `Risk`, `Cleanup`, `Popup`, `Location`, and `Launch command`.
-- Right-click menu on startup rows for edit, remove, restore, make quiet, launch now, open location, copy command, and refresh.
-- Keyboard shortcuts for common work: `Ctrl+N` add, `Enter` edit, `Delete` remove, `F5` refresh, `Ctrl+L` launch now, `Ctrl+O` open location, `Ctrl+C` copy command, and `Esc` clear search.
-- Red high-risk rows and green suggested-cleanup rows with non-color text labels plus reasons in `--list` JSON.
-- Safer confirmation dialogs for disabling and deleting startup entries.
-- Reworked Add/Edit Startup dialog with explicit Normal vs Quiet Tray startup choices plus clipboard path paste for fast entry creation.
+---
 
-## Important limitation
+## 📸 Screenshots
 
-Windows cannot generically force every third-party app into that app's own native tray icon. Tray-wrapper mode starts the target minimized and provides a controller tray icon. Apps that intentionally force their own UI can still show a window.
+| Main dashboard | Add / edit dialog |
+|---|---|
+| ![Main window](artifacts/proof/monitor2-current.png) | ![Add/Edit dialog](artifacts/proof/monitor2-add-dialog.png) |
 
-## Prerequisites
+More captures: [full list](artifacts/proof/MichStartupMaster_monitor2_full_list.png) ·
+[foreground](artifacts/proof/MichStartupMaster_foreground.png) ·
+[running](artifacts/proof/MichStartupMaster_running.png)
 
-- Windows 11 or Windows 10.
-- Windows PowerShell 5.1.
-- .NET Framework compiler available at one of:
-  - `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`
-  - `C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe`
+---
 
-## Build
+## 🚦 Quick start
 
 ```powershell
-& 'F:\study\Windows\Applications\Desktop\Utilities\System\Startup\Managers\mich-startup-master\scripts\build.ps1'
+# Run the app (opens the dashboard)
+.\build\MichStartupMaster.exe
+
+# Rebuild from source
+.\scripts\build.ps1
+
+# Run the full regression suite
+.\scripts\test.ps1
 ```
 
-Build output:
+> Requires Windows 10/11. Building needs a working .NET SDK 10 (`dotnet publish`); the build
+> script prefers the complete SDK at `C:\DotnetRepair\dotnet.exe` when the system SDK is broken.
 
-```text
-F:\study\Windows\Applications\Desktop\Utilities\System\Startup\Managers\mich-startup-master\build\MichStartupMaster.exe
-```
+---
 
-The build embeds:
+## 🖥️ Using the app
 
-```text
-assets\MichStartupMaster.ico
-```
+### The dashboard
 
-into the EXE using `csc.exe /win32icon`.
+- **Metric cards** show visible / enabled / disabled / needs-review / managed counts at a glance.
+- **Search** and quick filters: All · High risk · Suggested cleanup · Disabled.
+- **Columns**: Application · Startup entry · Source · Risk · Cleanup · Popup · Location · Launch command.
+- **Right-click any row** for edit, remove, restore, make quiet, launch now, open location, copy command, refresh.
+- **Keyboard**: `Ctrl+N` add · `Enter` edit · `Delete` remove · `F5` refresh · `Ctrl+L` launch now ·
+  `Ctrl+O` open location · `Ctrl+C` copy command · `Esc` clear search.
+- **Coverage** button runs the built-in boot + tray audit and shows the result inline.
+- Closing the window hides the app to its own tray icon; it keeps guarding your startup list.
 
-## Test / verification
+### Adding an app
+
+The Add/Edit dialog offers two startup modes:
+
+| Mode | What happens at logon |
+|---|---|
+| **Start normally** | Runs the executable directly — no Task Scheduler delay. |
+| **Start quietly in tray mode** | Launches hidden via the quiet wrapper; the app draws **its own** tray icon; the wrapper stays invisible and exits when the app exits. |
+
+Supports `.exe`, `.cmd`, `.bat`, `.ps1`, and `.lnk` targets (`.ps1`/`.cmd` are routed through the
+correct Windows host so they never flash a console).
+
+### CLI reference
+
+| Command | Purpose |
+|---|---|
+| `--list` | JSON inventory of every startup item |
+| `--audit-boot` | Boot-coverage (`gaps=0`) + tray-coverage (`findings=0`) self-check |
+| `--list-managed` | JSON of the enabled-manifest rows |
+| `--set-enabled <name> <true\|false>` | Enable / disable an entry (registry, task, folder, service, driver) |
+| `--toggle-popup <task> <normal\|tray>` | Switch a managed task between popup and quiet-tray mode |
+| `--enforce-enabled` | Re-assert every enabled item now (recreate / re-enable / fix delay) |
+| `--enforce-disabled` | Re-assert every protected-disabled item now |
+| `--enforce-quiet` | Restore quiet wrapper actions on protected tray tasks |
+| `--protect-disabled` | Record current disabled state into the protection store |
+| `--add-startup <name> <path> [args] [normal\|tray]` | Add a managed startup entry |
+| `--ui-contract` | Machine-readable UI contract for automation/testing |
+| `--smoke` | Self-test smoke mode |
+| `--agent` / `--start-in-tray` | Start the hidden guarding agent in the tray |
+
+---
+
+## 🛡️ How it works
+
+### The guard agent
+
+A hidden `--agent` process (registered at two redundant boot paths: a Startup-folder shortcut
+**and** the managed logon task `\MichStartupMaster\MichStartupMasterApp`) wakes every 30 seconds
+and enforces two authoritative stores:
+
+| Store | File (`%LOCALAPPDATA%\MichStartupMaster\`) | Guard |
+|---|---|---|
+| Enabled manifest | `enabled-startup-items.tsv` | re-creates deleted tasks, re-enables disabled ones, removes delays, launches repaired items immediately |
+| Disabled protection | `protected-disabled-items.tsv` | keeps disabled items off, even if another tool re-enables them |
+| Quiet protection | `protected-quiet-popup-items.tsv` | restores `--tray-run` wrapper actions if a task is switched back to a popup |
+
+### Why duplicates and broken icons are gone
+
+- The quiet wrapper **never creates its own tray icon** — each app shows only its own real icon.
+- The wrapper is single-instance per target: if the app is already running when a task fires, the
+  wrapper quietly exits instead of launching a second copy.
+- Retired duplicate launchers (e.g. a legacy root task next to a managed one) are disabled by the
+  guard and hidden behind their managed row.
+- Disabling a quiet app removes its quiet-protection entry, so the guard can never resurrect it.
+- The **Coverage** check re-proves all of this on demand — `BOOT_AUDIT … gaps=0` and
+  `TRAY_AUDIT … findings=0` are asserted in `scripts/test.ps1` on every run.
+
+### Migration from the old v2 app
+
+Legacy v2 enabled items are adopted automatically (one-shot): they become managed tasks — tray
+mode for items that ran quietly before, normal mode otherwise — while duplicate registry sources
+are removed and duplicate legacy launchers disabled. Items only present in the old state appear as
+**Legacy v2** rows and can be **Restore**d at any time.
+
+---
+
+## 🔨 Building from source
 
 ```powershell
-& 'F:\study\Windows\Applications\Desktop\Utilities\System\Startup\Managers\mich-startup-master\scripts\test.ps1'
+.\scripts\build.ps1
 ```
 
-The test script verifies:
+The script:
 
-1. The executable starts in smoke mode.
-2. `--list` returns many startup entries, not just one.
-3. Known startup items are present: `Autorun_current_ahk`, `AIMemoryBoost`, `FullScreenSnip`, and `TVStartupCheck`.
-4. Service and driver startup categories are present.
-5. Malwarebytes startup entries are visible when installed: `Malwarebytes Service`, `MBAMChameleon`, and `MbamElam`.
-6. A disposable auto-start service can be disabled and restored through the app.
-7. Every row has a non-empty human-readable `appName`.
-8. At least one boot/system/auto driver is marked high-risk while a normal user app is not falsely marked high-risk.
-9. Green cleanup suggestions exist on this machine, but no high-risk row or normal `FullScreenSnip` app row is falsely marked as cleanup.
-10. Quiet popup protection restores a tampered startup task back to `--tray-run ...` or `--start-in-tray`.
-11. The EXE icon can be extracted by Windows.
-12. A tray-wrapper test logon task can be created.
-13. A normal-mode test logon task can be created.
-14. Both tasks contain a `LogonTrigger` and no `<Delay>` element.
-15. Tray-mode XML uses `MichStartupMaster.exe --tray-run ...` or `--start-in-tray`.
-16. Normal-mode XML runs the target executable directly.
-17. Both regression tasks are removed and verified missing.
-18. The exact PiperVoicePaste executable at `F:\study\AI_ML\AI_and_Machine_Learning\Artificial_Intelligence\Speech\Windows\Dictation\Tray\PiperVoicePaste\PiperVoicePaste.exe` can be added in both tray and normal modes.
-19. `.ps1` and `.cmd` startup targets are registered through the correct Windows host executable instead of relying on fragile raw task actions.
+1. Picks a working .NET SDK (prefers `C:\DotnetRepair\dotnet.exe`, falls back to `dotnet`).
+2. Publishes self-contained for `win-x64` (`dotnet publish -c Release -r win-x64 --self-contained true`).
+3. Copies the icon + hidden VBS launcher into the output.
+4. Verifies the built EXE actually carries an embedded icon.
 
-## Open on monitor 2
+Output: `build\MichStartupMaster.exe` (fully self-contained — no runtime install needed on the target PC).
 
-To avoid disturbing monitor 1, use:
+Project: `MichStartupMaster.csproj` — .NET 10, WinForms, `System.Management`.
+
+---
+
+## 🧪 Testing
 
 ```powershell
-& 'F:\study\Windows\Applications\Desktop\Utilities\System\Startup\Managers\mich-startup-master\scripts\open-on-monitor2.ps1'
+.\scripts\test.ps1
 ```
 
-This script stops only previous Mich Startup Master instances, opens the app, and moves it to the non-primary monitor.
+The suite verifies, among other things:
 
-## Project layout
+- Smoke mode and a real startup inventory (`--list` returns many items across all sources).
+- Known entries are present and every row has a human-readable `appName`.
+- Service/driver toggle works on a disposable auto-start service (create → disable → enable → delete).
+- High-risk drivers are marked red; normal user apps are never falsely marked.
+- Tray and normal logon tasks are created without any `<Delay>` element.
+- Quiet popup protection restores a tampered task back to `--tray-run …`.
+- **Boot coverage** asserts `gaps=0`; **tray coverage** asserts `findings=0`.
 
-- `src/MichStartupMaster.cs` — C# WinForms source code.
-- `assets/MichStartupMaster.ico` — native app/taskbar icon.
-- `build/MichStartupMaster.exe` — compiled runnable app.
-- `scripts/build.ps1` — reproducible Windows build script.
-- `scripts/test.ps1` — smoke/regression test script.
-- `scripts/open-on-monitor2.ps1` — opens the GUI on the second monitor.
-- `scripts/capture-monitor2-proof.ps1` — captures second-monitor proof screenshot.
-- `artifacts/proof/` — screenshots captured during verification.
-- `artifacts/runtime-output/` — runtime verification output from tests.
+---
 
-## Troubleshooting
+## 📁 Project layout
 
-- If the taskbar still shows an old icon after pinning, unpin/re-pin the rebuilt EXE or restart Explorer; Windows caches pinned shortcut icons aggressively.
-- If only one startup item appears, run `scripts/test.ps1`; the fixed build should report the current machine's full startup inventory.
-- If adding/disabling a system-owned scheduled task fails, run the app elevated or choose a user-owned startup entry.
-- If disabling a machine-wide service or driver fails, run the app elevated; Windows requires admin rights for those controls.
-- If the app cannot compile, confirm .NET Framework `csc.exe` exists at the prerequisite paths.
-- If an app added in tray-wrapper mode still opens a window, that target application likely forces its own UI; try its own command-line arguments for minimized/tray behavior if it supports them.
+```
+MichStartupMaster.csproj      .NET 10 WinForms project
+src/MichStartupMaster.cs      All source (CLI, services, guards, WinForms UI, tray runner)
+assets/MichStartupMaster.ico  Native app / taskbar icon
+build/MichStartupMaster.exe   Compiled self-contained app (archived)
+scripts/build.ps1             Reproducible build
+scripts/test.ps1              Smoke + regression suite
+scripts/open-on-monitor2.ps1  Open the GUI on the second monitor
+artifacts/proof/              Screenshots captured during verification
+```
+
+---
+
+## 🛠️ Troubleshooting
+
+- **Old taskbar icon after pinning** — Windows caches pinned icons; unpin/re-pin the rebuilt EXE or restart Explorer.
+- **Only one startup item shows** — run `scripts/test.ps1`; the fixed build reports the machine's full inventory.
+- **Can't disable a system task / service / driver** — run the app elevated; Windows requires admin for those controls.
+- **A quiet app still opens a window** — that app forces its own UI; use its own minimized/tray flags if it has any.
+- **An item comes back after you disable it** — run `--enforce-disabled` and check the disabled-protection store; the guard keeps it off.
+- **The Coverage button reports a gap** — run `MichStartupMaster.exe --audit-boot` and paste the output; every boot source must be represented.
+
+---
+
+## 📄 License
+
+[MIT](LICENSE) © Michael (Michaelunkai)
+
+---
+
+<div align="center">
+
+**Mich Startup Master** — *everything that starts with Windows, finally under your control.*
+
+</div>

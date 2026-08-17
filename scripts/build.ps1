@@ -1,29 +1,36 @@
-$ErrorActionPreference='Stop'
+$ErrorActionPreference = 'Stop'
 $Root = Split-Path -Path $PSScriptRoot -Parent
-$Src = Join-Path $Root 'src\MichStartupMaster.cs'
-$Icon = Join-Path $Root 'assets\MichStartupMaster.ico'
 $OutDir = Join-Path $Root 'build'
-$Out = Join-Path $OutDir 'MichStartupMaster.exe'
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $Out } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-if(-not (Test-Path -LiteralPath $Icon)){ throw "Application icon not found: $Icon" }
-$candidates = @(
-  "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
-  "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe"
-)
-$csc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-if(-not $csc){ throw 'C# compiler csc.exe was not found. Install/enable .NET Framework developer tools.' }
-$cscArgs = @(
-  '/nologo','/target:winexe','/platform:x64','/optimize+',
-  "/out:$Out", "/win32icon:$Icon",
-  '/reference:System.dll','/reference:System.Core.dll','/reference:System.Drawing.dll','/reference:System.Windows.Forms.dll','/reference:System.Management.dll','/reference:Microsoft.CSharp.dll',
-  $Src
-)
-& $csc @cscArgs
-if($LASTEXITCODE -ne 0){ throw "csc failed with exit $LASTEXITCODE" }
+
+# The machine's C:\Program Files\dotnet SDK is incomplete (no Sdks folder), so prefer the
+# complete SDK copy at C:\DotnetRepair when present; otherwise fall back to the system dotnet.
+$dotnet = @(
+  'C:\DotnetRepair\dotnet.exe',
+  (Get-Command dotnet -ErrorAction SilentlyContinue).Source
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+if (-not $dotnet) { throw 'A working dotnet SDK was not found. Install one or restore C:\DotnetRepair.' }
+
+# Stop any running copy of the app so its files are not locked.
+Get-CimInstance Win32_Process -Filter "Name='MichStartupMaster.exe'" -ErrorAction SilentlyContinue |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+# Clean the previous layout so stale binaries cannot be mistaken for current ones.
+Get-ChildItem -LiteralPath $OutDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+
+& $dotnet publish (Join-Path $Root 'MichStartupMaster.csproj') -c Release -r win-x64 --self-contained true -o $OutDir
+if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit $LASTEXITCODE" }
+
+# The icon and hidden VBS launcher are declared as content in the project but are copied
+# explicitly so the deployed layout always carries them.
+Copy-Item -LiteralPath (Join-Path $Root 'assets\MichStartupMaster.ico') -Destination (Join-Path $OutDir 'MichStartupMaster.ico') -Force
+Copy-Item -LiteralPath (Join-Path $Root 'MichStartupMasterAgent.vbs') -Destination (Join-Path $OutDir 'MichStartupMasterAgent.vbs') -Force
+
 Add-Type -AssemblyName System.Drawing
-$extracted = [System.Drawing.Icon]::ExtractAssociatedIcon($Out)
-if($null -eq $extracted){ throw 'Built EXE icon extraction failed' }
+$extracted = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $OutDir 'MichStartupMaster.exe'))
+if ($null -eq $extracted) { throw 'Built EXE icon extraction failed' }
 $extracted.Dispose()
-Get-Item -LiteralPath $Out | Select-Object FullName,Length,LastWriteTime | Format-List
-"Embedded icon: $Icon"
+
+Get-Item -LiteralPath (Join-Path $OutDir 'MichStartupMaster.exe') | Select-Object FullName, Length, LastWriteTime | Format-List
+"Publish SDK: $dotnet"
+"Output: $OutDir"

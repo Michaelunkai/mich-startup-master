@@ -137,6 +137,45 @@ function Test-PopupToggle([string]$StartMode,[string]$ExpectedAfterFirstToggle,[
 Test-PopupToggle 'normal' 'Disabled' 'Enabled'
 Test-PopupToggle 'tray' 'Enabled' 'Disabled'
 
+# A disable of a quiet (tray) task must stick even after the quiet guard runs: previously the
+# quiet-protection store made the guard re-register the task as ENABLED within 30 seconds, so
+# "disable" never worked for quiet apps. Regression: disable -> enforce-quiet -> still disabled.
+function Test-QuietDisableSticks(){
+  $p = Start-Process -FilePath $App -ArgumentList '--add-test-task-tray' -Wait -PassThru
+  if($p.ExitCode -ne 0){ exit $p.ExitCode }
+  # Pick the NEWEST smoke task (name embeds a timestamp) so leftover tasks from an earlier
+  # crashed run can never shadow the one just created.
+  $task = (schtasks.exe /Query /FO CSV /V | ConvertFrom-Csv | Where-Object { $_.TaskName -like '\MichStartupMaster\HermesSmokeTray-*' } | Sort-Object TaskName -Descending | Select-Object -First 1)
+  if(-not $task){ throw 'quiet disable seed task not found' }
+  $taskName = $task.TaskName
+  $shortName = $taskName.Substring($taskName.LastIndexOf('\') + 1)
+  function Get-SmokeEnabled([string]$bare){
+    $t = Get-ScheduledTask -TaskPath '\MichStartupMaster\' -TaskName $bare -ErrorAction SilentlyContinue
+    return ($null -ne $t -and $t.Settings.Enabled)
+  }
+  try {
+    $p = Start-Process -FilePath $App -ArgumentList @('--set-enabled', $taskName, 'false') -Wait -PassThru
+    if($p.ExitCode -ne 0){ throw "quiet disable failed: $($p.ExitCode)" }
+    if(Get-SmokeEnabled $shortName){ throw 'task still enabled right after disable' }
+    $p = Start-Process -FilePath $App -ArgumentList '--enforce-quiet' -Wait -PassThru
+    if($p.ExitCode -ne 0){ throw "quiet enforce failed: $($p.ExitCode)" }
+    if(Get-SmokeEnabled $shortName){ throw 'quiet task was re-enabled by the quiet guard after disable' }
+    "QUIET_DISABLE_STICKS task=$taskName enabledAfterQuietGuard=False"
+    $p = Start-Process -FilePath $App -ArgumentList @('--set-enabled', $taskName, 'true') -Wait -PassThru
+    if($p.ExitCode -ne 0){ throw "quiet re-enable failed: $($p.ExitCode)" }
+    if(-not (Get-SmokeEnabled $shortName)){ throw 'quiet re-enable did not restore the task' }
+    [xml]$xml = (schtasks.exe /Query /TN $taskName /XML) -join "`n"
+    $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable); $ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task')
+    $argsNode = $xml.SelectSingleNode('//t:Actions/t:Exec/t:Arguments',$ns); $argText = if($argsNode){[string]$argsNode.InnerText}else{''}
+    "QUIET_REENABLE task=$taskName enabled=True wrapper=$($argText -like '--tray-run *' -or $argText -eq '--start-in-tray')"
+    if(-not ($argText -like '--tray-run *' -or $argText -eq '--start-in-tray')){ throw 'quiet re-enable did not restore the quiet wrapper action' }
+  }
+  finally {
+    Start-Process -FilePath $App -ArgumentList @('--remove-task', $shortName) -Wait | Out-Null
+  }
+}
+Test-QuietDisableSticks
+
 function Test-ModeTask([string]$ModeArg,[string]$ExpectMode){
   $p = Start-Process -FilePath $App -ArgumentList $ModeArg -Wait -PassThru
   "ADD $ExpectMode exit=$($p.ExitCode)"
@@ -240,4 +279,126 @@ Test-ArbitraryStartupTarget 'Cmd-Startup-Proof' $cmd 'normal' {
   param($action)
   if($action.Command -notlike '*\System32\cmd.exe'){ throw "cmd startup must use cmd host, got $($action.Command)" }
   if($action.Arguments -notlike '*startup proof command.cmd*'){ throw "cmd startup arguments missing target: $($action.Arguments)" }
+}
+
+# Enabled-manifest regression: everything the user sets to start must be re-asserted at every boot.
+$enforceName = 'EnforceEnabledProof'
+$enforceTask = "\MichStartupMaster\$enforceName"
+$enforceTarget = 'C:\Windows\System32\notepad.exe'
+try {
+  Remove-ProofTask $enforceTask
+  $p = Start-Process -FilePath $App -ArgumentList @('--add-startup', $enforceName, $enforceTarget, 'normal') -Wait -PassThru
+  "ENFORCE_ADD exit=$($p.ExitCode)"
+  if($p.ExitCode -ne 0){ throw 'enforce test: add-startup failed' }
+
+  $p = Start-Process -FilePath $App -ArgumentList '--list-managed' -RedirectStandardOutput (Join-Path $Root "artifacts\runtime-output\enforce-manifest.json") -Wait -PassThru
+  if($p.ExitCode -ne 0){ throw 'enforce test: --list-managed failed' }
+  $manifest = Get-Content -LiteralPath (Join-Path $Root "artifacts\runtime-output\enforce-manifest.json") -Raw | ConvertFrom-Json
+  $row = @($manifest | Where-Object { $_.task -eq $enforceTask -and $_.mode -eq 'normal' })[0]
+  if(-not $row){ throw "enforce test: managed task missing from enabled manifest: $enforceTask" }
+  "ENFORCE_MANIFEST row=$($row.task) mode=$($row.mode)"
+
+  # Tamper: disable the managed task. Enforce must re-enable it.
+  Disable-ScheduledTask -TaskPath '\MichStartupMaster\' -TaskName $enforceName | Out-Null
+  $state = (Get-ScheduledTask -TaskPath '\MichStartupMaster\' -TaskName $enforceName).State
+  if($state -ne 'Disabled'){ throw 'enforce test: task was not disabled for the tamper' }
+  $p = Start-Process -FilePath $App -ArgumentList '--enforce-enabled' -Wait -PassThru
+  "ENFORCE_ENABLE exit=$($p.ExitCode)"
+  if($p.ExitCode -ne 0){ throw 'enforce test: --enforce-enabled failed' }
+  $state = (Get-ScheduledTask -TaskPath '\MichStartupMaster\' -TaskName $enforceName).State
+  if($state -ne 'Ready'){ throw "enforce test: task was not re-enabled after enforce, state=$state" }
+  # The repaired item must start immediately at the current boot, not only the next one.
+  Start-Sleep -Seconds 4
+  $procs = @(Get-Process notepad -ErrorAction SilentlyContinue)
+  if($procs.Count -lt 1){ throw 'enforce test: repaired item was not launched immediately' }
+  "ENFORCE_REENABLED state=$state launchedNow=$($procs.Count)"
+  Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force
+
+  # Tamper: delete the task entirely. Enforce must recreate it with a no-delay logon trigger and run it now.
+  Unregister-ScheduledTask -TaskPath '\MichStartupMaster\' -TaskName $enforceName -Confirm:$false | Out-Null
+  $p = Start-Process -FilePath $App -ArgumentList '--enforce-enabled' -Wait -PassThru
+  if($p.ExitCode -ne 0){ throw 'enforce test: second --enforce-enabled failed' }
+  $task = Get-ScheduledTask -TaskPath '\MichStartupMaster\' -TaskName $enforceName
+  if(-not $task){ throw 'enforce test: deleted managed task was not recreated' }
+  if($task.State -ne 'Ready'){ throw "enforce test: recreated task not ready, state=$($task.State)" }
+  Start-Sleep -Seconds 4
+  $procs2 = @(Get-Process notepad -ErrorAction SilentlyContinue)
+  if($procs2.Count -lt 1){ throw 'enforce test: recreated item was not launched immediately' }
+  "ENFORCE_RECREATED launchedNow=$($procs2.Count)"
+  Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force
+  [xml]$xml = (schtasks.exe /Query /TN $enforceTask /XML) -join "`n"
+  $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable); $ns.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task')
+  $hasLogon = $null -ne $xml.SelectSingleNode('//t:LogonTrigger',$ns)
+  $hasDelay = $null -ne $xml.SelectSingleNode('//t:LogonTrigger/t:Delay',$ns)
+  if(-not $hasLogon -or $hasDelay){ throw 'enforce test: recreated task lacks immediate logon trigger' }
+  "ENFORCE_RECREATED logon=$hasLogon delay=$hasDelay"
+
+  # The app's own boot agent task must always be enabled (never disabled by the guard).
+  $p = Start-Process -FilePath $App -ArgumentList '--enforce-enabled' -Wait -PassThru
+  if($p.ExitCode -ne 0){ throw 'enforce test: third --enforce-enabled failed' }
+  $agentTask = Get-ScheduledTask -TaskPath '\MichStartupMaster\' -TaskName 'MichStartupMasterApp' -ErrorAction SilentlyContinue
+  if($agentTask -and $agentTask.State -eq 'Disabled'){ throw 'enforce test: app boot agent task must stay enabled' }
+  "ENFORCE_AGENT_TASK state=$(if($agentTask){$agentTask.State}else{'missing'})"
+
+  # v2 migration regression: every item the legacy v2 state marked Enabled must be adopted
+  # as a managed startup task (read-only assertion against the real v2 state).
+  $v2Path = Join-Path $env:LOCALAPPDATA 'MichStartupMaster\state-v2.json'
+  if(Test-Path -LiteralPath $v2Path){
+    $p = Start-Process -FilePath $App -ArgumentList '--enforce-enabled' -Wait -PassThru
+    if($p.ExitCode -ne 0){ throw 'migration test: --enforce-enabled failed' }
+    $p = Start-Process -FilePath $App -ArgumentList '--list-managed' -RedirectStandardOutput (Join-Path $Root "artifacts\runtime-output\migrate-manifest.json") -Wait -PassThru
+    if($p.ExitCode -ne 0){ throw 'migration test: --list-managed failed' }
+    $migrated = Get-Content -LiteralPath (Join-Path $Root "artifacts\runtime-output\migrate-manifest.json") -Raw | ConvertFrom-Json
+    $v2 = Get-Content -LiteralPath $v2Path -Raw | ConvertFrom-Json
+    foreach($item in @($v2.Items | Where-Object { $_.Enabled -eq $true })){
+      if([string]::IsNullOrWhiteSpace($item.Target)){ continue }
+      $name = if(-not [string]::IsNullOrWhiteSpace($item.LegacyTaskName)){ $item.LegacyTaskName } else { $item.Name }
+      $safe = ("$name" -replace '[^A-Za-z0-9 _.-]','').Trim()
+      if([string]::IsNullOrWhiteSpace($safe)){ continue }
+      $task = "\MichStartupMaster\$safe"
+      $row = @($migrated | Where-Object { $_.task -eq $task })[0]
+      if(-not $row){ throw "migration test: v2-enabled item '$name' was not adopted as $task" }
+      "MIGRATE_ADOPTED name=$name task=$task mode=$($row.mode)"
+    }
+  }
+
+  # List correctness regression: everything registered must show, without mirror duplicates.
+  $p = Start-Process -FilePath $App -ArgumentList '--list' -RedirectStandardOutput (Join-Path $Root "artifacts\runtime-output\final-list.json") -Wait -PassThru
+  if($p.ExitCode -ne 0){ throw 'list test: --list failed' }
+  $listText = Get-Content -LiteralPath (Join-Path $Root "artifacts\runtime-output\final-list.json") -Raw
+  $list = $listText | ConvertFrom-Json
+  # WMI Startup Command rows must not mirror registry Run rows (one row per app, native source).
+  $regCmds = @($list | Where-Object { $_.source -eq 'Registry Run' } | ForEach-Object { ($_.command -replace '\s+',' ').Trim().ToLowerInvariant() })
+  $wmiDup = @($list | Where-Object { $_.source -eq 'Startup Command' -and $regCmds -contains (($_.command -replace '\s+',' ').Trim().ToLowerInvariant()) })
+  if($wmiDup.Count -ne 0){ throw "list test: WMI rows duplicate registry rows: $($wmiDup[0].name)" }
+  "LIST_NO_WMI_MIRRORS"
+  # Every scheduled task with a startup-relevant trigger must be listed (watchdogs like FullScreenSnipGuard).
+  $watchdog = @($list | Where-Object { $_.name -eq 'FullScreenSnipGuard' -and $_.source -eq 'Scheduled Task' })[0]
+  if(-not $watchdog){ throw 'list test: TimeTrigger watchdog task FullScreenSnipGuard missing from list' }
+  "LIST_WATCHDOG_PRESENT"
+  # The retired duplicate root launcher for a managed item must not appear as a second enabled row.
+  $managedNames = @($list | Where-Object { $_.location -like '\MichStartupMaster\*' -and $_.enabled } | ForEach-Object { $_.name })
+  $dupRows = @($list | Where-Object { $_.source -eq 'Scheduled Task' -and $_.enabled -and $_.location -notlike '\MichStartupMaster\*' -and $_.name -notlike '\Microsoft\*' -and $_.name -notlike '\GoogleSystem\*' } | Where-Object {
+    $base = $_.name -replace '^\\MichStartupMaster\\',''
+    $managedNames -contains $base
+  })
+  if($dupRows.Count -ne 0){ throw "list test: duplicate enabled launcher still shown: $($dupRows[0].name)" }
+  "LIST_NO_RETIRED_DUPLICATES"
+
+  # Boot-coverage guarantee: every boot source (registry, folders, tasks, services, drivers,
+  # Winlogon, Active Setup, AppInit) must be represented in the app's own list.
+  $p = Start-Process -FilePath $App -ArgumentList '--audit-boot' -RedirectStandardOutput (Join-Path $Root "artifacts\runtime-output\boot-audit.txt") -Wait -PassThru
+  if($p.ExitCode -ne 0){ throw 'boot audit test: --audit-boot failed' }
+  $audit = Get-Content -LiteralPath (Join-Path $Root "artifacts\runtime-output\boot-audit.txt") -Raw
+  if($audit -notmatch 'gaps=0'){ throw "boot audit test: boot sources missing from the app: $($audit.Substring(0,[Math]::Min(400,$audit.Length)))" }
+  "BOOT_AUDIT_COVERAGE $audit"
+
+  # Tray guarantee: every managed tray app runs exactly one visible instance (one correct icon),
+  # and no quiet wrapper process may ever draw its own tray icon (the broken-duplicate failure).
+  if($audit -notmatch 'TRAY_AUDIT'){ throw 'boot audit test: TRAY_AUDIT line missing' }
+  if($audit -notmatch 'findings=0'){ throw "boot audit test: tray duplicates/broken icons detected: $($audit.Substring(0,[Math]::Min(400,$audit.Length)))" }
+  "TRAY_AUDIT_CLEAN $audit"
+}
+finally {
+  Remove-ProofTask $enforceTask
 }

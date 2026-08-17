@@ -10,6 +10,7 @@ using System.Management;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -28,6 +29,7 @@ namespace MichStartupMaster
         public static readonly string DisabledStore = Path.Combine(AppData, "disabled-items.tsv");
         public static readonly string ProtectedDisabledStore = Path.Combine(AppData, "protected-disabled-items.tsv");
         public static readonly string ProtectedQuietStore = Path.Combine(AppData, "protected-quiet-popup-items.tsv");
+        public static readonly string EnabledStore = Path.Combine(AppData, "enabled-startup-items.tsv");
         public static readonly string DisabledStartupFolder = Path.Combine(AppData, "DisabledStartupFolderItems");
         public static readonly string ManagedTaskRoot = @"\MichStartupMaster\";
         private static Icon _appIcon;
@@ -69,6 +71,7 @@ namespace MichStartupMaster
                 if (cmd == "--smoke") return Smoke();
                 if (cmd == "--version") { Console.WriteLine("MichStartupMaster GitHub recovery build"); return 0; }
                 if (cmd == "--list") { Console.WriteLine(StartupService.ToJson(StartupService.ScanAll())); return 0; }
+                if (cmd == "--audit-boot") { Console.WriteLine(StartupService.AuditBootCoverage()); Console.WriteLine(StartupService.AuditTrayCoverage()); return 0; }
                 if (cmd == "--add-test-task") return CliAddTestTask(args, true);
                 if (cmd == "--add-test-task-tray") return CliAddTestTask(args, true);
                 if (cmd == "--add-test-task-normal") return CliAddTestTask(args, false);
@@ -78,9 +81,11 @@ namespace MichStartupMaster
                 if (cmd == "--protect-disabled") { Console.WriteLine(ProtectedDisabledService.ProtectCurrentDisabled()); return 0; }
                 if (cmd == "--enforce-disabled") { Console.WriteLine(ProtectedDisabledService.EnforceProtected()); return 0; }
                 if (cmd == "--enforce-quiet") { Console.WriteLine(ProtectedQuietService.EnforceProtected()); return 0; }
+                if (cmd == "--enforce-enabled") { Console.WriteLine(EnabledStartupService.EnforceEnabled()); return 0; }
+                if (cmd == "--list-managed") { Console.WriteLine(EnabledStartupService.ToJson()); return 0; }
                 if (cmd == "--toggle-popup") return CliTogglePopup(args);
                 if (cmd == "--set-enabled") return CliSetEnabled(args);
-                if (cmd == "--tray-run") { TrayRunner.Run(args.Skip(1).ToArray()); return 0; }
+                if (cmd == "--tray-run") { TrayRunner.RunMain(args.Skip(1).ToArray()); return 0; }
                 if (cmd == "--start-in-tray" || cmd == "--agent")
                 {
                     Application.EnableVisualStyles();
@@ -89,6 +94,7 @@ namespace MichStartupMaster
                     using (var singleInstance = new System.Threading.Mutex(true, @"Local\MichStartupMaster.MainInstance", out createdNew))
                     {
                         if (!createdNew) return 0;
+                        StartupService.EnsureAgentRegistered();
                         Application.Run(new MainForm(true));
                     }
                     return 0;
@@ -112,6 +118,7 @@ namespace MichStartupMaster
                     TryShowExistingMainWindow();
                     return 0;
                 }
+                StartupService.EnsureAgentRegistered();
                 Application.Run(new MainForm());
             }
             return 0;
@@ -320,8 +327,200 @@ namespace MichStartupMaster
             AddAutoDrivers(items);
             AddStartupApproved(items);
             items.AddRange(DisabledStoreService.LoadDisabledItems());
+            AddLegacyV2Items(items);
             HydrateHumanNames(items);
             return Dedupe(items).OrderBy(x => x.Enabled ? 0 : 1).ThenBy(x => x.Source).ThenBy(x => x.Name).ToList();
+        }
+
+        // Verify that every single boot source on the machine is represented in the app's own
+        // list (ScanAll). Duplicates that dedupe collapses into a canonical row count as covered;
+        // anything truly absent is reported as a gap so "everything shows in the app" is a
+        // checkable, permanent guarantee rather than a hope.
+        public static string AuditBootCoverage()
+        {
+            try
+            {
+                var shown = ScanAll();
+                var raw = new List<StartupItem>();
+                AddCommonRegistryStartup(raw);
+                AddStartupFolder(raw, Environment.GetFolderPath(Environment.SpecialFolder.Startup), "User");
+                AddStartupFolder(raw, Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), "Machine");
+                AddLogonTasks(raw);
+                AddAutoServices(raw);
+                AddAutoDrivers(raw);
+                var gaps = new List<string>();
+                foreach (var src in raw)
+                {
+                    if (BootSourceCovered(src, shown)) continue;
+                    gaps.Add(src.Source + " | " + (string.IsNullOrWhiteSpace(src.Name) ? "?" : src.Name) + " | " + (string.IsNullOrWhiteSpace(src.Command) ? "" : src.Command));
+                }
+                if (gaps.Count == 0) return "BOOT_AUDIT sources=" + raw.Count + " shown=" + shown.Count + " gaps=0";
+                return "BOOT_AUDIT sources=" + raw.Count + " shown=" + shown.Count + " gaps=" + gaps.Count + Environment.NewLine + string.Join(Environment.NewLine, gaps.Take(50));
+            }
+            catch (Exception ex) { return "BOOT_AUDIT error: " + ex.GetBaseException().Message; }
+        }
+
+        private static bool BootSourceCovered(StartupItem src, List<StartupItem> shown)
+        {
+            string name = NormBootKey(src.Name);
+            string loc = NormBootKey(src.Location);
+            string cmd = NormBootKey(src.Command);
+            foreach (var it in shown)
+            {
+                if (!string.Equals(it.Source, src.Source, StringComparison.OrdinalIgnoreCase)) continue;
+                if (name.Length > 0 && NormBootKey(it.Name) == name) return true;
+                if (loc.Length > 0 && NormBootKey(it.Location) == loc) return true;
+                if (cmd.Length > 8 && NormBootKey(it.Command) == cmd) return true;
+            }
+            // A raw source hidden by dedupe is still covered when a shown row launches the exact
+            // same app (retired duplicate launchers collapse into their canonical managed row).
+            // Only app-launching sources qualify; never services/drivers whose shared svchost paths
+            // would otherwise mask a genuinely missing service. A shown quiet row's command is a
+            // --tray-run wrapper payload, so decode it back to the real target + arguments first.
+            if (cmd.Length > 8 && (src.Source == "Scheduled Task" || src.Source == "Registry Run" || src.Source == "Registry RunOnce" || src.Source == "Policy Run" || src.Source == "Startup Folder"))
+            {
+                foreach (var it in shown)
+                {
+                    string shownCmd = it.Command ?? "";
+                    string shownTarget, shownArgs;
+                    if (TryDecodeTrayPayload(shownCmd, out shownTarget, out shownArgs)) shownCmd = shownTarget + " " + shownArgs;
+                    if (NormBootKey(shownCmd) == cmd) return true;
+                }
+            }
+            return false;
+        }
+
+        private static string NormBootKey(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return "";
+            var sb = new StringBuilder();
+            foreach (char ch in value.ToLowerInvariant().Trim().Trim('"'))
+            {
+                if (!char.IsWhiteSpace(ch)) sb.Append(ch);
+            }
+            return sb.ToString();
+        }
+
+        // ---- Tray audit: every tray app shows exactly one correct icon, forever ----
+        // The historical failure mode was the quiet wrapper adding its OWN tray icon next to the
+        // app's real one (a blank/default "broken" duplicate), and duplicate launchers starting a
+        // second instance (a second real icon). This check makes both provably impossible to miss:
+        //   WRAPPER_ICON - a --tray-run wrapper process is still showing a tray icon (wrapper must
+        //                  stay invisible; the app draws its own icon)
+        //   DUP          - two visible instances of the same managed tray app are running
+        // A process is "visible" when it owns a tray-icon-class window, so app-internal helper
+        // processes (e.g. whisper-key's launcher stub, which owns no windows) never count.
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WinInfo { public int Pid; public string Class; }
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll")]
+        private static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+
+        private static List<WinInfo> SnapshotTopLevelWindows()
+        {
+            var list = new List<WinInfo>();
+            try
+            {
+                EnumWindows((h, l) =>
+                {
+                    uint pid;
+                    GetWindowThreadProcessId(h, out pid);
+                    var sb = new System.Text.StringBuilder(256);
+                    GetClassName(h, sb, 256);
+                    list.Add(new WinInfo { Pid = (int)pid, Class = sb.ToString() });
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { }
+            return list;
+        }
+
+        private static bool IsTrayIconClass(string cls)
+        {
+            if (string.IsNullOrEmpty(cls)) return false;
+            if (cls.StartsWith("WindowsForms10.Window", StringComparison.Ordinal)) return true; // WinForms NotifyIcon (+ main form)
+            if (cls.IndexOf("SystemTrayIcon", StringComparison.Ordinal) >= 0) return true;      // pystray (icon + menu windows)
+            if (cls.IndexOf("TrayIcon", StringComparison.Ordinal) >= 0) return true;            // Qt tray icon message window
+            if (cls.IndexOf("NotifyIcon", StringComparison.Ordinal) >= 0) return true;          // Electron / generic
+            if (string.Equals(cls, "AutoHotkey", StringComparison.OrdinalIgnoreCase)) return true; // AutoHotkey script tray icon
+            return false;
+        }
+
+        private static bool ProcessHasTrayIcon(List<WinInfo> wins, int pid)
+        {
+            foreach (var w in wins) if (w.Pid == pid && IsTrayIconClass(w.Class)) return true;
+            return false;
+        }
+
+        // Every enabled managed tray app must be running exactly once, and every wrapper process
+        // must stay invisible. Returns a TRAY_AUDIT line plus one line per finding.
+        public static string AuditTrayCoverage()
+        {
+            try
+            {
+                var rows = EnabledStartupService.Load().Where(r => r.Kind == "managed-task" && r.Mode == "tray").ToList();
+                var procs = new List<Tuple<int, string, string>>(); // pid, exe, commandline(lower)
+                try
+                {
+                    using (var searcher = new System.Management.ManagementObjectSearcher("SELECT ProcessId,ExecutablePath,CommandLine FROM Win32_Process"))
+                    {
+                        foreach (System.Management.ManagementObject mo in searcher.Get())
+                        {
+                            int pid = Convert.ToInt32(mo["ProcessId"]);
+                            string cmd = Convert.ToString(mo["CommandLine"] ?? "").ToLowerInvariant();
+                            string exe = Convert.ToString(mo["ExecutablePath"] ?? "");
+                            procs.Add(Tuple.Create(pid, exe, cmd));
+                        }
+                    }
+                }
+                catch { }
+                var wins = SnapshotTopLevelWindows();
+                var findings = new List<string>();
+                int running = 0;
+
+                // 1. No wrapper process may ever draw a tray icon (the wrapper stays invisible).
+                foreach (var p in procs)
+                {
+                    string cmd = p.Item3;
+                    if (cmd.IndexOf("--tray-run", StringComparison.Ordinal) < 0) continue;
+                    if (cmd.IndexOf("--agent", StringComparison.Ordinal) >= 0) continue; // the agent itself owns its one icon
+                    if (ProcessHasTrayIcon(wins, p.Item1))
+                        findings.Add("WRAPPER_ICON pid=" + p.Item1 + " (a quiet wrapper is showing a tray icon; wrappers must stay invisible)");
+                }
+
+                // 2. Each managed tray app runs exactly one visible instance.
+                foreach (var row in rows)
+                {
+                    var candidates = new List<string>();
+                    string target = (row.Target ?? "").Trim().ToLowerInvariant();
+                    if (target.Length > 0) candidates.Add(target);
+                    // Indirection targets (powershell.exe -File script.ps1 / wscript x.vbs / pythonw x.pyw)
+                    // never stay running; match on the script's directory so the real worker is found.
+                    foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(row.Arguments ?? "", @"[""']?([A-Za-z]:[^""'\s]+?\.(?:ps1|pyw|py|vbs|bat|cmd|exe|lnk))[""']?", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    {
+                        string script = m.Groups[1].Value;
+                        try { string dir = System.IO.Path.GetDirectoryName(script); if (!string.IsNullOrWhiteSpace(dir)) candidates.Add(dir.ToLowerInvariant()); }
+                        catch { }
+                    }
+                    if (candidates.Count == 0) continue;
+                    var matches = procs.Where(p =>
+                        p.Item3.IndexOf("--type=", StringComparison.Ordinal) < 0 && // exclude Electron/Chromium children
+                        candidates.Any(c => c.Length > 0 && p.Item3.IndexOf(c, StringComparison.Ordinal) >= 0)).ToList();
+                    var visible = matches.Where(p => ProcessHasTrayIcon(wins, p.Item1)).ToList();
+                    if (visible.Count > 0) running++;
+                    if (visible.Count > 1)
+                        findings.Add("DUP " + row.Name + " | " + visible.Count + " visible instances (pids " + string.Join(",", visible.Select(v => v.Item1.ToString())) + ")");
+                }
+
+                if (findings.Count == 0) return "TRAY_AUDIT apps=" + rows.Count + " running=" + running + " findings=0";
+                return "TRAY_AUDIT apps=" + rows.Count + " running=" + running + " findings=" + findings.Count + Environment.NewLine + string.Join(Environment.NewLine, findings);
+            }
+            catch (Exception ex) { return "TRAY_AUDIT error: " + ex.GetBaseException().Message; }
         }
 
         private static void HydrateHumanNames(List<StartupItem> items)
@@ -411,14 +610,57 @@ namespace MichStartupMaster
 
         private static List<StartupItem> Dedupe(List<StartupItem> items)
         {
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var result = new List<StartupItem>();
-            foreach (var item in items)
+            var all = items.ToList();
+            // Native (registry/folder) commands that are already surfaced: WMI Startup Command
+            // rows are only an alternate mirror of the same registrations.
+            var nativeCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var item in all)
             {
+                if ((item.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase)) continue;
+                if (item.Source == "Registry Run" || item.Source == "Registry RunOnce" || item.Source == "Registry RunServices" || item.Source == "Policy Run" || item.Source == "Startup Folder")
+                    nativeCommands.Add(NormalizeManagedCommand(item.Command, ""));
+            }
+            // Commands a managed item already launches: any other registration that launches the
+            // exact same app is a retired/redundant duplicate and is not shown again.
+            var managedCommands = new HashSet<string>(EnabledStartupService.Load()
+                .Where(r => r.Kind == "managed-task" && !string.IsNullOrWhiteSpace(r.Target))
+                .Select(r => NormalizeManagedCommand(r.Target, r.Arguments)), StringComparer.OrdinalIgnoreCase);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var wmiSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var result = new List<StartupItem>();
+            // Live registrations first: they always win over informational/legacy records.
+            foreach (var item in all.Where(i => !(i.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase)))
+            {
+                // A disabled task that launches the same app as a managed item is the retired
+                // duplicate launcher; the managed row is the single source of truth.
+                if (item.Source == "Scheduled Task" && !item.Enabled && managedCommands.Contains(NormalizeManagedCommand(item.Command, ""))) continue;
+                if (item.Source == "Startup Command")
+                {
+                    string nc = NormalizeManagedCommand(item.Command, "");
+                    if (nativeCommands.Contains(nc)) continue;
+                    if (!wmiSeen.Add(nc)) continue;
+                }
+                string key = (item.Source + "|" + item.Location + "|" + item.Name + "|" + item.Command).ToLowerInvariant();
+                if (seen.Add(key)) result.Add(item);
+            }
+            // Legacy disabled-store records are informational only: drop them when a live
+            // registration already covers the same source + location + name.
+            foreach (var item in all.Where(i => (i.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase)))
+            {
+                string baseKey = (item.Source + "|" + item.Location + "|" + item.Name).ToLowerInvariant();
+                bool covered = result.Any(live => string.Equals((live.Source + "|" + live.Location + "|" + live.Name).ToLowerInvariant(), baseKey, StringComparison.OrdinalIgnoreCase));
+                if (covered) continue;
                 string key = (item.Source + "|" + item.Location + "|" + item.Name + "|" + item.Command).ToLowerInvariant();
                 if (seen.Add(key)) result.Add(item);
             }
             return result;
+        }
+
+        // Normalize a launch command to its lower-cased, collapsed form for duplicate detection.
+        private static string NormalizeManagedCommand(string target, string args)
+        {
+            try { return Regex.Replace((target + " " + (args ?? "")).ToLowerInvariant(), @"\s+", " ").Trim().Trim('"'); }
+            catch { return (target + " " + (args ?? "")).ToLowerInvariant(); }
         }
 
         private static void AddWmiStartupCommands(List<StartupItem> items)
@@ -543,20 +785,23 @@ namespace MichStartupMaster
                 string script = @"
 $ErrorActionPreference='Stop'
 foreach($t in Get-ScheduledTask){
-  $hasLogon=$false; $hasBoot=$false; $hasDelay=$false
+  $hasLogon=$false; $hasBoot=$false; $hasTime=$false; $hasDelay=$false
   foreach($tr in @($t.Triggers)){
     if($null -eq $tr){ continue }
     $cn = if($tr.CimClass){ [string]$tr.CimClass.CimClassName } else { '' }
     if($cn -like '*LogonTrigger*'){ $hasLogon=$true }
     if($cn -like '*BootTrigger*'){ $hasBoot=$true }
+    if($cn -like '*TimeTrigger*'){ $hasTime=$true }
     $delayProp=$tr.PSObject.Properties['Delay']
     if($delayProp -and $delayProp.Value){ $hasDelay=$true }
   }
-  if($hasLogon -or $hasBoot){
+  $path = $t.TaskPath
+  $isMicrosoft = $path.StartsWith('\Microsoft\') -or $path.StartsWith('\Windows\') -or $path.StartsWith('\GoogleSystem\')
+  if($hasLogon -or $hasBoot -or ($hasTime -and -not $isMicrosoft)){
     $actions = (@($t.Actions) | ForEach-Object { if($_){ (($_.Execute) + ' ' + ($_.Arguments)).Trim() } }) -join ' || '
     $enabled = if($t.Settings.Enabled){'true'}else{'false'}
     $managed = if(($t.TaskPath + $t.TaskName).StartsWith('\MichStartupMaster\')){'true'}else{'false'}
-    $k=@(); if($hasLogon){ $k+='logon' }; if($hasBoot){ $k+='boot' }; $triggerKind=$k -join '+'
+    $k=@(); if($hasLogon){ $k+='logon' }; if($hasBoot){ $k+='boot' }; if($hasTime){ $k+='time' }; $triggerKind=$k -join '+'
     ($t.TaskPath + $t.TaskName) + ""`t"" + $enabled + ""`t"" + $t.State + ""`t"" + $hasDelay + ""`t"" + $managed + ""`t"" + $triggerKind + ""`t"" + $actions
   }
 }
@@ -663,6 +908,81 @@ foreach($t in Get-ScheduledTask){
             catch (Exception ex) { items.Add(ErrorItem("Startup Approval", scope, root.Name + @"\" + subKey, ex)); }
         }
 
+        // Surface startup items that exist only in the legacy v2 state (no live registration
+        // anywhere) so nothing the user once configured is invisible. Restore re-creates them.
+        private static void AddLegacyV2Items(List<StartupItem> items)
+        {
+            try
+            {
+                string v2Path = Path.Combine(Program.AppData, "state-v2.json");
+                if (!File.Exists(v2Path)) return;
+                string raw;
+                try { raw = File.ReadAllText(v2Path); } catch { return; }
+                System.Text.Json.JsonDocument doc;
+                try { doc = System.Text.Json.JsonDocument.Parse(raw); } catch { return; }
+                using (doc)
+                {
+                    if (!doc.RootElement.TryGetProperty("Items", out var arr) || arr.ValueKind != System.Text.Json.JsonValueKind.Array) return;
+                    var liveTaskLocs = new HashSet<string>(items.Where(i => i.Source == "Scheduled Task").Select(i => (i.Location ?? "").ToLowerInvariant()), StringComparer.OrdinalIgnoreCase);
+                    var manifest = EnabledStartupService.Load();
+                    foreach (var it in arr.EnumerateArray())
+                    {
+                        try
+                        {
+                            string name = JsonV2String(it, "LegacyTaskName");
+                            if (string.IsNullOrWhiteSpace(name)) name = JsonV2String(it, "Name");
+                            string target = JsonV2String(it, "Target");
+                            string args = JsonV2String(it, "Arguments");
+                            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(target)) continue;
+                            string safeName = Regex.Replace(name, "[^A-Za-z0-9 _.-]", "").Trim();
+                            if (safeName.Length == 0) safeName = "StartupApp";
+                            string taskLocation = Program.ManagedTaskRoot + safeName;
+                            // Already tracked or live: the normal scan shows it.
+                            if (manifest.Any(r => string.Equals(r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase))) continue;
+                            if (liveTaskLocs.Contains(taskLocation.ToLowerInvariant())) continue;
+                            if (EnabledStartupService.IsV2Migrated(taskLocation)) continue;
+                            bool enabled = JsonV2Bool(it, "Enabled");
+                            int launchMode = JsonV2Int(it, "LaunchMode");
+                            string command = (target + (string.IsNullOrWhiteSpace(args) ? "" : " " + args)).Trim();
+                            items.Add(new StartupItem
+                            {
+                                Id = "legacy|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(safeName)) + "|" + launchMode,
+                                Name = safeName,
+                                Source = "Legacy v2",
+                                Scope = "User/System",
+                                Command = command,
+                                Location = "Legacy v2 state",
+                                Enabled = false,
+                                CanDisable = false,
+                                IsManaged = false,
+                                Status = (enabled ? "Enabled" : "Disabled") + " in legacy v2 state — not currently registered; Restore to start it at every boot"
+                            });
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static string JsonV2String(System.Text.Json.JsonElement el, string key)
+        {
+            try { if (el.TryGetProperty(key, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String) return v.GetString() ?? ""; } catch { }
+            return "";
+        }
+
+        private static bool JsonV2Bool(System.Text.Json.JsonElement el, string key)
+        {
+            try { if (el.TryGetProperty(key, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.True) return true; } catch { }
+            return false;
+        }
+
+        private static int JsonV2Int(System.Text.Json.JsonElement el, string key)
+        {
+            try { if (el.TryGetProperty(key, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.Number) return v.GetInt32(); } catch { }
+            return 0;
+        }
+
         private static bool IsServiceStartupMode(string startMode)
         {
             return string.Equals(startMode, "Auto", StringComparison.OrdinalIgnoreCase) || string.Equals(startMode, "Automatic", StringComparison.OrdinalIgnoreCase);
@@ -675,18 +995,54 @@ foreach($t in Get-ScheduledTask){
 
         public static void Disable(StartupItem item)
         {
-            if (item.Id.StartsWith("reg|")) DisableRegistry(item);
-            else if (item.Id.StartsWith("active|")) DisableActiveSetup(item);
-            else if (item.Id.StartsWith("folder|")) DisableStartupFolder(item);
-            else if (item.Id.StartsWith("task|")) RunChecked("schtasks.exe", "/Change /TN " + Q(item.Location) + " /Disable");
-            else if (item.Id.StartsWith("service|")) DisableServiceOrDriver(item, "service");
-            else if (item.Id.StartsWith("driver|")) DisableServiceOrDriver(item, "driver");
-            else throw new InvalidOperationException("Unsupported item: " + item.Id);
+            if (item == null) throw new ArgumentNullException("item");
+            if (item.Id.StartsWith("legacy|", StringComparison.OrdinalIgnoreCase))
+            {
+                // A legacy v2 ghost is already not registered; "disabling" it just takes it
+                // over so the migration/view stop surfacing it.
+                EnabledStartupService.Remove(item);
+                try
+                {
+                    string[] parts = item.Id.Split('|');
+                    if (parts.Length > 1 && !string.IsNullOrWhiteSpace(UnB64(parts[1]))) EnabledStartupService.MarkV2Migrated(Program.ManagedTaskRoot + UnB64(parts[1]));
+                }
+                catch { }
+                return;
+            }
+            // Record intent FIRST: even if the direct disable call fails or times out, the guard
+            // will keep enforcing the disabled state and the manifest row is removed in finally,
+            // so a half-completed disable can never leave the item silently enabled again.
             ProtectedDisabledService.Protect(item);
+            // A quiet (tray) task must also leave the quiet-protection store. Otherwise the quiet
+            // guard re-registers it as an ENABLED task every 30 seconds and the disable can never
+            // stick — the exact "disable does not work" bug for quiet apps like GameSir/AHK/whisper-key.
+            if (item.Id.StartsWith("task|", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(item.Location))
+                ProtectedQuietService.UnprotectTask(item.Location);
+            try
+            {
+                if (item.Id.StartsWith("reg|")) DisableRegistry(item);
+                else if (item.Id.StartsWith("active|")) DisableActiveSetup(item);
+                else if (item.Id.StartsWith("folder|")) DisableStartupFolder(item);
+                else if (item.Id.StartsWith("task|")) RunChecked("schtasks.exe", "/Change /TN " + Q(item.Location) + " /Disable");
+                else if (item.Id.StartsWith("service|")) DisableServiceOrDriver(item, "service");
+                else if (item.Id.StartsWith("driver|")) DisableServiceOrDriver(item, "driver");
+                else throw new InvalidOperationException("Unsupported item: " + item.Id);
+            }
+            finally
+            {
+                EnabledStartupService.Remove(item);
+            }
         }
 
         public static void Enable(StartupItem item)
         {
+            if (item == null) throw new ArgumentNullException("item");
+            if (item.Id.StartsWith("legacy|", StringComparison.OrdinalIgnoreCase))
+            {
+                // Recreate the managed startup from the item's stored v2 configuration.
+                EnableLegacyV2(item);
+                return;
+            }
             ProtectedDisabledService.Unprotect(item);
             if (item.Id.StartsWith("disabled|reg|")) RestoreRegistry(item);
             else if (item.Id.StartsWith("disabled|active|")) RestoreActiveSetup(item);
@@ -695,6 +1051,54 @@ foreach($t in Get-ScheduledTask){
             else if (item.Id.StartsWith("disabled|driver|")) RestoreServiceOrDriver(item);
             else if (item.Id.StartsWith("task|")) RunChecked("schtasks.exe", "/Change /TN " + Q(item.Location) + " /Enable");
             else throw new InvalidOperationException("Unsupported disabled item: " + item.Id);
+            EnabledStartupService.UpsertFromItem(item);
+            // Re-assert quiet protection for a quiet task so the quiet guard keeps it running
+            // quietly even if the manifest row is ever lost again.
+            if (item.Id.StartsWith("task|") && StartupService.CommandUsesTrayWrapper(item.Command ?? "") && !string.IsNullOrWhiteSpace(item.Location))
+            {
+                string quietTarget, quietArgs;
+                try
+                {
+                    StartupService.ResolveLaunchTarget(item, out quietTarget, out quietArgs);
+                    if (!string.IsNullOrWhiteSpace(quietTarget)) ProtectedQuietService.ProtectTask(item.Location, quietTarget, quietArgs ?? "");
+                }
+                catch { }
+            }
+        }
+
+        private static void EnableLegacyV2(StartupItem item)
+        {
+            try
+            {
+                string[] parts = item.Id.Split('|');
+                string legacyName = parts.Length > 1 ? UnB64(parts[1]) : "";
+                if (string.IsNullOrWhiteSpace(legacyName)) throw new InvalidOperationException("Legacy item name is missing");
+                string v2Path = Path.Combine(Program.AppData, "state-v2.json");
+                if (!File.Exists(v2Path)) throw new InvalidOperationException("Legacy v2 state file is missing");
+                string target = "", args = "";
+                int launchMode = 0;
+                using (var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(v2Path)))
+                {
+                    if (doc.RootElement.TryGetProperty("Items", out var arr) && arr.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    {
+                        foreach (var it in arr.EnumerateArray())
+                        {
+                            string name = it.TryGetProperty("LegacyTaskName", out var lt) && lt.ValueKind == System.Text.Json.JsonValueKind.String ? lt.GetString() : "";
+                            if (string.IsNullOrWhiteSpace(name)) { name = it.TryGetProperty("Name", out var nn) && nn.ValueKind == System.Text.Json.JsonValueKind.String ? nn.GetString() : ""; }
+                            if (!string.Equals(name, legacyName, StringComparison.OrdinalIgnoreCase)) continue;
+                            target = it.TryGetProperty("Target", out var tg) && tg.ValueKind == System.Text.Json.JsonValueKind.String ? tg.GetString() : "";
+                            args = it.TryGetProperty("Arguments", out var ag) && ag.ValueKind == System.Text.Json.JsonValueKind.String ? ag.GetString() : "";
+                            if (it.TryGetProperty("LaunchMode", out var lm) && lm.ValueKind == System.Text.Json.JsonValueKind.Number) { try { launchMode = lm.GetInt32(); } catch { } }
+                            break;
+                        }
+                    }
+                }
+                if (string.IsNullOrWhiteSpace(target)) throw new InvalidOperationException("Legacy item target is missing in v2 state");
+                if (!File.Exists(target)) throw new FileNotFoundException("Application not found", target);
+                AddManagedStartup(legacyName, target, args ?? "", launchMode == 2, true);
+                EnabledStartupService.MarkV2Migrated(Program.ManagedTaskRoot + legacyName);
+            }
+            catch (Exception ex) { throw new InvalidOperationException("Could not restore legacy item: " + ex.Message, ex); }
         }
 
         private static void DisableRegistry(StartupItem item)
@@ -849,6 +1253,55 @@ foreach($t in Get-ScheduledTask){
             DisabledStoreService.Remove(item.Id);
         }
 
+        // Guarantee the hidden boot agent is registered from this copy of the app:
+        // a Startup-folder shortcut and a managed logon task, both launching --agent.
+        public static void EnsureAgentRegistered()
+        {
+            // Adopt legacy v2 enabled items into the enforcement manifest right away, so items
+            // set to start in the old app are registered and running at this very boot.
+            try { EnabledStartupService.MigrateV2EnabledItems(); } catch { }
+            try
+            {
+                string exe = ProcessExePath();
+                if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe)) return;
+                string wd = Path.GetDirectoryName(exe) ?? "";
+                string lnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "Mich Startup Master Agent.lnk");
+                bool lnkOk = false;
+                try
+                {
+                    if (File.Exists(lnk))
+                    {
+                        Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                        if (shellType != null)
+                        {
+                            dynamic shell = Activator.CreateInstance(shellType);
+                            dynamic shortcut = shell.CreateShortcut(lnk);
+                            lnkOk = string.Equals(Convert.ToString(shortcut.TargetPath), exe, StringComparison.OrdinalIgnoreCase)
+                                && string.Equals(Convert.ToString(shortcut.Arguments ?? "").Trim(), "--agent", StringComparison.OrdinalIgnoreCase);
+                        }
+                    }
+                }
+                catch { lnkOk = false; }
+                if (!lnkOk)
+                {
+                    string script =
+                        "$ErrorActionPreference='SilentlyContinue';" +
+                        "function D($s){[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))};" +
+                        "$lnk = D '" + B64(lnk) + "';" +
+                        "$exe = D '" + B64(exe) + "';" +
+                        "$wd = D '" + B64(wd) + "';" +
+                        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($lnk);" +
+                        "$s.TargetPath=$exe;$s.Arguments='--agent';$s.WorkingDirectory=$wd;" +
+                        "$s.Description='Mich Startup Master hidden startup agent';$s.Save();";
+                    RunPowerShellScript(script);
+                }
+                // Backup path: a managed logon task that re-runs the agent with no delay.
+                string task = Program.ManagedTaskRoot + "MichStartupMasterApp";
+                RegisterLogonTaskAt(task, exe, "--agent");
+            }
+            catch { }
+        }
+
         public static string AddManagedStartup(string name, string targetPath, string arguments, bool trayMode, bool noDelay)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name is required");
@@ -862,6 +1315,7 @@ foreach($t in Get-ScheduledTask){
             string taskLocation = RegisterLogonTaskAt(Program.ManagedTaskRoot + safeName, execute, actionArgs);
             if (trayMode) ProtectedQuietService.ProtectTask(taskLocation, targetPath, arguments ?? "");
             if (!noDelay) { /* Task Scheduler has no explicit Delay either way; this app always uses immediate logon triggers. */ }
+            EnabledStartupService.Upsert(new EnabledStartupService.Row { Kind = "managed-task", Name = safeName, Scope = "User/System", Command = execute + " " + actionArgs, Location = taskLocation, Status = "Managed startup task", Target = targetPath, Arguments = arguments ?? "", Mode = trayMode ? "tray" : "normal", TaskLocation = taskLocation });
             return taskLocation;
         }
 
@@ -885,7 +1339,7 @@ foreach($t in Get-ScheduledTask){
                 "$action=if([string]::IsNullOrWhiteSpace($arguments)){New-ScheduledTaskAction -Execute $execute}else{New-ScheduledTaskAction -Execute $execute -Argument $arguments};" +
                 "$trigger=New-ScheduledTaskTrigger -AtLogOn;" +
                 "$principal=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited;" +
-                "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 0);" +
+                "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 0);" +
                 "Register-ScheduledTask -TaskPath $path -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null;";
             RunPowerShellScript(script);
             return path + taskName;
@@ -901,7 +1355,7 @@ foreach($t in Get-ScheduledTask){
             throw new InvalidOperationException("Unsupported registry root: " + rootName);
         }
 
-        private static bool IsSelfTarget(string targetPath)
+        internal static bool IsSelfTarget(string targetPath)
         {
             try
             {
@@ -916,6 +1370,7 @@ foreach($t in Get-ScheduledTask){
         {
             string tn = nameOrTask.StartsWith("\\") ? nameOrTask : Program.ManagedTaskRoot + nameOrTask.Replace(Program.ManagedTaskRoot.Trim('\\'), "").Trim('\\');
             ProtectedQuietService.UnprotectTask(tn);
+            EnabledStartupService.RemoveByTask(tn);
             RunChecked("schtasks.exe", "/Delete /F /TN " + Q(tn));
         }
 
@@ -942,6 +1397,7 @@ foreach($t in Get-ScheduledTask){
                 RegisterLogonTaskAt(item.Location, execute, actionArgs);
                 if (popupEnabled) ProtectedQuietService.UnprotectTask(item.Location);
                 else ProtectedQuietService.ProtectTask(item.Location, target, arguments ?? "");
+                EnabledStartupService.Upsert(new EnabledStartupService.Row { Kind = "managed-task", Name = item.Name ?? "", Scope = item.Scope ?? "", Command = execute + " " + actionArgs, Location = item.Location, Status = item.Status ?? "", Target = target, Arguments = arguments ?? "", Mode = popupEnabled ? "normal" : "tray", TaskLocation = item.Location });
                 return;
             }
 
@@ -966,6 +1422,7 @@ foreach($t in Get-ScheduledTask){
                 RegisterLogonTaskAt(item.Location, execute, actionArgs);
                 if (trayMode) ProtectedQuietService.ProtectTask(item.Location, targetPath, arguments ?? "");
                 else ProtectedQuietService.UnprotectTask(item.Location);
+                EnabledStartupService.Upsert(new EnabledStartupService.Row { Kind = "managed-task", Name = name ?? "", Scope = item.Scope ?? "", Command = execute + " " + actionArgs, Location = item.Location, Status = item.Status ?? "", Target = targetPath, Arguments = arguments ?? "", Mode = trayMode ? "tray" : "normal", TaskLocation = item.Location });
                 return item.Location;
             }
             if (item.PopupLabel() == "N/A") throw new InvalidOperationException("This startup source cannot be edited as an application launch. Services, drivers, Winlogon, AppInit, and Active Setup rows should be changed from their owning tool.");
@@ -974,7 +1431,7 @@ foreach($t in Get-ScheduledTask){
             return AddManagedStartup(name, targetPath, arguments ?? "", trayMode, true);
         }
 
-        private static void BuildManagedAction(string targetPath, string arguments, bool trayMode, out string execute, out string actionArgs)
+        internal static void BuildManagedAction(string targetPath, string arguments, bool trayMode, out string execute, out string actionArgs)
         {
             if (trayMode)
             {
@@ -1017,7 +1474,7 @@ foreach($t in Get-ScheduledTask){
         }
 
         private static string AppendArgs(string arguments) { return string.IsNullOrWhiteSpace(arguments) ? "" : " " + arguments.Trim(); }
-        private static string WinArg(string value) { return "\"" + (value ?? "").Replace("\"", "\\\"") + "\""; }
+        internal static string WinArg(string value) { return "\"" + (value ?? "").Replace("\"", "\\\"") + "\""; }
 
         public static void ResolveLaunchTarget(StartupItem item, out string targetPath, out string arguments)
         {
@@ -1035,7 +1492,7 @@ foreach($t in Get-ScheduledTask){
             if (!File.Exists(targetPath) || !IsSupportedStartupTarget(targetPath)) throw new FileNotFoundException("Resolved startup target is not a supported startup target", targetPath);
         }
 
-        private static bool TryDecodeTrayPayload(string command, out string targetPath, out string arguments)
+        internal static bool TryDecodeTrayPayload(string command, out string targetPath, out string arguments)
         {
             targetPath = ""; arguments = "";
             Match m = Regex.Match(command ?? "", @"--tray-run\s+(?<payload>[A-Za-z0-9+/=]+)", RegexOptions.IgnoreCase);
@@ -1050,7 +1507,7 @@ foreach($t in Get-ScheduledTask){
             catch { return false; }
         }
 
-        private static bool TrySplitCommand(string command, out string exe, out string args)
+        internal static bool TrySplitCommand(string command, out string exe, out string args)
         {
             exe = ""; args = "";
             command = (command ?? "").Trim();
@@ -1094,9 +1551,11 @@ foreach($t in Get-ScheduledTask){
 
         private static string Esc(string s) { return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " "); }
         private static StartupItem ErrorItem(string source, string scope, string location, Exception ex) { return new StartupItem { Id = "error|" + source + "|" + location, Name = "Scan warning", Source = source, Scope = scope, Location = location, Command = ex.Message, Enabled = false, CanDisable = false, Status = "Read failed" }; }
-        private static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "\\\"") + "\""; }
+        internal static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "\\\"") + "\""; }
 
-        private static string PowerShellExe()
+        internal static string ProcessExePath() { try { return Process.GetCurrentProcess().MainModule.FileName; } catch { return ""; } }
+
+        internal static string PowerShellExe()
         {
             string full = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"System32\WindowsPowerShell\v1.0\powershell.exe");
             return File.Exists(full) ? full : "powershell.exe";
@@ -1116,16 +1575,45 @@ foreach($t in Get-ScheduledTask){
             try { var id = System.Security.Principal.WindowsIdentity.GetCurrent(); var p = new System.Security.Principal.WindowsPrincipal(id); return p.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator); } catch { return false; }
         }
 
-        private static string RunCapture(string exe, string args)
+        internal static string RunCapture(string exe, string args, int timeoutMs = 30000)
         {
             var psi = new ProcessStartInfo(exe, args) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
-            using (var p = Process.Start(psi)) { string o = p.StandardOutput.ReadToEnd(); string e = p.StandardError.ReadToEnd(); p.WaitForExit(20000); if (p.ExitCode != 0 && string.IsNullOrWhiteSpace(o)) throw new Exception(e); return o; }
+            using (var p = Process.Start(psi))
+            {
+                // Read the pipes on background tasks so a hung child can never block the GUI forever;
+                // WaitForExit with a hard timeout kills it and surfaces a clear error instead.
+                var so = Task.Run(() => p.StandardOutput.ReadToEnd());
+                var se = Task.Run(() => p.StandardError.ReadToEnd());
+                if (!p.WaitForExit(timeoutMs))
+                {
+                    try { p.Kill(); } catch { }
+                    try { p.WaitForExit(3000); } catch { }
+                    throw new Exception("Command timed out after " + timeoutMs + " ms: " + exe + " " + args);
+                }
+                string o = so.Result;
+                string e = se.Result;
+                if (p.ExitCode != 0 && string.IsNullOrWhiteSpace(o)) throw new Exception(e);
+                return o;
+            }
         }
 
-        private static void RunChecked(string exe, string args)
+        internal static void RunChecked(string exe, string args, int timeoutMs = 30000)
         {
             var psi = new ProcessStartInfo(exe, args) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
-            using (var p = Process.Start(psi)) { string o = p.StandardOutput.ReadToEnd(); string e = p.StandardError.ReadToEnd(); p.WaitForExit(20000); if (p.ExitCode != 0) throw new Exception((o + " " + e).Trim()); }
+            using (var p = Process.Start(psi))
+            {
+                var so = Task.Run(() => p.StandardOutput.ReadToEnd());
+                var se = Task.Run(() => p.StandardError.ReadToEnd());
+                if (!p.WaitForExit(timeoutMs))
+                {
+                    try { p.Kill(); } catch { }
+                    try { p.WaitForExit(3000); } catch { }
+                    throw new Exception("Command timed out after " + timeoutMs + " ms: " + exe + " " + args);
+                }
+                string o = so.Result;
+                string e = se.Result;
+                if (p.ExitCode != 0) throw new Exception((o + " " + e).Trim());
+            }
         }
 
         private static IEnumerable<Dictionary<string, string>> CsvRows(string csv)
@@ -1229,10 +1717,34 @@ foreach($t in Get-ScheduledTask){
             SaveRows(LoadRows().Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList());
         }
 
+        // Remove a protection row by its exact key, so an explicitly-enabled item can never be re-disabled by the guard.
+        public static void UnprotectKey(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key) || !File.Exists(Program.ProtectedDisabledStore)) return;
+            SaveRows(LoadRows().Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList());
+        }
+
+        // Protect a task/registry row directly by key (used when retiring duplicate launchers), so
+        // the guard keeps enforcing its disabled state even though no StartupItem was scanned.
+        public static void ProtectKey(string key, string location, string source, string status)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(key)) return;
+                Directory.CreateDirectory(Program.AppData);
+                var rows = LoadRows().Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList();
+                rows.Add(Row.FromParts(key, location, source, status));
+                SaveRows(rows);
+            }
+            catch { }
+        }
+
         public static string ProtectCurrentDisabled()
         {
             int count = 0;
-            foreach (var item in StartupService.ScanAll().Where(x => !x.Enabled && !x.Id.StartsWith("error|"))) { Protect(item); count++; }
+            // Never protect the app's own boot agent or its own managed startup agent task.
+            string agentTask = Program.ManagedTaskRoot + "MichStartupMasterApp";
+            foreach (var item in StartupService.ScanAll().Where(x => !x.Enabled && !x.Id.StartsWith("error|") && !x.Id.StartsWith("legacy|", StringComparison.OrdinalIgnoreCase) && !string.Equals(x.Location, agentTask, StringComparison.OrdinalIgnoreCase))) { Protect(item); count++; }
             return "PROTECT_DISABLED count=" + count + " store=" + Program.ProtectedDisabledStore;
         }
 
@@ -1247,11 +1759,24 @@ foreach($t in Get-ScheduledTask){
             return "ENFORCE_DISABLED protected=" + LoadRows().Count + " actions=" + disabled + " failures=" + failures;
         }
 
+        public static bool IsProtected(string key)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(key) || !File.Exists(Program.ProtectedDisabledStore)) return false;
+                return LoadRows().Any(r => string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase));
+            }
+            catch { return false; }
+        }
+
         private static bool EnforceRow(Row r)
         {
             if (r.Key.StartsWith("task|", StringComparison.OrdinalIgnoreCase))
             {
-                RunHidden("schtasks.exe", "/Change /TN " + Q(r.Location) + " /Disable");
+                // Use the hard-timeout runner (drains pipes, kills hung children) so a stuck
+                // schtasks call can never wedge the guard or leave the task half-disabled.
+                try { StartupService.RunChecked("schtasks.exe", "/Change /TN " + Q(r.Location) + " /Disable"); }
+                catch { }
                 return true;
             }
             if (r.Key.StartsWith("reg|", StringComparison.OrdinalIgnoreCase) || r.Type == "Registry Run")
@@ -1332,7 +1857,19 @@ foreach($t in Get-ScheduledTask){
         private static void SaveRows(List<Row> rows)
         {
             Directory.CreateDirectory(Program.AppData);
-            File.WriteAllLines(Program.ProtectedDisabledStore, rows.Select(r => string.Join("\t", new[] { B64(r.Key), B64(r.Id), B64(r.Type), B64(r.Name), B64(r.Scope), B64(r.Command), B64(r.Location), B64(r.Status) })), Encoding.UTF8);
+            WriteAllLinesWithRetry(Program.ProtectedDisabledStore, rows.Select(r => string.Join("\t", new[] { B64(r.Key), B64(r.Id), B64(r.Type), B64(r.Name), B64(r.Scope), B64(r.Command), B64(r.Location), B64(r.Status) })).ToArray());
+        }
+
+        // The agent's guards and the GUI/CLI write the same store from separate processes; a
+        // momentary file lock must never crash the caller, so retry briefly before giving up.
+        private static void WriteAllLinesWithRetry(string path, string[] lines)
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                try { File.WriteAllLines(path, lines, Encoding.UTF8); return; }
+                catch (IOException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
+                catch (UnauthorizedAccessException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
+            }
         }
 
         private static void RunHidden(string exe, string args)
@@ -1353,6 +1890,7 @@ foreach($t in Get-ScheduledTask){
         {
             public string Key, Id, Type, Name, Scope, Command, Location, Status;
             public static Row FromItem(string key, StartupItem item) { return new Row { Key = key, Id = item.Id, Type = item.Source, Name = item.Name, Scope = item.Scope, Command = item.Command, Location = item.Location, Status = item.Status }; }
+            public static Row FromParts(string key, string location, string type, string status) { return new Row { Key = key, Id = "task|" + location, Type = type, Name = System.IO.Path.GetFileName(location.TrimEnd('\\')), Scope = "User/System", Command = "", Location = location, Status = status }; }
         }
     }
 
@@ -1371,6 +1909,16 @@ foreach($t in Get-ScheduledTask){
         {
             if (string.IsNullOrWhiteSpace(taskLocation) || !File.Exists(Program.ProtectedQuietStore)) return;
             SaveRows(LoadRows().Where(r => !string.Equals(r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase)).ToList());
+        }
+
+        public static bool IsProtected(string taskLocation)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(taskLocation) || !File.Exists(Program.ProtectedQuietStore)) return false;
+                return LoadRows().Any(r => string.Equals(r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase));
+            }
+            catch { return false; }
         }
 
         public static string EnforceProtected()
@@ -1420,12 +1968,737 @@ foreach($t in Get-ScheduledTask){
         private static void SaveRows(List<Row> rows)
         {
             Directory.CreateDirectory(Program.AppData);
-            File.WriteAllLines(Program.ProtectedQuietStore, rows.Select(r => string.Join("\t", new[] { B64(r.TaskLocation), B64(r.TargetPath), B64(r.Arguments) })), Encoding.UTF8);
+            // Retry briefly: the agent's guards and the GUI/CLI write the same store from
+            // separate processes, so a momentary lock must never crash the caller.
+            for (int attempt = 0; ; attempt++)
+            {
+                try { File.WriteAllLines(Program.ProtectedQuietStore, rows.Select(r => string.Join("\t", new[] { B64(r.TaskLocation), B64(r.TargetPath), B64(r.Arguments) })), Encoding.UTF8); return; }
+                catch (IOException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
+                catch (UnauthorizedAccessException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
+            }
         }
 
         private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
         private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
         private sealed class Row { public string TaskLocation, TargetPath, Arguments; }
+    }
+
+    internal static class EnabledStartupService
+    {
+        public sealed class Row
+        {
+            public string Kind;          // managed-task | task | registry | folder | service | driver
+            public string Name;
+            public string Scope;
+            public string Command;       // raw command / registry value / folder file
+            public string Location;      // registry key or task path
+            public string Status;        // stored metadata (registry root\tsubkey\tvalue\tkind\tsource, or service meta)
+            public string Target;        // resolved executable
+            public string Arguments;
+            public string Mode;          // normal | tray
+            public string TaskLocation;  // full task path for task kinds
+        }
+
+        private static string StorePath { get { return Program.EnabledStore; } }
+
+        public static void Upsert(Row row)
+        {
+            if (row == null) return;
+            Directory.CreateDirectory(Program.AppData);
+            string key = RowKey(row);
+            var rows = Load().Where(r => !string.Equals(RowKey(r), key, StringComparison.OrdinalIgnoreCase)).ToList();
+            rows.Add(row);
+            Save(rows);
+        }
+
+        private static string RowKey(Row r)
+        {
+            if (r == null) return "";
+            if (!string.IsNullOrWhiteSpace(r.TaskLocation)) return "task|" + r.TaskLocation;
+            return (r.Kind ?? "") + "|" + (r.Location ?? "") + "|" + (r.Name ?? "");
+        }
+
+        public static void RemoveByTask(string taskLocation)
+        {
+            if (string.IsNullOrWhiteSpace(taskLocation)) return;
+            Save(Load().Where(r => !string.Equals(r.TaskLocation ?? "", taskLocation, StringComparison.OrdinalIgnoreCase)).ToList());
+        }
+
+        public static void Remove(StartupItem item)
+        {
+            if (item == null) return;
+            string id = item.Id ?? "";
+            if (id.StartsWith("task|", StringComparison.OrdinalIgnoreCase)) { RemoveByTask(item.Location); return; }
+            if (id.StartsWith("reg|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|reg|", StringComparison.OrdinalIgnoreCase))
+            {
+                // Remove only the matching registry row; never touch unrelated rows.
+                Save(Load().Where(r => !(r.Kind == "registry" && string.Equals(r.Name ?? "", item.Name ?? "", StringComparison.OrdinalIgnoreCase) && string.Equals(r.Location ?? "", item.Location ?? "", StringComparison.OrdinalIgnoreCase))).ToList());
+                return;
+            }
+            if (id.StartsWith("folder|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|folder|", StringComparison.OrdinalIgnoreCase))
+            {
+                // Remove only the matching folder row; never touch unrelated rows.
+                Save(Load().Where(r => !(r.Kind == "folder" && string.Equals(r.Command ?? "", item.Command ?? "", StringComparison.OrdinalIgnoreCase))).ToList());
+                return;
+            }
+            if (id.StartsWith("service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("driver|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|driver|", StringComparison.OrdinalIgnoreCase))
+            {
+                // Remove only the matching service/driver row; never touch unrelated rows.
+                Save(Load().Where(r => !((r.Kind == "service" || r.Kind == "driver") && string.Equals(r.Name ?? "", item.Name ?? "", StringComparison.OrdinalIgnoreCase))).ToList());
+                return;
+            }
+        }
+
+        // Record an item the user explicitly enabled/restored so the guard keeps it running at every boot.
+        public static void UpsertFromItem(StartupItem item)
+        {
+            if (item == null) return;
+            try
+            {
+                string id = item.Id ?? "";
+                string kind;
+                string taskLocation = "";
+                string mode = "normal";
+                string target = "";
+                string args = "";
+                if (id.StartsWith("task|", StringComparison.OrdinalIgnoreCase))
+                {
+                    taskLocation = item.Location;
+                    kind = item.IsManaged ? "managed-task" : "task";
+                    StartupService.ResolveLaunchTarget(item, out target, out args);
+                    mode = StartupService.CommandUsesTrayWrapper(item.Command ?? "") ? "tray" : "normal";
+                }
+                else if (id.StartsWith("disabled|task|", StringComparison.OrdinalIgnoreCase))
+                {
+                    taskLocation = item.Location;
+                    kind = item.IsManaged ? "managed-task" : "task";
+                    StartupService.ResolveLaunchTarget(item, out target, out args);
+                    mode = StartupService.CommandUsesTrayWrapper(item.Command ?? "") ? "tray" : "normal";
+                }
+                else if (id.StartsWith("reg|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|reg|", StringComparison.OrdinalIgnoreCase))
+                {
+                    kind = "registry";
+                    StartupService.ResolveLaunchTarget(item, out target, out args);
+                }
+                else if (id.StartsWith("folder|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|folder|", StringComparison.OrdinalIgnoreCase))
+                {
+                    kind = "folder";
+                    StartupService.ResolveLaunchTarget(item, out target, out args);
+                }
+                else if (id.StartsWith("service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|service|", StringComparison.OrdinalIgnoreCase))
+                {
+                    kind = "service";
+                }
+                else if (id.StartsWith("driver|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|driver|", StringComparison.OrdinalIgnoreCase))
+                {
+                    kind = "driver";
+                }
+                else return;
+                var row = new Row { Kind = kind, Name = item.Name ?? "", Scope = item.Scope ?? "", Command = item.Command ?? "", Location = item.Location ?? "", Status = item.Status ?? "", Target = target, Arguments = args, Mode = mode, TaskLocation = taskLocation };
+                Upsert(row);
+            }
+            catch { }
+        }
+
+        public static List<Row> Load()
+        {
+            var list = new List<Row>();
+            if (!File.Exists(StorePath)) return list;
+            foreach (var line in File.ReadAllLines(StorePath))
+            {
+                var p = line.Split('\t');
+                if (p.Length < 10) continue;
+                list.Add(new Row { Kind = UnB64(p[0]), Name = UnB64(p[1]), Scope = UnB64(p[2]), Command = UnB64(p[3]), Location = UnB64(p[4]), Status = UnB64(p[5]), Target = UnB64(p[6]), Arguments = UnB64(p[7]), Mode = UnB64(p[8]), TaskLocation = UnB64(p[9]) });
+            }
+            return list;
+        }
+
+        private static void Save(List<Row> rows)
+        {
+            Directory.CreateDirectory(Program.AppData);
+            File.WriteAllLines(StorePath, rows.Select(r => string.Join("\t", new[] { B64(r.Kind), B64(r.Name), B64(r.Scope), B64(r.Command), B64(r.Location), B64(r.Status), B64(r.Target), B64(r.Arguments), B64(r.Mode), B64(r.TaskLocation) })), Encoding.UTF8);
+        }
+
+        // Make sure every enabled managed task currently registered under \MichStartupMaster\ is tracked.
+        public static void ImportExistingManagedTasks()
+        {
+            try
+            {
+                var rows = Load();
+                var known = new HashSet<string>(rows.Where(r => r.Kind == "managed-task" && !string.IsNullOrWhiteSpace(r.TaskLocation)).Select(r => r.TaskLocation.ToLowerInvariant()), StringComparer.OrdinalIgnoreCase);
+                string script =
+                    "$ErrorActionPreference='Stop';" +
+                    "foreach($t in Get-ScheduledTask){" +
+                    "  $full=($t.TaskPath + $t.TaskName);" +
+                    "  if(-not $full.StartsWith('\\MichStartupMaster\\')){ continue }" +
+                    "  $enabled = if($t.Settings.Enabled){'true'}else{'false'};" +
+                    "  $actions = (@($t.Actions) | ForEach-Object { if($_){ (($_.Execute) + ' ' + ($_.Arguments)).Trim() } }) -join ' || ';" +
+                    "  $full + '\t' + $enabled + '\t' + $actions" +
+                    "}";
+                string output = StartupService.RunCapture(StartupService.PowerShellExe(), "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)));
+                foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string[] p = line.Split(new[] { '\t' }, 3);
+                    if (p.Length < 3) continue;
+                    string taskLocation = p[0];
+                    bool enabled = p[1].Equals("true", StringComparison.OrdinalIgnoreCase);
+                    if (!enabled || string.Equals(taskLocation, Program.ManagedTaskRoot + "MichStartupMasterApp", StringComparison.OrdinalIgnoreCase)) continue;
+                    // Never re-adopt a task the user disabled (even a half-disabled one): the
+                    // protected-disabled store records their intent and the guard keeps it off.
+                    // A task still in the quiet-protection store is exempt: the quiet store proves
+                    // the user wanted it RUNNING (quietly), so a stale disabled protection left by
+                    // an older half-failed disable is healed instead of orphaned forever.
+                    if (ProtectedDisabledService.IsProtected("task|" + taskLocation) && !ProtectedQuietService.IsProtected(taskLocation)) continue;
+                    if (known.Contains(taskLocation.ToLowerInvariant())) continue;
+                    string action = p[2];
+                    string target = "";
+                    string args = "";
+                    string mode = "normal";
+                    if (action.IndexOf("--start-in-tray", StringComparison.OrdinalIgnoreCase) >= 0) { mode = "tray"; target = StartupService.ProcessExePath(); }
+                    else if (action.IndexOf("--tray-run", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        mode = "tray";
+                        StartupService.TryDecodeTrayPayload(action, out target, out args);
+                    }
+                    else
+                    {
+                        mode = "normal";
+                        StartupService.TrySplitCommand(action, out target, out args);
+                    }
+                    if (string.IsNullOrWhiteSpace(target) || !File.Exists(target)) continue;
+                    if (!StartupService.IsSupportedStartupTarget(target)) continue;
+                    Upsert(new Row { Kind = "managed-task", Name = taskLocation.TrimStart('\\'), Scope = "User/System", Command = action, Location = taskLocation, Status = "Managed startup task", Target = target, Arguments = args, Mode = mode, TaskLocation = taskLocation });
+                }
+            }
+            catch { }
+        }
+
+        // Adopt every startup item the legacy v2 state (state-v2.json) marked Enabled into the
+        // managed-task enforcement system, so items set to start in the old app also start at
+        // every boot with the same no-exceptions guarantee as everything else.
+        public static string MigrateV2EnabledItems()
+        {
+            int adopted = 0, skipped = 0, missing = 0;
+            try
+            {
+                string v2Path = Path.Combine(Program.AppData, "state-v2.json");
+                if (!File.Exists(v2Path)) return "MIGRATE_V2 none";
+                string raw;
+                try { raw = File.ReadAllText(v2Path); } catch { return "MIGRATE_V2 unreadable"; }
+                JsonDocument doc;
+                try { doc = JsonDocument.Parse(raw); } catch { return "MIGRATE_V2 invalid-json"; }
+                using (doc)
+                {
+                    if (!doc.RootElement.TryGetProperty("Items", out var itemsEl) || itemsEl.ValueKind != JsonValueKind.Array) return "MIGRATE_V2 no-items";
+                    var rows = Load();
+                    // Every managed task already known to the new system is taken over for good:
+                    // backfill the one-shot marker so disabling or removing one of them can never
+                    // cause the v2 migration to resurrect it on a later pass.
+                    foreach (var r in rows.Where(r => r.Kind == "managed-task" && !string.IsNullOrWhiteSpace(r.TaskLocation))) MarkV2Migrated(r.TaskLocation);
+                    foreach (var it in itemsEl.EnumerateArray())
+                    {
+                        try
+                        {
+                            if (!JsonBool(it, "Enabled")) continue;
+                            string name = JsonStr(it, "LegacyTaskName");
+                            if (string.IsNullOrWhiteSpace(name)) name = JsonStr(it, "Name");
+                            string target = JsonStr(it, "Target");
+                            string args = JsonStr(it, "Arguments") ?? "";
+                            int launchMode = JsonInt(it, "LaunchMode");
+                            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(target)) continue;
+                            string safeName = Regex.Replace(name, "[^A-Za-z0-9 _.-]", "").Trim();
+                            if (safeName.Length == 0) safeName = "StartupApp";
+                            string taskLocation = Program.ManagedTaskRoot + safeName;
+                            // Never re-adopt an item the new app has already taken over (the user may
+                            // have disabled or removed it since; the manifest alone is not the marker
+                            // because disabling deletes the manifest row).
+                            if (IsV2Migrated(taskLocation)) { skipped++; continue; }
+                            if (rows.Any(r => r.Kind == "managed-task" && string.Equals(r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase))) { skipped++; continue; }
+                            bool trayMode = launchMode == 2;
+                            var row = new Row
+                            {
+                                Kind = "managed-task",
+                                Name = safeName,
+                                Scope = "User/System",
+                                Command = "",
+                                Location = taskLocation,
+                                Status = "Managed startup task (migrated from v2)",
+                                Target = target,
+                                Arguments = args,
+                                Mode = trayMode ? "tray" : "normal",
+                                TaskLocation = taskLocation
+                            };
+                            // Manifest intent wins: drop any stale disabled protection for this task.
+                            ProtectedDisabledService.UnprotectKey("task|" + taskLocation);
+                            if (File.Exists(target))
+                            {
+                                string execute, actionArgs;
+                                StartupService.BuildManagedAction(target, args, trayMode, out execute, out actionArgs);
+                                row.Command = execute + " " + actionArgs;
+                                StartupService.RegisterLogonTaskAt(taskLocation, execute, actionArgs);
+                                if (trayMode) ProtectedQuietService.ProtectTask(taskLocation, target, args);
+                                // A task that did not exist or was disabled before boot must run now,
+                                // unless the app is already running (never double-start anything).
+                                if (!IsProcessRunning(target)) TryRunTask(taskLocation);
+                                adopted++;
+                            }
+                            else
+                            {
+                                // Target not on disk yet: record intent so the guard adopts and runs it
+                                // the moment the file appears, without the user having to touch anything.
+                                missing++;
+                            }
+                            // The managed task is now the single launcher: retire duplicate native
+                            // sources (registry Run values / stale disabled records) for the same app.
+                            RetireDuplicateNativeSource(target);
+                            Upsert(row);
+                            MarkV2Migrated(taskLocation);
+                        }
+                        catch { }
+                    }
+                }
+                return "MIGRATE_V2 adopted=" + adopted + " skipped=" + skipped + " missing=" + missing;
+            }
+            catch { return "MIGRATE_V2 error"; }
+        }
+
+        private static string MigratedMarkerPath { get { return Path.Combine(Program.AppData, "migrated-v2-items.tsv"); } }
+
+        internal static bool IsV2Migrated(string taskLocation)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(taskLocation) || !File.Exists(MigratedMarkerPath)) return false;
+                return File.ReadAllLines(MigratedMarkerPath).Any(l => string.Equals(l.Trim().TrimStart('\uFEFF'), taskLocation, StringComparison.OrdinalIgnoreCase));
+            }
+            catch { return false; }
+        }
+
+        internal static void MarkV2Migrated(string taskLocation)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(taskLocation)) return;
+                Directory.CreateDirectory(Program.AppData);
+                if (IsV2Migrated(taskLocation)) return;
+                File.AppendAllText(MigratedMarkerPath, taskLocation + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        internal static bool IsProcessRunning(string target)
+        {
+            try
+            {
+                string name = Path.GetFileNameWithoutExtension(target ?? "").ToLowerInvariant();
+                if (string.IsNullOrWhiteSpace(name)) return false;
+                // Script hosts are always present; they are not the app itself, so never treat
+                // their presence as proof the startup target is already running.
+                if (name == "powershell" || name == "powershell_ise" || name == "pwsh" || name == "cmd" || name == "cscript" || name == "wscript" || name == "conhost" || name == "rundll32") return false;
+                return Process.GetProcessesByName(name).Length > 0;
+            }
+            catch { return false; }
+        }
+
+        private static string JsonStr(JsonElement el, string key)
+        {
+            try { if (el.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String) return v.GetString(); } catch { }
+            return "";
+        }
+
+        private static bool JsonBool(JsonElement el, string key)
+        {
+            try { if (el.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.True) return true; } catch { }
+            return false;
+        }
+
+        private static int JsonInt(JsonElement el, string key)
+        {
+            try { if (el.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number) return v.GetInt32(); } catch { }
+            return 0;
+        }
+
+        // The managed task is the single canonical launcher for a migrated app: remove any
+        // registry Run value or stale legacy disabled record that launches the same executable,
+        // so the app can never start twice at boot.
+        private static void RetireDuplicateNativeSource(string target)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(target)) return;
+                string norm = target.Trim().Trim('"').TrimEnd('\\').ToLowerInvariant();
+                foreach (var sub in new[] { @"Software\Microsoft\Windows\CurrentVersion\Run", @"Software\Microsoft\Windows\CurrentVersion\RunOnce" })
+                {
+                    foreach (var root in new[] { Registry.CurrentUser, Registry.LocalMachine })
+                    {
+                        try
+                        {
+                            using (var key = root.OpenSubKey(sub, true))
+                            {
+                                if (key == null) continue;
+                                foreach (var vn in key.GetValueNames())
+                                {
+                                    object v = key.GetValue(vn, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                                    string cmd = v == null ? "" : v.ToString();
+                                    if (cmd.Trim().Trim('"').TrimEnd('\\').ToLowerInvariant() == norm) key.DeleteValue(vn, false);
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                if (File.Exists(Program.DisabledStore))
+                {
+                    var kept = File.ReadAllLines(Program.DisabledStore).Where(l =>
+                    {
+                        var p = l.Split('\t');
+                        if (p.Length < 5) return true;
+                        string cmd = UnB64(p[4]);
+                        return cmd.Trim().Trim('"').TrimEnd('\\').ToLowerInvariant() != norm;
+                    }).ToArray();
+                    File.WriteAllLines(Program.DisabledStore, kept, Encoding.UTF8);
+                }
+            }
+            catch { }
+        }
+
+        // Every managed item must be the single launcher for its app: retire any registry Run
+        // value or legacy scheduled task that launches the same (target + arguments), so a
+        // migrated item can never start twice at boot. Runs only in the throttled import pass.
+        private static void RetireDuplicateLaunchSources()
+        {
+            try
+            {
+                var rows = Load().Where(r => r.Kind == "managed-task" && !string.IsNullOrWhiteSpace(r.Target) && File.Exists(r.Target)).ToList();
+                if (rows.Count == 0) return;
+                foreach (var row in rows)
+                {
+                    try
+                    {
+                        RetireDuplicateNativeSource(row.Target);
+                        RetireDuplicateTask(row.Target, row.Arguments ?? "");
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        // Disable any scheduled task OUTSIDE the managed root whose action launches exactly the
+        // same (executable + arguments) as a managed item, and protect it so the guard keeps it off.
+        private static void RetireDuplicateTask(string target, string arguments)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(target)) return;
+                string canonical = NormalizeCommand(target + " " + (arguments ?? ""));
+                if (string.IsNullOrWhiteSpace(canonical)) return;
+                string script =
+                    "$ErrorActionPreference='Stop';" +
+                    "foreach($t in Get-ScheduledTask){" +
+                    "  $full=($t.TaskPath + $t.TaskName);" +
+                    "  if($full.StartsWith('\\MichStartupMaster\\')){ continue }" +
+                    "  $actions = (@($t.Actions) | ForEach-Object { if($_){ (($_.Execute) + ' ' + ($_.Arguments)).Trim() } }) -join ' || ';" +
+                    "  $full + '\t' + $actions" +
+                    "}";
+                string output = StartupService.RunCapture(StartupService.PowerShellExe(), "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)));
+                foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string[] p = line.Split(new[] { '\t' }, 2);
+                    if (p.Length < 2) continue;
+                    string taskLocation = p[0];
+                    string action = p[1];
+                    // Match only exact same-app launchers, never a different script/arguments.
+                    if (!string.Equals(NormalizeCommand(action), canonical, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(taskLocation, Program.ManagedTaskRoot + "MichStartupMasterApp", StringComparison.OrdinalIgnoreCase)) continue;
+                    try { StartupService.RunChecked("schtasks.exe", "/Change /TN " + StartupService.Q(taskLocation) + " /Disable"); } catch { }
+                    ProtectedDisabledService.ProtectKey("task|" + taskLocation, taskLocation, "Scheduled Task", "Retired duplicate launcher for " + target);
+                }
+            }
+            catch { }
+        }
+
+        private static string NormalizeCommand(string command)
+        {
+            try
+            {
+                return Regex.Replace((command ?? "").ToLowerInvariant(), @"\s+", " ").Trim().Trim('"');
+            }
+            catch { return (command ?? "").ToLowerInvariant(); }
+        }
+
+        private static DateTime _lastImportUtc = DateTime.MinValue;
+        private static int _busy;
+
+        public static string EnforceEnabled(bool includeImport = true)
+        {
+            if (System.Threading.Interlocked.Exchange(ref _busy, 1) == 1) return "ENFORCE_ENABLED busy";
+            try
+            {
+                // Adopt legacy v2 enabled items and any managed task created outside the app at
+                // most every few minutes, and always on the first pass, so nothing enabled can be missed.
+                if (includeImport && (DateTime.UtcNow - _lastImportUtc).TotalMinutes >= 5)
+                {
+                    MigrateV2EnabledItems();
+                    ImportExistingManagedTasks();
+                    // Each managed item must be the single launcher: retire duplicate registry
+                    // Run values and legacy tasks that launch the same app, so nothing starts twice.
+                    RetireDuplicateLaunchSources();
+                    _lastImportUtc = DateTime.UtcNow;
+                }
+                int actions = 0, failures = 0;
+                // The app's own hidden boot agent must always be registered, enabled, and correct.
+                try
+                {
+                    string exe = StartupService.ProcessExePath();
+                    if (!string.IsNullOrWhiteSpace(exe) && File.Exists(exe))
+                    {
+                        var agentRow = new Row { Kind = "managed-task", Name = "MichStartupMasterApp", Scope = "User/System", Command = exe + " --agent", Location = Program.ManagedTaskRoot + "MichStartupMasterApp", Status = "Managed startup agent", Target = exe, Arguments = "--agent", Mode = "normal", TaskLocation = Program.ManagedTaskRoot + "MichStartupMasterApp" };
+                        if (EnforceRow(agentRow)) actions++;
+                    }
+                }
+                catch { failures++; }
+                foreach (var row in Load())
+                {
+                    try { if (EnforceRow(row)) actions++; }
+                    catch { failures++; }
+                }
+                return "ENFORCE_ENABLED protected=" + Load().Count + " actions=" + actions + " failures=" + failures;
+            }
+            finally
+            {
+                System.Threading.Interlocked.Exchange(ref _busy, 0);
+            }
+        }
+
+        private static bool EnforceRow(Row row)
+        {
+            if (row == null) return false;
+            if (row.Kind == "managed-task" || row.Kind == "task")
+            {
+                string taskLocation = row.TaskLocation;
+                if (string.IsNullOrWhiteSpace(taskLocation)) taskLocation = row.Location;
+                if (string.IsNullOrWhiteSpace(taskLocation)) return false;
+                // The enabled manifest is authoritative for this task; drop any stale disabled protection.
+                ProtectedDisabledService.UnprotectKey("task|" + taskLocation);
+                bool isManaged = row.Kind == "managed-task";
+                bool tray = string.Equals(row.Mode, "tray", StringComparison.OrdinalIgnoreCase);
+                string expectedExec, expectedArgs;
+                if (isManaged)
+                {
+                    string target = row.Target;
+                    if (string.IsNullOrWhiteSpace(target) || !File.Exists(target)) return false;
+                    StartupService.BuildManagedAction(target, row.Arguments ?? "", tray, out expectedExec, out expectedArgs);
+                }
+                else
+                {
+                    expectedExec = row.Target; expectedArgs = row.Arguments ?? "";
+                }
+                string state = QueryTaskState(taskLocation);
+                if (state == null)
+                {
+                    if (isManaged) StartupService.RegisterLogonTaskAt(taskLocation, expectedExec, expectedArgs);
+                    else StartupService.RunChecked("schtasks.exe", "/Create /F /TN " + StartupService.Q(taskLocation) + " /SC ONLOGON /TR " + StartupService.Q(StartupService.WinArg(expectedExec) + (string.IsNullOrWhiteSpace(expectedArgs) ? "" : " " + expectedArgs)));
+                    // The task was missing, so it would not start at this boot unless we run it right now.
+                    TryRunTask(taskLocation);
+                    return true;
+                }
+                if (state == "disabled")
+                {
+                    StartupService.RunChecked("schtasks.exe", "/Change /TN " + StartupService.Q(taskLocation) + " /Enable");
+                    // Re-enabling alone does not fire the logon trigger; launch it immediately so it starts this boot.
+                    TryRunTask(taskLocation);
+                    return true;
+                }
+                if (isManaged)
+                {
+                    // Verify the action matches the desired mode and has an immediate logon trigger.
+                    string xml = null;
+                    try { xml = StartupService.RunCapture("schtasks.exe", "/Query /TN " + StartupService.Q(taskLocation) + " /XML"); }
+                    catch { }
+                    bool correct = xml != null && xml.IndexOf("<LogonTrigger", StringComparison.OrdinalIgnoreCase) >= 0 && xml.IndexOf("<Delay>", StringComparison.OrdinalIgnoreCase) < 0;
+                    if (correct)
+                    {
+                        string cmd = ExtractXmlElement(xml, "Command");
+                        string argText = ExtractXmlElement(xml, "Arguments");
+                        bool actionMatches = string.Equals(cmd ?? "", expectedExec ?? "", StringComparison.OrdinalIgnoreCase) && string.Equals((argText ?? "").Trim(), (expectedArgs ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
+                        if (!actionMatches) correct = false;
+                    }
+                    if (!correct)
+                    {
+                        StartupService.RegisterLogonTaskAt(taskLocation, expectedExec, expectedArgs);
+                        TryRunTask(taskLocation);
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if (row.Kind == "registry")
+            {
+                RegistryKey root;
+                string subKey;
+                string valueName;
+                RegistryValueKind kind = RegistryValueKind.String;
+                string command = row.Command ?? "";
+                string[] meta = (row.Status ?? "").Split('\t');
+                if (meta.Length >= 4 && meta[0].StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase))
+                {
+                    root = RootFromName(meta[0]);
+                    subKey = meta[1];
+                    valueName = meta[2];
+                    try { kind = (RegistryValueKind)Enum.Parse(typeof(RegistryValueKind), meta[3], true); } catch { }
+                }
+                else
+                {
+                    root = string.Equals(row.Scope, "Machine", StringComparison.OrdinalIgnoreCase) ? Registry.LocalMachine : Registry.CurrentUser;
+                    subKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+                    valueName = row.Name;
+                }
+                if (string.IsNullOrWhiteSpace(valueName) || string.IsNullOrWhiteSpace(command)) return false;
+                // Manifest intent wins over any stale disabled protection for this registry value.
+                ProtectedDisabledService.UnprotectKey("reg|" + row.Scope + "|" + root.Name + "|" + subKey + "|" + valueName);
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key != null && key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) != null) return false;
+                }
+                using (var key = root.CreateSubKey(subKey)) key.SetValue(valueName, command, kind);
+                // A Run value only takes effect at the next logon; start it now so this boot is not missed.
+                TryLaunchTarget(row.Target, row.Arguments);
+                return true;
+            }
+            if (row.Kind == "folder")
+            {
+                string file = row.Command ?? "";
+                if (string.IsNullOrWhiteSpace(file)) return false;
+                ProtectedDisabledService.UnprotectKey("folder|" + row.Scope + "|" + file);
+                if (File.Exists(file)) return false;
+                // Try to recover from the app's disabled-folder quarantine.
+                string originalName = Path.GetFileName(file);
+                string quarantine = Program.DisabledStartupFolder;
+                if (Directory.Exists(quarantine))
+                {
+                    var match = Directory.GetFiles(quarantine).FirstOrDefault(f => Path.GetFileName(f).StartsWith(originalName + ".", StringComparison.OrdinalIgnoreCase));
+                    if (match != null)
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(file));
+                        File.Move(match, file);
+                        TryLaunchTarget(row.Target, row.Arguments);
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if (row.Kind == "service" || row.Kind == "driver")
+            {
+                string[] meta = (row.Status ?? "").Split('\t');
+                string serviceName = meta.Length > 0 ? meta[0] : row.Name;
+                if (string.IsNullOrWhiteSpace(serviceName)) return false;
+                ProtectedDisabledService.UnprotectKey(Convert.ToBase64String(Encoding.UTF8.GetBytes(serviceName ?? "")) + "|" + serviceName);
+                using (var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + serviceName, true))
+                {
+                    if (key == null) return false;
+                    object current = key.GetValue("Start");
+                    if (current != null && Convert.ToInt32(current) == 4)
+                    {
+                        key.SetValue("Start", 2, RegistryValueKind.DWord);
+                        TryStartService(serviceName);
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return false;
+        }
+
+        // Launch a repaired task immediately so it runs at the current boot, not only the next one.
+        private static void TryRunTask(string taskLocation)
+        {
+            // The app's own agent is already this process; never re-launch it.
+            if (string.Equals(taskLocation, Program.ManagedTaskRoot + "MichStartupMasterApp", StringComparison.OrdinalIgnoreCase)) return;
+            try
+            {
+                // Never double-start an app that is already running.
+                var row = Load().FirstOrDefault(r => string.Equals(r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase));
+                if (row != null && !string.IsNullOrWhiteSpace(row.Target) && IsProcessRunning(row.Target)) return;
+                StartupService.RunChecked("schtasks.exe", "/Run /TN " + StartupService.Q(taskLocation));
+            }
+            catch { }
+        }
+
+        private static void TryLaunchTarget(string target, string arguments)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(target) || !File.Exists(target)) return;
+                string execute, actionArgs;
+                StartupService.BuildDirectAction(target, arguments ?? "", out execute, out actionArgs);
+                var psi = new ProcessStartInfo(execute, actionArgs)
+                {
+                    UseShellExecute = false,
+                    WorkingDirectory = Directory.Exists(Path.GetDirectoryName(target)) ? Path.GetDirectoryName(target) : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                };
+                Process.Start(psi);
+            }
+            catch { }
+        }
+
+        private static void TryStartService(string serviceName)
+        {
+            try { StartupService.RunChecked("sc.exe", "start " + serviceName); }
+            catch { }
+        }
+
+        private static string QueryTaskState(string taskLocation)
+        {
+            try
+            {
+                string output = StartupService.RunCapture("schtasks.exe", "/Query /TN " + StartupService.Q(taskLocation) + " /FO LIST /V");
+                var m = Regex.Match(output ?? "", @"Scheduled Task State:\s*(?<v>[A-Za-z]+)", RegexOptions.IgnoreCase);
+                if (m.Success)
+                {
+                    string v = m.Groups["v"].Value.ToLowerInvariant();
+                    if (v.StartsWith("dis", StringComparison.Ordinal)) return "disabled";
+                    return "enabled";
+                }
+                return "enabled";
+            }
+            catch { return null; }
+        }
+
+        private static string ExtractXmlElement(string xml, string element)
+        {
+            try
+            {
+                var m = Regex.Match(xml, "<" + element + ">(?<v>.*?)</" + element + ">", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+                return m.Success ? m.Groups["v"].Value.Trim() : null;
+            }
+            catch { return null; }
+        }
+
+        public static string ToJson()
+        {
+            var rows = Load();
+            var sb = new StringBuilder();
+            sb.Append("[");
+            for (int i = 0; i < rows.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                var r = rows[i];
+                sb.Append("{\"kind\":\"").Append(Esc(r.Kind)).Append("\",\"name\":\"").Append(Esc(r.Name)).Append("\",\"target\":\"").Append(Esc(r.Target)).Append("\",\"mode\":\"").Append(Esc(r.Mode)).Append("\",\"task\":\"").Append(Esc(r.TaskLocation)).Append("\"}");
+            }
+            sb.Append("]");
+            return sb.ToString();
+        }
+
+        private static string Esc(string s) { return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " "); }
+        private static RegistryKey RootFromName(string rootName)
+        {
+            if (string.Equals(rootName, Registry.LocalMachine.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKLM", StringComparison.OrdinalIgnoreCase)) return Registry.LocalMachine;
+            if (string.Equals(rootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKCU", StringComparison.OrdinalIgnoreCase)) return Registry.CurrentUser;
+            throw new InvalidOperationException("Unsupported registry root: " + rootName);
+        }
+        private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
+        private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
     }
 
     internal static class TrayRunner
@@ -1435,10 +2708,13 @@ foreach($t in Get-ScheduledTask){
         [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
         [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
         private const int SW_HIDE = 0;
-        private const int SW_MINIMIZE = 6;
+        private const int SW_RESTORE = 9;
+        private const int HideDurationSeconds = 12;
+        private const int AutoExitGraceSeconds = 15;
 
-        public static void Run(string[] args)
+        public static void RunMain(string[] args)
         {
             if (args.Length < 1) return;
             string decoded;
@@ -1451,28 +2727,148 @@ foreach($t in Get-ScheduledTask){
             {
                 string full = Path.GetFullPath(target);
                 if (!File.Exists(full) || !StartupService.IsSupportedStartupTarget(full)) return;
-                string execute, actionArgs;
-                StartupService.BuildDirectAction(full, targetArgs, out execute, out actionArgs);
-                var psi = new ProcessStartInfo(execute, actionArgs)
+                string mutexName = @"Local\MichStartupMaster.TrayWrapper." + HashName(full);
+                bool createdNew;
+                using (var mutex = new System.Threading.Mutex(true, mutexName, out createdNew))
                 {
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WindowStyle = ProcessWindowStyle.Normal,
-                    WorkingDirectory = Directory.Exists(Path.GetDirectoryName(full)) ? Path.GetDirectoryName(full) : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
-                };
-                Process.Start(psi);
+                    if (!createdNew) return; // another quiet wrapper already controls this target
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    using (var ctx = new TrayWrapperContext(full, targetArgs))
+                    {
+                        Application.Run(ctx);
+                    }
+                }
             }
             catch { }
         }
 
-        private static void HideProcessWindows(Process child, TimeSpan duration)
+        private static string HashName(string value)
         {
-            return;
+            using (var sha = SHA1.Create())
+            {
+                byte[] h = sha.ComputeHash(Encoding.UTF8.GetBytes((value ?? "").ToLowerInvariant()));
+                var sb = new StringBuilder();
+                foreach (byte b in h) sb.Append(b.ToString("x2"));
+                return sb.ToString();
+            }
         }
 
-        private static void HideWindowsForProcessTree(int rootPid)
+        private sealed class TrayWrapperContext : ApplicationContext
         {
-            return;
+            private readonly string _target;
+            private readonly string _targetArgs;
+            private Timer _hideTimer;
+            private Timer _watchTimer;
+            private DateTime _startedUtc = DateTime.UtcNow;
+            private int _rootPid;
+            private readonly HashSet<int> _tree = new HashSet<int>();
+            private DateTime? _treeDeadSince;
+            private bool _exiting;
+
+            public TrayWrapperContext(string target, string targetArgs)
+            {
+                _target = target;
+                _targetArgs = targetArgs;
+                StartTarget();
+                // No tray icon of its own: the wrapper is an invisible quiet launcher so the
+                // target app's OWN tray icon is the only one ever shown. This permanently
+                // removes the duplicate/broken "wrapper" icons next to GameSir, whisper-key,
+                // AutoHotkey, etc. Clicking the app's own icon (or "Launch now" in Startup
+                // Master) opens its GUI.
+                _hideTimer = new Timer { Interval = 400 };
+                _hideTimer.Tick += (s, e) => HideNewWindows();
+                _hideTimer.Start();
+                _watchTimer = new Timer { Interval = 5000 };
+                _watchTimer.Tick += (s, e) => CheckAlive();
+                _watchTimer.Start();
+            }
+
+            private void StartTarget()
+            {
+                try
+                {
+                    // Single instance per target: if the app is already running (another launcher
+                    // fired first, or the user started it manually), never start a second copy and
+                    // never add a second tray icon for it — quietly hand over instead.
+                    if (EnabledStartupService.IsProcessRunning(_target))
+                    {
+                        _rootPid = 0;
+                        Environment.Exit(0);
+                        return;
+                    }
+                    string execute, actionArgs;
+                    StartupService.BuildDirectAction(_target, _targetArgs, out execute, out actionArgs);
+                    var psi = new ProcessStartInfo(execute, actionArgs)
+                    {
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        WindowStyle = ProcessWindowStyle.Minimized,
+                        WorkingDirectory = Directory.Exists(Path.GetDirectoryName(_target)) ? Path.GetDirectoryName(_target) : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                    };
+                    var p = Process.Start(psi);
+                    _rootPid = p.Id;
+                    RefreshTree();
+                }
+                catch { }
+            }
+
+            private void HideNewWindows()
+            {
+                if (_exiting) return;
+                if ((DateTime.UtcNow - _startedUtc).TotalSeconds > HideDurationSeconds) { _hideTimer.Stop(); _hideTimer.Dispose(); _hideTimer = null; return; }
+                try
+                {
+                    RefreshTree();
+                    var pids = new HashSet<int>(_tree);
+                    if (_rootPid != 0) pids.Add(_rootPid);
+                    EnumWindows((h, l) =>
+                    {
+                        uint pid;
+                        GetWindowThreadProcessId(h, out pid);
+                        if (pids.Contains((int)pid) && IsWindowVisible(h)) ShowWindowAsync(h, SW_HIDE);
+                        return true;
+                    }, IntPtr.Zero);
+                }
+                catch { }
+            }
+
+            private void CheckAlive()
+            {
+                if (_exiting) return;
+                try
+                {
+                    RefreshTree();
+                    bool anyAlive = false;
+                    var all = new HashSet<int>(_tree);
+                    if (_rootPid != 0) all.Add(_rootPid);
+                    foreach (int pid in all)
+                    {
+                        try { using (var p = Process.GetProcessById(pid)) { if (!p.HasExited) { anyAlive = true; break; } } }
+                        catch { }
+                    }
+                    if (anyAlive) { _treeDeadSince = null; return; }
+                    if (_treeDeadSince == null) _treeDeadSince = DateTime.UtcNow;
+                    else if ((DateTime.UtcNow - _treeDeadSince.Value).TotalSeconds >= AutoExitGraceSeconds) ExitWrapper();
+                }
+                catch { }
+            }
+
+            private void RefreshTree()
+            {
+                _tree.Clear();
+                if (_rootPid == 0) return;
+                foreach (int pid in ChildProcessIds(_rootPid)) _tree.Add(pid);
+            }
+
+            private void ExitWrapper()
+            {
+                if (_exiting) return;
+                _exiting = true;
+                try { if (_hideTimer != null) { _hideTimer.Stop(); _hideTimer.Dispose(); } } catch { }
+                try { if (_watchTimer != null) { _watchTimer.Stop(); _watchTimer.Dispose(); } } catch { }
+                try { ExitThread(); } catch { }
+            }
         }
 
         private static IEnumerable<int> ChildProcessIds(int rootPid)
@@ -1493,11 +2889,6 @@ foreach($t in Get-ScheduledTask){
             catch { }
             return ids;
         }
-
-        private static void HideWindowsForPid(int pid)
-        {
-            return;
-        }
     }
 
     internal sealed class MainForm : Form
@@ -1506,7 +2897,7 @@ foreach($t in Get-ScheduledTask){
         private ListView _list;
         private TextBox _search;
         private Label _summary, _visibleValue, _enabledValue, _disabledValue, _reviewValue, _managedValue, _hint;
-        private Button _refresh, _disable, _enable, _add, _editSelected, _deleteManaged, _clearSearch, _showAll, _showRisky, _showCleanup, _showDisabled, _quietSelected, _protectNow, _enforceNow, _openFolders;
+        private Button _refresh, _disable, _enable, _add, _editSelected, _deleteManaged, _clearSearch, _showAll, _showRisky, _showCleanup, _showDisabled, _quietSelected, _protectNow, _enforceNow, _coverage, _openFolders;
         private NotifyIcon _tray;
         private Timer _guardTimer;
         private bool _reallyExit;
@@ -1535,7 +2926,14 @@ foreach($t in Get-ScheduledTask){
             FormClosing += OnClosingToTray;
             Resize += (s, e) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
             KeyDown += MainFormKeyDown;
-            Shown += (s, e) => { if (_startInTray) BeginInvoke(new Action(HideToTray)); };
+            Shown += (s, e) =>
+            {
+                if (_startInTray) BeginInvoke(new Action(HideToTray));
+                else if (_search != null) _search.Clear();
+            };
+            // A window that was hidden and is shown again (e.g. opened from the Start Menu while
+            // the hidden boot agent owns the window) must always present the full list.
+            VisibleChanged += (s, e) => { if (Visible && _search != null) _search.Clear(); };
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -1581,6 +2979,7 @@ foreach($t in Get-ScheduledTask){
             _deleteManaged = Button("Delete task", Warn, 115); _deleteManaged.Location = new Point(toolbar.Width - 373, 18); _deleteManaged.Anchor = AnchorStyles.Top | AnchorStyles.Right; _deleteManaged.Click += (s, e) => DeleteManaged(); toolbar.Controls.Add(_deleteManaged);
             _protectNow = Button("Protect disabled", Surface2, 135); _protectNow.Location = new Point(toolbar.Width - 270, 18); _protectNow.Anchor = AnchorStyles.Top | AnchorStyles.Right; _protectNow.Click += (s, e) => ProtectDisabledNow(); toolbar.Controls.Add(_protectNow);
             _enforceNow = Button("Enforce now", Steel, 112); _enforceNow.Location = new Point(toolbar.Width - 130, 18); _enforceNow.Anchor = AnchorStyles.Top | AnchorStyles.Right; _enforceNow.Click += (s, e) => RunGuardsAsync(true); toolbar.Controls.Add(_enforceNow);
+            _coverage = Button("Coverage", Steel, 92); _coverage.Location = new Point(toolbar.Width - 230, 18); _coverage.Anchor = AnchorStyles.Top | AnchorStyles.Right; _coverage.Click += (s, e) => RunBootAuditAsync(); toolbar.Controls.Add(_coverage);
             _openFolders = Button("Open startup folders", Surface2, 160); _openFolders.Location = new Point(toolbar.Width - 190, 66); _openFolders.Anchor = AnchorStyles.Top | AnchorStyles.Right; _openFolders.Click += (s, e) => OpenStartupFolders(); toolbar.Controls.Add(_openFolders);
 
             var listCard = Card(new Rectangle(28, 432, Width - 72, Height - 488));
@@ -1679,7 +3078,8 @@ foreach($t in Get-ScheduledTask){
             var trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add("Open Startup Master", null, (s, e) => OpenFromTray());
             trayMenu.Items.Add("Refresh inventory", null, (s, e) => RefreshItems());
-            trayMenu.Items.Add("Enforce quiet + disabled guards", null, (s, e) => RunGuardsAsync(true));
+            trayMenu.Items.Add("Verify boot coverage", null, (s, e) => RunBootAuditAsync());
+            trayMenu.Items.Add("Enforce quiet + disabled + enabled guards", null, (s, e) => RunGuardsAsync(true));
             trayMenu.Items.Add("Exit", null, (s, e) => { _reallyExit = true; if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } Application.Exit(); });
             _tray.ContextMenuStrip = trayMenu;
         }
@@ -1687,6 +3087,9 @@ foreach($t in Get-ScheduledTask){
         {
             if (IsDisposed) return;
             if (InvokeRequired) { BeginInvoke(new Action(OpenFromTray)); return; }
+            // Always show the full inventory on open: a leftover search term must never make
+            // items look missing from the app, and the list must always reflect the current state.
+            if (_search != null) _search.Clear();
             ShowInTaskbar = true;
             Show();
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
@@ -1694,6 +3097,7 @@ foreach($t in Get-ScheduledTask){
             Activate();
             TopMost = true;
             TopMost = false;
+            RefreshItems();
         }
         private void HideToTray()
         {
@@ -1713,6 +3117,7 @@ foreach($t in Get-ScheduledTask){
             {
                 ProtectedDisabledService.EnforceProtected();
                 ProtectedQuietService.EnforceProtected();
+                EnabledStartupService.EnforceEnabled(true);
                 var scanned = StartupService.ScanAll();
                 ProtectedDisabledService.ProtectCurrentDisabled();
                 return scanned;
@@ -1849,9 +3254,32 @@ foreach($t in Get-ScheduledTask){
             catch (Exception ex) { MessageBox.Show(ex.Message, "Edit failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         }
         private void ProtectDisabledNow() { try { string result = ProtectedDisabledService.ProtectCurrentDisabled(); Toast("Protected disabled", result); } catch (Exception ex) { MessageBox.Show(ex.Message, "Protect disabled failed"); } }
+        private void RunBootAuditAsync()
+        {
+            SetBusy(true, "Verifying every boot source is shown in the app and every tray app has one correct icon...");
+            Task.Run(() =>
+            {
+                string boot = StartupService.AuditBootCoverage();
+                string tray = StartupService.AuditTrayCoverage();
+                return boot + Environment.NewLine + tray;
+            }).ContinueWith(t =>
+            {
+                if (IsDisposed) return;
+                BeginInvoke(new Action(() =>
+                {
+                    SetBusy(false, "");
+                    string result = t.Exception != null ? "Coverage check failed: " + t.Exception.GetBaseException().Message : t.Result;
+                    bool clean = result.IndexOf("gaps=0", StringComparison.Ordinal) >= 0 && result.IndexOf("findings=0", StringComparison.Ordinal) >= 0;
+                    Toast(clean ? "Coverage: complete" : "Coverage: gaps found", result);
+                }));
+            });
+        }
+
         private void RunGuardsAsync(bool showResult)
         {
-            Task.Run(() => ProtectedDisabledService.EnforceProtected() + " | " + ProtectedQuietService.EnforceProtected()).ContinueWith(t =>
+            // includeImport=true lets the throttled pass re-run v2 migration, external-task import,
+            // and duplicate-launcher retirement at most every five minutes while the app runs.
+            Task.Run(() => ProtectedDisabledService.EnforceProtected() + " | " + ProtectedQuietService.EnforceProtected() + " | " + EnabledStartupService.EnforceEnabled(true)).ContinueWith(t =>
             {
                 if (IsDisposed || !showResult) return;
                 BeginInvoke(new Action(() => Toast("Guards enforced", t.Exception == null ? t.Result : t.Exception.GetBaseException().Message)));
