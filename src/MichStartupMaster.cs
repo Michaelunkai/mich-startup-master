@@ -72,6 +72,7 @@ namespace MichStartupMaster
                 if (cmd == "--version") { Console.WriteLine("MichStartupMaster GitHub recovery build"); return 0; }
                 if (cmd == "--list") { Console.WriteLine(StartupService.ToJson(StartupService.ScanAll())); return 0; }
                 if (cmd == "--audit-boot") { Console.WriteLine(StartupService.AuditBootCoverage()); Console.WriteLine(StartupService.AuditTrayCoverage()); return 0; }
+                if (cmd == "--detect-new") { var fresh = StartupWatcher.DetectNew(); Console.WriteLine("DETECT_NEW count=" + fresh.Count + (fresh.Count > 0 ? " first=" + fresh[0].HumanName() : "")); return 0; }
                 if (cmd == "--add-test-task") return CliAddTestTask(args, true);
                 if (cmd == "--add-test-task-tray") return CliAddTestTask(args, true);
                 if (cmd == "--add-test-task-normal") return CliAddTestTask(args, false);
@@ -1448,6 +1449,56 @@ foreach($t in Get-ScheduledTask){
             return ext == ".exe" || ext == ".cmd" || ext == ".bat" || ext == ".ps1" || ext == ".lnk";
         }
 
+        // Packaged (MSIX/Store) apps live under WindowsApps in a versioned folder that moves
+        // every time the app auto-updates. A stored path pointing at an old version would otherwise
+        // silently fail at boot, so resolve it to the newest installed version of the same package
+        // family. Returns the original path when it already exists or cannot be resolved, so callers
+        // simply check File.Exists afterwards.
+        public static string ResolveTargetPath(string target)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(target)) return target;
+                if (File.Exists(target)) return target;
+                string windowsApps = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WindowsApps");
+                string full = Path.GetFullPath(target);
+                if (!full.StartsWith(windowsApps, StringComparison.OrdinalIgnoreCase)) return target;
+                string relative = full.Substring(windowsApps.Length).TrimStart('\\', '/');
+                int slash = relative.IndexOfAny(new[] { '\\', '/' });
+                if (slash < 0) return target;
+                string packageFolder = relative.Substring(0, slash);
+                string subPath = relative.Substring(slash + 1);
+                int dd = packageFolder.LastIndexOf("__", StringComparison.Ordinal);
+                if (dd < 0) return target;
+                string publisher = packageFolder.Substring(dd + 2);
+                string before = packageFolder.Substring(0, dd);
+                int us = before.IndexOf('_');
+                if (us <= 0) return target;
+                string name = before.Substring(0, us);
+                string best = null;
+                Version bestVersion = null;
+                if (Directory.Exists(windowsApps))
+                {
+                    foreach (string dir in Directory.GetDirectories(windowsApps, name + "_*"))
+                    {
+                        string fn = Path.GetFileName(dir);
+                        if (!fn.EndsWith("__" + publisher, StringComparison.OrdinalIgnoreCase)) continue;
+                        string mid = fn.Substring(name.Length + 1, fn.Length - name.Length - 1 - ("__" + publisher).Length);
+                        int sep = mid.IndexOf('_');
+                        if (sep <= 0) continue;
+                        string verText = mid.Substring(0, sep);
+                        Version v;
+                        if (!Version.TryParse(verText, out v)) continue;
+                        string candidate = Path.Combine(dir, subPath);
+                        if (!File.Exists(candidate)) continue;
+                        if (bestVersion == null || v > bestVersion) { bestVersion = v; best = candidate; }
+                    }
+                }
+                return best ?? target;
+            }
+            catch { return target; }
+        }
+
         public static void BuildDirectAction(string targetPath, string arguments, out string execute, out string actionArgs)
         {
             string ext = Path.GetExtension(targetPath ?? "").ToLowerInvariant();
@@ -1517,10 +1568,26 @@ foreach($t in Get-ScheduledTask){
                 int end = command.IndexOf('"', 1);
                 if (end > 1) { exe = command.Substring(1, end - 1); args = command.Substring(end + 1).Trim(); return true; }
             }
-            Match m = Regex.Match(command, @"^(?<exe>.+?\.exe|.+?\.lnk)(?:\s+(?<args>.*))?$", RegexOptions.IgnoreCase);
+            Match m = Regex.Match(command, @"^(?<exe>.+?\.(?:exe|lnk|ps1|cmd|bat|vbs|py|pyw|com|msc))(?:\s+(?<args>.*))?$", RegexOptions.IgnoreCase);
             if (m.Success) { exe = m.Groups["exe"].Value.Trim(); args = m.Groups["args"].Value.Trim(); return true; }
             if (File.Exists(command)) { exe = command; args = ""; return true; }
             return false;
+        }
+
+        // Human-friendly name for a startup target, used by the Add/Edit dialog to auto-fill the
+        // friendly name the moment a path is pasted or typed.
+        public static string SuggestDisplayName(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return "";
+            try
+            {
+                string expanded = ExpandPathTokens(path.Trim('"'));
+                if (!File.Exists(expanded)) return CleanName(SafeFileStem(path));
+                string fromFile = FriendlyNameFromFile(expanded);
+                if (!string.IsNullOrWhiteSpace(fromFile)) return fromFile;
+                return CleanName(SafeFileStem(expanded));
+            }
+            catch { return ""; }
         }
 
         private static void ResolveShortcut(string shortcutPath, out string targetPath, out string arguments)
@@ -2487,7 +2554,17 @@ foreach($t in Get-ScheduledTask){
                 if (isManaged)
                 {
                     string target = row.Target;
+                    if (string.IsNullOrWhiteSpace(target)) return false;
+                    if (!File.Exists(target)) target = StartupService.ResolveTargetPath(target);
                     if (string.IsNullOrWhiteSpace(target) || !File.Exists(target)) return false;
+                    if (!string.Equals(target, row.Target, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // The packaged app auto-updated into a new version folder; persist the
+                        // resolved path so the manifest self-heals and the task gets re-registered
+                        // with the current launcher on the lines below.
+                        row.Target = target;
+                        Upsert(row);
+                    }
                     StartupService.BuildManagedAction(target, row.Arguments ?? "", tray, out expectedExec, out expectedArgs);
                 }
                 else
@@ -2701,6 +2778,98 @@ foreach($t in Get-ScheduledTask){
         private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
     }
 
+    // Watches for brand-new startup entries appearing from ANY source (another app or installer,
+    // a registry edit, a new scheduled task, a dropped Startup-folder shortcut) and reports them
+    // so the user is told the moment something new is set to run at boot. A persisted signature
+    // store makes only genuinely new entries toast — the pre-existing inventory is seeded as the
+    // baseline on the very first scan and never floods with notifications.
+    internal static class StartupWatcher
+    {
+        // MSM_KNOWN_STORE lets the regression suite point the watcher at an isolated store so a
+        // "new item detected" test is fully deterministic and never races the live agent.
+        private static string StorePath
+        {
+            get
+            {
+                string overridePath = Environment.GetEnvironmentVariable("MSM_KNOWN_STORE");
+                if (!string.IsNullOrWhiteSpace(overridePath)) return overridePath;
+                return Path.Combine(Program.AppData, "known-startup-items.tsv");
+            }
+        }
+
+        // A stable identity for one logical startup entry. It deliberately excludes per-scan noise
+        // (case, extra whitespace) so the same entry is never re-reported on later scans.
+        private static string Identity(StartupItem item)
+        {
+            string name = (item.Name ?? "").Trim();
+            string loc = (item.Location ?? "").Trim();
+            string cmd = (item.Command ?? "").Trim();
+            return (item.Source ?? "") + "\u0001" + name + "\u0001" + loc + "\u0001" + cmd;
+        }
+
+        private static HashSet<string> LoadKnown()
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                if (File.Exists(StorePath))
+                {
+                    foreach (string line in File.ReadAllLines(StorePath))
+                    {
+                        string sig = UnB64(line.Split('\t')[0]);
+                        if (!string.IsNullOrWhiteSpace(sig)) set.Add(sig);
+                    }
+                }
+            }
+            catch { }
+            return set;
+        }
+
+        private static void SaveKnown(IEnumerable<StartupItem> items)
+        {
+            try
+            {
+                Directory.CreateDirectory(Program.AppData);
+                var lines = items.Select(i => B64(Identity(i))).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                WriteAllLinesWithRetry(StorePath, lines);
+            }
+            catch { }
+        }
+
+        // Returns the startup entries that appeared since the previous call. The first call only
+        // seeds the baseline and returns nothing, so the app never toasts for its existing inventory.
+        public static List<StartupItem> DetectNew()
+        {
+            var current = StartupService.ScanAll();
+            try
+            {
+                if (!File.Exists(StorePath))
+                {
+                    SaveKnown(current);
+                    return new List<StartupItem>();
+                }
+                var known = LoadKnown();
+                var fresh = current.Where(i => !(i.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase) && !known.Contains(Identity(i))).ToList();
+                SaveKnown(current);
+                return fresh;
+            }
+            catch { return new List<StartupItem>(); }
+        }
+
+        private static void WriteAllLinesWithRetry(string path, string[] lines)
+        {
+            for (int attempt = 0; ; attempt++)
+            {
+                try { File.WriteAllLines(path, lines, Encoding.UTF8); return; }
+                catch (IOException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
+                catch (UnauthorizedAccessException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
+            }
+        }
+
+        private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
+        private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
+    }
+
     internal static class TrayRunner
     {
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -2711,7 +2880,10 @@ foreach($t in Get-ScheduledTask){
         [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
         private const int SW_HIDE = 0;
         private const int SW_RESTORE = 9;
-        private const int HideDurationSeconds = 12;
+        // How long after launch the wrapper aggressively suppresses EVERY window the target shows
+        // (the boot popup window). After this it switches to "only hide brand-new windows" mode so
+        // the user can still open the app's GUI from its tray icon.
+        private const int BootSettleSeconds = 60;
         private const int AutoExitGraceSeconds = 15;
 
         public static void RunMain(string[] args)
@@ -2726,12 +2898,16 @@ foreach($t in Get-ScheduledTask){
             try
             {
                 string full = Path.GetFullPath(target);
-                if (!File.Exists(full) || !StartupService.IsSupportedStartupTarget(full)) return;
-                string mutexName = @"Local\MichStartupMaster.TrayWrapper." + HashName(full);
+                if (!File.Exists(full)) full = StartupService.ResolveTargetPath(full);
+                if (string.IsNullOrWhiteSpace(full) || !File.Exists(full) || !StartupService.IsSupportedStartupTarget(full)) return;
+                // The single-instance identity is the full launch identity (target + arguments),
+                // not just the host path: quiet apps that share a script host (wscript.exe,
+                // powershell.exe, ...) must never collide with each other's wrapper.
+                string mutexName = @"Local\MichStartupMaster.TrayWrapper." + HashName(full + "\n" + targetArgs);
                 bool createdNew;
                 using (var mutex = new System.Threading.Mutex(true, mutexName, out createdNew))
                 {
-                    if (!createdNew) return; // another quiet wrapper already controls this target
+                    if (!createdNew) return; // another quiet wrapper already controls this exact launch
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
                     using (var ctx = new TrayWrapperContext(full, targetArgs))
@@ -2763,6 +2939,9 @@ foreach($t in Get-ScheduledTask){
             private DateTime _startedUtc = DateTime.UtcNow;
             private int _rootPid;
             private readonly HashSet<int> _tree = new HashSet<int>();
+            // Windows this wrapper has hidden and windows the user has intentionally re-opened.
+            private readonly HashSet<IntPtr> _hiddenWindows = new HashSet<IntPtr>();
+            private readonly HashSet<IntPtr> _exemptWindows = new HashSet<IntPtr>();
             private DateTime? _treeDeadSince;
             private bool _exiting;
 
@@ -2776,7 +2955,7 @@ foreach($t in Get-ScheduledTask){
                 // removes the duplicate/broken "wrapper" icons next to GameSir, whisper-key,
                 // AutoHotkey, etc. Clicking the app's own icon (or "Launch now" in Startup
                 // Master) opens its GUI.
-                _hideTimer = new Timer { Interval = 400 };
+                _hideTimer = new Timer { Interval = 1000 };
                 _hideTimer.Tick += (s, e) => HideNewWindows();
                 _hideTimer.Start();
                 _watchTimer = new Timer { Interval = 5000 };
@@ -2803,7 +2982,8 @@ foreach($t in Get-ScheduledTask){
                     {
                         UseShellExecute = false,
                         CreateNoWindow = true,
-                        WindowStyle = ProcessWindowStyle.Minimized,
+                        // Start fully hidden so even a brief startup flash never reaches the desktop.
+                        WindowStyle = ProcessWindowStyle.Hidden,
                         WorkingDirectory = Directory.Exists(Path.GetDirectoryName(_target)) ? Path.GetDirectoryName(_target) : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
                     };
                     var p = Process.Start(psi);
@@ -2816,17 +2996,24 @@ foreach($t in Get-ScheduledTask){
             private void HideNewWindows()
             {
                 if (_exiting) return;
-                if ((DateTime.UtcNow - _startedUtc).TotalSeconds > HideDurationSeconds) { _hideTimer.Stop(); _hideTimer.Dispose(); _hideTimer = null; return; }
                 try
                 {
                     RefreshTree();
                     var pids = new HashSet<int>(_tree);
                     if (_rootPid != 0) pids.Add(_rootPid);
+                    bool settled = (DateTime.UtcNow - _startedUtc).TotalSeconds > BootSettleSeconds;
                     EnumWindows((h, l) =>
                     {
                         uint pid;
                         GetWindowThreadProcessId(h, out pid);
-                        if (pids.Contains((int)pid) && IsWindowVisible(h)) ShowWindowAsync(h, SW_HIDE);
+                        if (!pids.Contains((int)pid) || !IsWindowVisible(h)) return true;
+                        if (_exemptWindows.Contains(h)) return true;
+                        // After the boot settle period, a window we already hid that is visible
+                        // again means the user opened it on purpose (e.g. clicked the app's tray
+                        // icon) — leave it alone from then on.
+                        if (settled && _hiddenWindows.Contains(h)) { _exemptWindows.Add(h); return true; }
+                        ShowWindowAsync(h, SW_HIDE);
+                        _hiddenWindows.Add(h);
                         return true;
                     }, IntPtr.Zero);
                 }
@@ -2900,6 +3087,7 @@ foreach($t in Get-ScheduledTask){
         private Button _refresh, _disable, _enable, _add, _editSelected, _deleteManaged, _clearSearch, _showAll, _showRisky, _showCleanup, _showDisabled, _quietSelected, _protectNow, _enforceNow, _coverage, _openFolders;
         private NotifyIcon _tray;
         private Timer _guardTimer;
+        private ToolTip _tooltip;
         private bool _reallyExit;
         private bool _isRefreshing;
         private int _refreshVersion;
@@ -2918,10 +3106,11 @@ foreach($t in Get-ScheduledTask){
             Text = "Mich Startup Master - Windows Boot Control";
             Width = 1440; Height = 900; MinimumSize = new Size(1160, 760);
             BackColor = Bg; Font = new Font("Segoe UI", 10f); DoubleBuffered = true; Icon = Program.AppIcon; KeyPreview = true;
+            _tooltip = new ToolTip { AutoPopDelay = 6000, InitialDelay = 400, ReshowDelay = 200, ShowAlways = true };
             BuildUi(); BuildTray();
-            Load += (s, e) => RefreshItems();
+            Load += (s, e) => { RefreshItems(); DetectNewStartupItems(); };
             _guardTimer = new Timer { Interval = 30000 };
-            _guardTimer.Tick += (s, e) => RunGuardsAsync(false);
+            _guardTimer.Tick += (s, e) => { RunGuardsAsync(false); DetectNewStartupItems(); };
             _guardTimer.Start();
             FormClosing += OnClosingToTray;
             Resize += (s, e) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
@@ -2955,6 +3144,8 @@ foreach($t in Get-ScheduledTask){
             hero.Controls.Add(title); hero.Controls.Add(sub); hero.Controls.Add(_summary);
             _add = Button("+ Add startup", Accent, 170); _add.Location = new Point(30, 112); _add.Click += (s, e) => AddBootApp(); hero.Controls.Add(_add);
             _refresh = Button("Refresh inventory", Steel, 160); _refresh.Location = new Point(hero.Width - 190, 104); _refresh.Anchor = AnchorStyles.Top | AnchorStyles.Right; _refresh.Click += (s, e) => RefreshItems(); hero.Controls.Add(_refresh);
+            var heroIcon = new PictureBox { Image = Program.AppIcon.ToBitmap(), SizeMode = PictureBoxSizeMode.Zoom, Bounds = new Rectangle(hero.Width - 92, 22, 60, 60), Anchor = AnchorStyles.Top | AnchorStyles.Right, BackColor = Color.Transparent };
+            hero.Controls.Add(heroIcon);
 
             int cardTop = 202, cardW = 194, gap = 14;
             _visibleValue = MetricCard("Visible", "startup items in view", Color.FromArgb(129, 140, 248), 28 + (cardW + gap) * 0, cardTop, cardW);
@@ -2993,6 +3184,27 @@ foreach($t in Get-ScheduledTask){
             _list.ContextMenuStrip = BuildListContextMenu();
             _list.Resize += (s, e) => { if (_list.Columns.Count > 8) _list.Columns[8].Width = Math.Max(300, _list.Width - 1306); };
             listCard.Controls.Add(_list);
+            AttachTooltips();
+        }
+
+        private void AttachTooltips()
+        {
+            _tooltip.SetToolTip(_add, "Add any .exe/.cmd/.bat/.ps1/.lnk to Windows startup — just paste a full path and the rest fills in.");
+            _tooltip.SetToolTip(_refresh, "Re-scan every boot source and refresh the list.");
+            _tooltip.SetToolTip(_search, "Type to filter the list. Cleared automatically when the window opens.");
+            _tooltip.SetToolTip(_showAll, "Show every startup entry.");
+            _tooltip.SetToolTip(_showRisky, "Show high-consequence entries: services, drivers, and logon components.");
+            _tooltip.SetToolTip(_showCleanup, "Show suggested optional-startup cleanup candidates.");
+            _tooltip.SetToolTip(_showDisabled, "Show entries currently kept from startup.");
+            _tooltip.SetToolTip(_editSelected, "Edit the selected entry's path, arguments, and startup mode.");
+            _tooltip.SetToolTip(_quietSelected, "Start the selected app quietly in the tray at every boot (no window).");
+            _tooltip.SetToolTip(_disable, "Remove the selected entry from startup. It can be restored later.");
+            _tooltip.SetToolTip(_enable, "Restore the selected entry so it runs at boot.");
+            _tooltip.SetToolTip(_deleteManaged, "Permanently delete a startup task created by this app.");
+            _tooltip.SetToolTip(_protectNow, "Re-assert every disabled entry so it stays disabled.");
+            _tooltip.SetToolTip(_enforceNow, "Re-assert every enabled, quiet, and disabled guard right now.");
+            _tooltip.SetToolTip(_coverage, "Verify every boot source is shown and every tray app has one correct icon.");
+            _tooltip.SetToolTip(_openFolders, "Open the user and common Startup folders in Explorer.");
         }
 
         private ContextMenuStrip BuildListContextMenu()
@@ -3013,7 +3225,30 @@ foreach($t in Get-ScheduledTask){
 
         private Panel Card(Rectangle bounds)
         {
-            return new Panel { Bounds = bounds, BackColor = Color.FromArgb(220, Surface), BorderStyle = BorderStyle.FixedSingle };
+            var p = new Panel { Bounds = bounds, BackColor = Surface, BorderStyle = BorderStyle.None };
+            ApplyRound(p, 14);
+            p.Resize += (s, e) => ApplyRound(p, 14);
+            return p;
+        }
+
+        // Clip a control to softly rounded corners. Buttons never resize, so a one-shot region is
+        // enough; cards are re-rounded on resize so the corners stay correct when the window grows.
+        private static void ApplyRound(Control c, int radius)
+        {
+            try
+            {
+                if (c.Width < radius * 2 + 2 || c.Height < radius * 2 + 2) { c.Region = null; return; }
+                int d = radius * 2;
+                var path = new GraphicsPath();
+                var r = new Rectangle(0, 0, c.Width, c.Height);
+                path.AddArc(r.X, r.Y, d, d, 180, 90);
+                path.AddArc(r.Right - d - 1, r.Y, d, d, 270, 90);
+                path.AddArc(r.Right - d - 1, r.Bottom - d - 1, d, d, 0, 90);
+                path.AddArc(r.X, r.Bottom - d - 1, d, d, 90, 90);
+                path.CloseFigure();
+                c.Region = new Region(path);
+            }
+            catch { }
         }
 
         private Label MetricCard(string title, string helper, Color accent, int x, int y, int w)
@@ -3067,7 +3302,9 @@ foreach($t in Get-ScheduledTask){
         private Button Button(string text, Color color, int width)
         {
             var b = new Button { Text = text, Width = width, Height = 40, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 9.5f), Cursor = Cursors.Hand };
-            b.FlatAppearance.BorderSize = 0; b.MouseEnter += (s, e) => b.BackColor = ControlPaint.Light(color, .10f); b.MouseLeave += (s, e) => b.BackColor = color; return b;
+            b.FlatAppearance.BorderSize = 0;
+            ApplyRound(b, 10);
+            b.MouseEnter += (s, e) => b.BackColor = ControlPaint.Light(color, .10f); b.MouseLeave += (s, e) => b.BackColor = color; return b;
         }
 
         private void BuildTray()
@@ -3344,67 +3581,186 @@ foreach($t in Get-ScheduledTask){
             }
         }
         private void Toast(string title, string body) { _hint.Text = title + ": " + body; }
+
+        // Show a real Windows notification next to the tray icon (used for the "new startup item"
+        // alert). Also updates the in-app hint so the message is visible either way.
+        private void NotifyToast(string title, string body, ToolTipIcon icon)
+        {
+            _hint.Text = title + ": " + body;
+            try
+            {
+                if (_tray == null) return;
+                _tray.BalloonTipTitle = title;
+                _tray.BalloonTipText = body;
+                _tray.BalloonTipIcon = icon;
+                _tray.ShowBalloonTip(7000);
+            }
+            catch { }
+        }
+
+        // Scan for startup entries that appeared since the last check and alert the moment they
+        // are found, so nothing set to run at boot — by this app or any other — is ever missed.
+        private void DetectNewStartupItems()
+        {
+            Task.Run(() => StartupWatcher.DetectNew()).ContinueWith(t =>
+            {
+                if (IsDisposed) return;
+                var fresh = t.Exception != null ? new List<StartupItem>() : t.Result;
+                if (fresh.Count == 0) return;
+                BeginInvoke(new Action(() =>
+                {
+                    if (fresh.Count == 1)
+                    {
+                        var item = fresh[0];
+                        NotifyToast("New startup item detected", item.HumanName() + " was just set to start with Windows.", ToolTipIcon.Warning);
+                    }
+                    else
+                    {
+                        NotifyToast("New startup items detected", fresh.Count + " new entries were just set to start with Windows.", ToolTipIcon.Warning);
+                    }
+                    RefreshItems();
+                }));
+            });
+        }
+
         private static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "\\\"") + "\""; }
     }
 
     internal sealed class AddStartupForm : Form
     {
         public string AppTitle { get { return _name.Text.Trim(); } }
-        public string AppPath { get { return _path.Text.Trim(); } }
+        public string AppPath { get { return _path.Text.Trim().Trim('"'); } }
         public string AppArguments { get { return _args.Text; } }
         public bool TrayMode { get { return _trayMode.Checked; } }
-        private TextBox _name, _path, _args;
+        private TextBox _name, _path, _args, _paste;
         private RadioButton _normalMode, _trayMode;
-        private readonly Color Bg = Color.FromArgb(10, 14, 28), Surface = Color.FromArgb(21, 28, 51), TextMain = Color.FromArgb(245, 247, 255), Muted = Color.FromArgb(156, 166, 195), Accent = Color.FromArgb(99, 102, 241);
+        private Label _status;
+        private readonly Color Bg = Color.FromArgb(10, 14, 28), Surface = Color.FromArgb(21, 28, 51), Surface2 = Color.FromArgb(17, 24, 44), TextMain = Color.FromArgb(245, 247, 255), Muted = Color.FromArgb(156, 166, 195), Accent = Color.FromArgb(20, 184, 166), Good = Color.FromArgb(52, 211, 153);
 
         public AddStartupForm() : this("", "", "", true) { }
 
         public AddStartupForm(string appTitle, string appPath, string appArguments, bool trayMode)
         {
-            Text = "Add app to Windows startup"; Width = 720; Height = 520; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; BackColor = Bg; ForeColor = Color.White; Font = new Font("Segoe UI", 10f); StartPosition = FormStartPosition.CenterParent; Icon = Program.AppIcon;
-            Controls.Add(new Label { Text = string.IsNullOrWhiteSpace(appPath) ? "Add an app to startup" : "Edit startup app", Left = 28, Top = 24, AutoSize = true, ForeColor = TextMain, Font = new Font("Segoe UI Semibold", 22f) });
-            Controls.Add(new Label { Text = "Choose an executable, script, shortcut, or command launcher, then pick normal startup or quiet tray startup.", Left = 30, Top = 66, Width = 620, Height = 40, ForeColor = Muted, Font = new Font("Segoe UI", 10.5f) });
-            AddLabel("Friendly name", 118); _name = Box(144, 470);
-            AddLabel("Executable path", 184); _path = Box(210, 486); var browse = Button("Browse", Accent, 82); browse.Left = 526; browse.Top = 208; browse.Click += Browse; Controls.Add(browse); var paste = Button("Paste", Surface, 76); paste.Left = 614; paste.Top = 208; paste.Click += PastePath; Controls.Add(paste);
-            AddLabel("Optional arguments", 250); _args = Box(276, 622);
-            AddLabel("Startup mode", 318);
-            _normalMode = new RadioButton { Text = "Start normally - run the app directly at Windows logon", Left = 34, Top = 346, Width = 610, ForeColor = TextMain, BackColor = Bg, Checked = !trayMode };
-            _trayMode = new RadioButton { Text = "Start quietly in tray mode - no terminal, minimized launch, controller tray icon", Left = 34, Top = 378, Width = 630, ForeColor = TextMain, BackColor = Bg, Checked = trayMode };
+            Text = "Add app to Windows startup"; Width = 780; Height = 640; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; BackColor = Bg; ForeColor = Color.White; Font = new Font("Segoe UI", 10f); StartPosition = FormStartPosition.CenterParent; Icon = Program.AppIcon; DoubleBuffered = true;
+            Controls.Add(new Label { Text = string.IsNullOrWhiteSpace(appPath) ? "Add an app to startup" : "Edit startup app", Left = 32, Top = 22, AutoSize = true, ForeColor = TextMain, Font = new Font("Segoe UI Semibold", 22f) });
+            Controls.Add(new Label { Text = "Just paste a full path or a whole command line — the friendly name, arguments and quiet mode are filled in for you.", Left = 34, Top = 62, Width = 700, Height = 40, ForeColor = Muted, Font = new Font("Segoe UI", 10.5f) });
+
+            // Smart paste: one field that accepts a bare path or a full command line.
+            AddLabel("Paste a full path or command (fastest way)", 112);
+            _paste = Box(138, 622); _paste.Width = 528; _paste.Leave += (s, e) => { if (!string.IsNullOrWhiteSpace(_paste.Text)) ApplyPaste(_paste.Text); };
+            var paste = Button("Paste & fill", Accent, 120); paste.Left = 668; paste.Top = 136; paste.Click += PastePath; Controls.Add(paste);
+
+            AddLabel("Friendly name (auto-filled)", 182); _name = Box(208, 640);
+            AddLabel("Executable path", 252); _path = Box(278, 528); _path.Width = 528; _path.Leave += (s, e) => AutoFillFromPath();
+            var browse = Button("Browse", Surface, 104); browse.Left = 668; browse.Top = 276; browse.Click += Browse; Controls.Add(browse);
+            AddLabel("Optional arguments", 322); _args = Box(348, 640);
+
+            AddLabel("Startup mode", 398);
+            _normalMode = new RadioButton { Text = "Start normally — run the app directly at Windows logon (a window may appear)", Left = 34, Top = 424, Width = 700, ForeColor = TextMain, BackColor = Bg, Checked = !trayMode };
+            _trayMode = new RadioButton { Text = "Start quietly in tray mode — no window, no terminal, starts silently at every boot", Left = 34, Top = 454, Width = 700, ForeColor = Good, BackColor = Bg, Checked = trayMode };
             Controls.Add(_normalMode); Controls.Add(_trayMode);
-            Controls.Add(new Label { Text = "Quiet tray mode is the safest generic no-popup startup path; apps that force their own window may still show it.", Left = 54, Top = 406, Width = 590, Height = 34, ForeColor = Muted, Font = new Font("Segoe UI", 9f) });
+            Controls.Add(new Label { Text = "Quiet tray mode launches the app hidden and keeps it alive; the app's own tray icon opens its window when you click it.", Left = 54, Top = 482, Width = 690, Height = 34, ForeColor = Muted, Font = new Font("Segoe UI", 9f) });
+
             _name.Text = appTitle ?? "";
             _path.Text = appPath ?? "";
             _args.Text = appArguments ?? "";
-            var ok = Button(string.IsNullOrWhiteSpace(appPath) ? "Add at next boot" : "Save startup", Accent, 150); ok.Left = 390; ok.Top = 452; ok.DialogResult = DialogResult.OK; ok.Click += ValidateBeforeClose;
-            var cancel = Button("Cancel", Surface, 100); cancel.Left = 550; cancel.Top = 452; cancel.DialogResult = DialogResult.Cancel;
+
+            _status = new Label { Left = 34, Top = 524, Width = 700, Height = 34, ForeColor = Good, Font = new Font("Segoe UI", 9.5f) };
+            Controls.Add(_status);
+
+            var ok = Button(string.IsNullOrWhiteSpace(appPath) ? "Add at next boot" : "Save startup", Accent, 170); ok.Left = 430; ok.Top = 566; ok.DialogResult = DialogResult.OK; ok.Click += ValidateBeforeClose;
+            var cancel = Button("Cancel", Surface, 110); cancel.Left = 612; cancel.Top = 566; cancel.DialogResult = DialogResult.Cancel;
             Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
         }
+
         private void ValidateBeforeClose(object sender, EventArgs e)
         {
-            if (string.IsNullOrWhiteSpace(AppTitle) || string.IsNullOrWhiteSpace(AppPath) || !File.Exists(AppPath) || !StartupService.IsSupportedStartupTarget(AppPath))
+            string path = AppPath;
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path) || !StartupService.IsSupportedStartupTarget(path))
             {
-                MessageBox.Show("Choose a valid .exe, .cmd, .bat, .ps1, or .lnk file and a friendly name before saving startup.", "Missing app", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Paste a valid full path to a .exe, .cmd, .bat, .ps1, or .lnk file (or browse for it), then save.", "Missing app", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 DialogResult = DialogResult.None;
+                return;
+            }
+            // A friendly name is optional: derive it from the file's metadata right before saving.
+            if (string.IsNullOrWhiteSpace(AppTitle))
+            {
+                string suggestion = StartupService.SuggestDisplayName(path);
+                _name.Text = string.IsNullOrWhiteSpace(suggestion) ? Path.GetFileNameWithoutExtension(path) : suggestion;
             }
         }
-        private void AddLabel(string text, int top) { Controls.Add(new Label { Text = text, Left = 30, Top = top, AutoSize = true, ForeColor = Muted, Font = new Font("Segoe UI Semibold", 9.5f) }); }
-        private TextBox Box(int top, int width) { var t = new TextBox { Left = 30, Top = top, Width = width, Height = 30, BackColor = Color.FromArgb(17, 24, 44), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10.5f) }; Controls.Add(t); return t; }
-        private Button Button(string text, Color color, int width) { var b = new Button { Text = text, Width = width, Height = 38, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 9.5f), Cursor = Cursors.Hand }; b.FlatAppearance.BorderSize = 0; return b; }
-        private void Browse(object sender, EventArgs e) { using (var ofd = new System.Windows.Forms.OpenFileDialog { Filter = "Startup targets (*.exe;*.cmd;*.bat;*.ps1;*.lnk)|*.exe;*.cmd;*.bat;*.ps1;*.lnk|All files (*.*)|*.*", Title = "Choose app to start with Windows" }) if (ofd.ShowDialog(this) == DialogResult.OK) { _path.Text = ofd.FileName; if (string.IsNullOrWhiteSpace(_name.Text)) _name.Text = Path.GetFileNameWithoutExtension(ofd.FileName); } }
+
+        private void AutoFillFromPath()
+        {
+            string path = AppPath;
+            if (string.IsNullOrWhiteSpace(path)) return;
+            string expanded = Environment.ExpandEnvironmentVariables(path);
+            if (!string.Equals(expanded, path, StringComparison.OrdinalIgnoreCase)) _path.Text = expanded;
+            if (string.IsNullOrWhiteSpace(_name.Text))
+            {
+                string suggestion = StartupService.SuggestDisplayName(expanded);
+                if (!string.IsNullOrWhiteSpace(suggestion)) { _name.Text = suggestion; _status.Text = "✓ Friendly name auto-filled from the file's metadata."; }
+            }
+            if (File.Exists(expanded) && StartupService.IsSupportedStartupTarget(expanded)) _status.Text = "✓ Ready to add.";
+        }
+
+        // Accept a bare full path OR a whole command line ("C:\app.exe --flag") and fill every
+        // field automatically — no browsing required.
+        private bool ApplyPaste(string text)
+        {
+            try
+            {
+                text = (text ?? "").Trim();
+                if (text.Length >= 2 && text[0] == '"' && text[text.Length - 1] == '"' && text.Count(c => c == '"') == 2) text = text.Substring(1, text.Length - 2);
+                string path, args;
+                if (File.Exists(text)) { path = text; args = ""; }
+                else if (StartupService.TrySplitCommand(text, out path, out args))
+                {
+                    // A path into WindowsApps may point at an older version of a packaged app;
+                    // resolve it to the newest installed version before telling the user it's gone.
+                    if (!File.Exists(path))
+                    {
+                        string resolved = StartupService.ResolveTargetPath(path);
+                        if (!string.IsNullOrWhiteSpace(resolved) && File.Exists(resolved)) path = resolved;
+                    }
+                }
+                else { _status.ForeColor = Muted; _status.Text = "That path doesn't exist yet. Paste a full path to an installed .exe/.cmd/.bat/.ps1/.lnk."; return false; }
+                if (!File.Exists(path)) { _status.ForeColor = Muted; _status.Text = "That path doesn't exist yet. Paste a full path to an installed .exe/.cmd/.bat/.ps1/.lnk."; return false; }
+                if (!StartupService.IsSupportedStartupTarget(path)) { _status.ForeColor = Muted; _status.Text = "That file type can't be started directly. Use .exe, .cmd, .bat, .ps1, or .lnk."; return false; }
+                _path.Text = path;
+                _args.Text = args ?? "";
+                if (string.IsNullOrWhiteSpace(_name.Text)) _name.Text = StartupService.SuggestDisplayName(path);
+                if (!_trayMode.Checked && !_normalMode.Checked) _trayMode.Checked = true;
+                _status.ForeColor = Good;
+                _status.Text = "✓ Detected " + (string.IsNullOrWhiteSpace(args) ? "app" : "app with arguments") + ". Save to add it at every boot.";
+                return true;
+            }
+            catch (Exception ex) { _status.ForeColor = Muted; _status.Text = ex.Message; return false; }
+        }
+
+        private void AddLabel(string text, int top) { Controls.Add(new Label { Text = text, Left = 34, Top = top, AutoSize = true, ForeColor = Muted, Font = new Font("Segoe UI Semibold", 9.5f) }); }
+        private TextBox Box(int top, int width) { var t = new TextBox { Left = 34, Top = top, Width = width, Height = 32, BackColor = Surface2, ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10.5f) }; Controls.Add(t); return t; }
+        private Button Button(string text, Color color, int width) { var b = new Button { Text = text, Width = width, Height = 40, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 9.5f), Cursor = Cursors.Hand }; b.FlatAppearance.BorderSize = 0; b.MouseEnter += (s, e) => b.BackColor = ControlPaint.Light(color, .10f); b.MouseLeave += (s, e) => b.BackColor = color; return b; }
+
+        private void Browse(object sender, EventArgs e)
+        {
+            using (var ofd = new System.Windows.Forms.OpenFileDialog { Filter = "Startup targets (*.exe;*.cmd;*.bat;*.ps1;*.lnk)|*.exe;*.cmd;*.bat;*.ps1;*.lnk|All files (*.*)|*.*", Title = "Choose app to start with Windows" })
+            {
+                if (ofd.ShowDialog(this) != DialogResult.OK) return;
+                _path.Text = ofd.FileName;
+                if (string.IsNullOrWhiteSpace(_name.Text)) _name.Text = StartupService.SuggestDisplayName(ofd.FileName);
+                AutoFillFromPath();
+            }
+        }
+
         private void PastePath(object sender, EventArgs e)
         {
             try
             {
-                if (!Clipboard.ContainsText()) return;
-                string text = (Clipboard.GetText() ?? "").Trim().Trim('"');
-                if (File.Exists(text))
-                {
-                    _path.Text = text;
-                    if (string.IsNullOrWhiteSpace(_name.Text)) _name.Text = Path.GetFileNameWithoutExtension(text);
-                }
-                else MessageBox.Show("Clipboard does not contain an existing startup target path.", "Paste path", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                if (!Clipboard.ContainsText()) { _status.ForeColor = Muted; _status.Text = "Clipboard has no text. Copy a file path first."; return; }
+                ApplyPaste(Clipboard.GetText() ?? "");
             }
-            catch (Exception ex) { MessageBox.Show(ex.Message, "Paste path failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            catch (Exception ex) { _status.ForeColor = Muted; _status.Text = ex.Message; }
         }
     }
 

@@ -96,7 +96,7 @@ function Test-PopupToggle([string]$StartMode,[string]$ExpectedAfterFirstToggle,[
   $p = Start-Process -FilePath $App -ArgumentList "--add-test-task-$StartMode" -Wait -PassThru
   if($p.ExitCode -ne 0){ exit $p.ExitCode }
   $pattern = if($StartMode -eq 'tray'){ '\MichStartupMaster\HermesSmokeTray-*' } else { '\MichStartupMaster\HermesSmokeNormal-*' }
-  $task = (schtasks.exe /Query /FO CSV /V | ConvertFrom-Csv | Where-Object { $_.TaskName -like $pattern } | Select-Object -First 1)
+  $task = (schtasks.exe /Query /FO CSV /V | ConvertFrom-Csv | Where-Object { $_.TaskName -like $pattern } | Sort-Object TaskName -Descending | Select-Object -First 1)
   if(-not $task){ throw "popup toggle seed task not found: $StartMode" }
   $taskName = $task.TaskName
   try {
@@ -110,7 +110,11 @@ function Test-PopupToggle([string]$StartMode,[string]$ExpectedAfterFirstToggle,[
     "POPUP_TOGGLE $StartMode first=$actualAfterFirst cmd=$cmd args=$argText"
     if($actualAfterFirst -ne $ExpectedAfterFirstToggle){ throw "unexpected popup state after first toggle: $actualAfterFirst" }
     if($ExpectedAfterFirstToggle -eq 'Disabled'){
-      schtasks.exe /Change /TN $taskName /TR "`"$App`" --smoke" | Out-Null
+      # Tamper the task action back to a plain run (simulating something that switched it away
+      # from the quiet wrapper). Use Set-ScheduledTask rather than `schtasks /Change /TR` so the
+      # legacy tool can never hang waiting for a "run as" password in a non-interactive shell.
+      $shortName = $taskName.Substring($taskName.LastIndexOf('\') + 1)
+      Set-ScheduledTask -TaskPath '\MichStartupMaster\' -TaskName $shortName -Action (New-ScheduledTaskAction -Execute $App -Argument '--smoke') | Out-Null
       $p = Start-Process -FilePath $App -ArgumentList '--enforce-quiet' -Wait -PassThru
       if($p.ExitCode -ne 0){ throw "quiet enforcement failed: $($p.ExitCode)" }
       [xml]$xml = (schtasks.exe /Query /TN $taskName /XML) -join "`n"
@@ -176,12 +180,48 @@ function Test-QuietDisableSticks(){
 }
 Test-QuietDisableSticks
 
+# New-startup detection regression: a brand-new registry Run value must be reported the moment it
+# appears, while a stable inventory must never false-positive. Uses an isolated store via
+# MSM_KNOWN_STORE so the test can never race the live agent's 30-second guard cycle.
+function Test-NewStartupDetection(){
+  $store = Join-Path $Root 'artifacts\runtime-output\watcher-known.tsv'
+  Remove-Item -LiteralPath $store -ErrorAction SilentlyContinue
+  $env:MSM_KNOWN_STORE = $store
+  try {
+    $p = Start-Process -FilePath $App -ArgumentList '--detect-new' -RedirectStandardOutput (Join-Path $Root "artifacts\runtime-output\watcher-seed.txt") -Wait -PassThru
+    if($p.ExitCode -ne 0){ throw 'watcher test: --detect-new seed failed' }
+    $seed = Get-Content -LiteralPath (Join-Path $Root "artifacts\runtime-output\watcher-seed.txt") -Raw
+    "WATCHER_SEED $seed"
+    if($seed -notmatch 'count=0'){ throw "watcher test: first detection should seed baseline with count=0: $seed" }
+
+    New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'MSM_WatcherProbe' -Value '"C:\Windows\System32\cmd.exe" /c exit' -PropertyType String -Force | Out-Null
+    $p = Start-Process -FilePath $App -ArgumentList '--detect-new' -RedirectStandardOutput (Join-Path $Root "artifacts\runtime-output\watcher-new.txt") -Wait -PassThru
+    if($p.ExitCode -ne 0){ throw 'watcher test: --detect-new new-item failed' }
+    $new = Get-Content -LiteralPath (Join-Path $Root "artifacts\runtime-output\watcher-new.txt") -Raw
+    "WATCHER_NEW $new"
+    if($new -notmatch 'count=1'){ throw "watcher test: new registry value was not detected: $new" }
+
+    Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'MSM_WatcherProbe' -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath $App -ArgumentList '--detect-new' -RedirectStandardOutput (Join-Path $Root "artifacts\runtime-output\watcher-clean.txt") -Wait -PassThru
+    if($p.ExitCode -ne 0){ throw 'watcher test: --detect-new clean failed' }
+    $clean = Get-Content -LiteralPath (Join-Path $Root "artifacts\runtime-output\watcher-clean.txt") -Raw
+    "WATCHER_CLEAN $clean"
+    if($clean -notmatch 'count=0'){ throw "watcher test: removed value left a stale detection: $clean" }
+  }
+  finally {
+    Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'MSM_WatcherProbe' -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $store -ErrorAction SilentlyContinue
+    Remove-Item Env:MSM_KNOWN_STORE -ErrorAction SilentlyContinue
+  }
+}
+Test-NewStartupDetection
+
 function Test-ModeTask([string]$ModeArg,[string]$ExpectMode){
   $p = Start-Process -FilePath $App -ArgumentList $ModeArg -Wait -PassThru
   "ADD $ExpectMode exit=$($p.ExitCode)"
   if($p.ExitCode -ne 0){ exit $p.ExitCode }
   $pattern = if($ExpectMode -eq 'tray'){ '\MichStartupMaster\HermesSmokeTray-*' } else { '\MichStartupMaster\HermesSmokeNormal-*' }
-  $task = (schtasks.exe /Query /FO CSV /V | ConvertFrom-Csv | Where-Object { $_.TaskName -like $pattern } | Select-Object -First 1)
+  $task = (schtasks.exe /Query /FO CSV /V | ConvertFrom-Csv | Where-Object { $_.TaskName -like $pattern } | Sort-Object TaskName -Descending | Select-Object -First 1)
   if(-not $task){ throw "test task not found after add: $ExpectMode" }
   $taskName = $task.TaskName
   [xml]$xml = (schtasks.exe /Query /TN $taskName /XML) -join "`n"
@@ -251,16 +291,18 @@ function Test-ArbitraryStartupTarget([string]$Name,[string]$Target,[string]$Mode
   finally { Remove-ProofTask $taskName }
 }
 
-$piper = 'F:\study\AI_ML\AI_and_Machine_Learning\Artificial_Intelligence\Speech\Windows\Dictation\Tray\PiperVoicePaste\PiperVoicePaste.exe'
-if(-not (Test-Path -LiteralPath $piper)){ throw "PiperVoicePaste proof target missing: $piper" }
-Test-ArbitraryStartupTarget 'PiperVoicePaste-CodexProof-Tray' $piper 'tray' {
+# Use a guaranteed-present system executable for the arbitrary-target proof (not a machine-specific
+# path that may move), so the test stays portable across any Windows 11 install.
+$arbitraryTarget = 'C:\Windows\System32\notepad.exe'
+if(-not (Test-Path -LiteralPath $arbitraryTarget)){ throw "Arbitrary-target proof target missing: $arbitraryTarget" }
+Test-ArbitraryStartupTarget 'ArbitraryProof-Tray' $arbitraryTarget 'tray' {
   param($action)
-  if($action.Command -ne $App){ throw 'Piper tray startup must execute MichStartupMaster tray wrapper' }
-  if($action.Arguments -notlike '--tray-run *'){ throw "Piper tray startup did not use encoded tray payload: $($action.Arguments)" }
+  if($action.Command -ne $App){ throw 'Tray arbitrary startup must execute MichStartupMaster tray wrapper' }
+  if($action.Arguments -notlike '--tray-run *'){ throw "Tray arbitrary startup did not use encoded tray payload: $($action.Arguments)" }
 }
-Test-ArbitraryStartupTarget 'PiperVoicePaste-CodexProof-Normal' $piper 'normal' {
+Test-ArbitraryStartupTarget 'ArbitraryProof-Normal' $arbitraryTarget 'normal' {
   param($action)
-  if($action.Command -ne $piper){ throw "Piper normal startup must execute exact PiperVoicePaste.exe, got $($action.Command)" }
+  if($action.Command -ne $arbitraryTarget){ throw "Normal arbitrary startup must execute the exact target, got $($action.Command)" }
 }
 
 $proofDir = Join-Path $Root 'artifacts\runtime-output\launcher-targets'

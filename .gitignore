@@ -11,6 +11,9 @@ bin/
 build/*
 !build/MichStartupMaster.exe
 
+# Installer output (built with Inno Setup; uploaded to GitHub Releases instead of committed)
+dist/
+
 # Runtime-generated logs/temp
 *.log
 *.tmp
@@ -24,6 +27,9 @@ _preview_screen.html
 *.key
 *.pem
 secrets.*
+
+# Project-local .NET SDK (merged toolchain used to build on this machine)
+.dotnet/
 
 # OS/editor
 .DS_Store
