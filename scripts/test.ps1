@@ -1184,6 +1184,50 @@ function Invoke-AppCommand {
   }
 }
 
+function Invoke-ConcurrentAppCommands {
+  param(
+    [Parameter(Mandatory = $true)][object[]]$ArgumentSets,
+    [int]$TimeoutSeconds = 120
+  )
+  if (-not $script:AppIsolationInitialized) { throw 'Concurrent product execution is blocked until the harness establishes an isolated state root.' }
+  $currentStateRoot = [Environment]::GetEnvironmentVariable('MSM_STATE_ROOT', [EnvironmentVariableTarget]::Process)
+  $currentKnownStore = [Environment]::GetEnvironmentVariable('MSM_KNOWN_STORE', [EnvironmentVariableTarget]::Process)
+  $resolvedCurrentStateRoot = [IO.Path]::GetFullPath($currentStateRoot).TrimEnd('\')
+  $resolvedActiveStateRoot = [IO.Path]::GetFullPath($script:ActiveAppStateRoot).TrimEnd('\')
+  $resolvedCurrentKnownStore = [IO.Path]::GetFullPath($currentKnownStore)
+  if ([string]::IsNullOrWhiteSpace($currentStateRoot) -or [string]::IsNullOrWhiteSpace($currentKnownStore) -or
+      -not [string]::Equals($resolvedCurrentStateRoot, $resolvedActiveStateRoot, [StringComparison]::OrdinalIgnoreCase) -or
+      [IO.Path]::GetFileName($resolvedCurrentStateRoot) -notlike 'MichStartupMaster-test-*' -or
+      -not $resolvedCurrentKnownStore.StartsWith($resolvedCurrentStateRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Concurrent product execution is blocked because the isolated state environment is incomplete or escaped.'
+  }
+  Initialize-TestProcessContainment
+  $jobs = New-Object 'Collections.Generic.List[object]'
+  $results = New-Object 'Collections.Generic.List[object]'
+  try {
+    $index = 0
+    foreach ($arguments in $ArgumentSets) {
+      $script:CommandNumber++
+      $stdoutPath = Join-Path $RunDir ('{0:D2}-concurrent-{1}.stdout.txt' -f $script:CommandNumber, $index)
+      $stderrPath = Join-Path $RunDir ('{0:D2}-concurrent-{1}.stderr.txt' -f $script:CommandNumber, $index)
+      $argumentLine = (@($arguments) | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' '
+      $job = [MichStartupMaster.TestHarnessV4.TestProcessJob]::StartSuspendedAndAssign($App, $argumentLine, $Root, $stdoutPath, $stderrPath)
+      [void]$jobs.Add([pscustomobject]@{ Job = $job; Arguments = @($arguments); Stdout = $stdoutPath; Stderr = $stderrPath })
+      $index++
+    }
+    foreach ($entry in $jobs) {
+      if (-not $entry.Job.WaitForExit($TimeoutSeconds * 1000)) { $entry.Job.TerminateAndVerify(5000); throw "Concurrent command timed out: $($entry.Arguments -join ' ')" }
+      $exitCode = $entry.Job.GetExitCode()
+      $stdout = if (Test-Path -LiteralPath $entry.Stdout) { Get-Content -LiteralPath $entry.Stdout -Raw } else { '' }
+      $stderr = if (Test-Path -LiteralPath $entry.Stderr) { Get-Content -LiteralPath $entry.Stderr -Raw } else { '' }
+      if ($exitCode -ne 0) { throw "Concurrent command failed with exit $exitCode`: $($entry.Arguments -join ' ')`n$stderr`n$stdout" }
+      [void]$results.Add([pscustomobject]@{ Arguments = $entry.Arguments; ExitCode = $exitCode; Output = [string]$stdout; Error = [string]$stderr })
+    }
+  }
+  finally { foreach ($entry in $jobs) { if ($null -ne $entry.Job) { $entry.Job.CloseAndVerifyNoSurvivors(5000) } } }
+  $results.ToArray()
+}
+
 function Assert-HarnessIsolationOrder {
   $tokens = $null
   $parseErrors = $null
@@ -1211,12 +1255,24 @@ function Assert-HarnessIsolationOrder {
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-AppCommand'
   }, $true))
   if ($invokeDefinition.Count -ne 1) { throw 'Static isolation regression: Invoke-AppCommand must have one definition.' }
+  $concurrentDefinition = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-ConcurrentAppCommands'
+  }, $true))
+  if ($concurrentDefinition.Count -ne 1) { throw 'Static isolation regression: Invoke-ConcurrentAppCommands must have one definition.' }
   $invokeBodyText = $invokeDefinition[0].Body.Extent.Text
   $guardOffset = $invokeBodyText.IndexOf('AppIsolationInitialized', [StringComparison]::Ordinal)
   $nativeLaunchOffset = $invokeBodyText.IndexOf('StartSuspendedAndAssign', [StringComparison]::Ordinal)
   if ($guardOffset -lt 0 -or $nativeLaunchOffset -lt 0 -or $guardOffset -ge $nativeLaunchOffset -or
       [regex]::Matches($invokeBodyText, 'StartSuspendedAndAssign').Count -ne 1) {
     throw 'Static isolation regression: Invoke-AppCommand must enforce isolation before its single suspended product launch.'
+  }
+  $concurrentBodyText = $concurrentDefinition[0].Body.Extent.Text
+  $concurrentGuardOffset = $concurrentBodyText.IndexOf('AppIsolationInitialized', [StringComparison]::Ordinal)
+  $concurrentLaunchOffset = $concurrentBodyText.IndexOf('StartSuspendedAndAssign', [StringComparison]::Ordinal)
+  if ($concurrentGuardOffset -lt 0 -or $concurrentLaunchOffset -lt 0 -or $concurrentGuardOffset -ge $concurrentLaunchOffset -or
+      [regex]::Matches($concurrentBodyText, 'StartSuspendedAndAssign').Count -ne 1) {
+    throw 'Static isolation regression: Invoke-ConcurrentAppCommands must enforce isolation before its suspended product launches.'
   }
   $unguardedProductStarts = @($ast.FindAll({
     param($node)
@@ -1239,10 +1295,12 @@ function Assert-HarnessIsolationOrder {
     $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
       [string]::Equals([string]$node.Member.Extent.Text, 'StartSuspendedAndAssign', [StringComparison]::Ordinal)
   }, $true))
-  if ($nativeLaunches.Count -ne 1 -or
-      $nativeLaunches[0].Extent.StartOffset -lt $invokeDefinition[0].Extent.StartOffset -or
-      $nativeLaunches[0].Extent.EndOffset -gt $invokeDefinition[0].Extent.EndOffset) {
-    throw 'Static isolation regression: the single native product launch must remain inside guarded Invoke-AppCommand.'
+  $nativeLaunchesOutsideGuards = @($nativeLaunches | Where-Object {
+    -not (($_.Extent.StartOffset -ge $invokeDefinition[0].Extent.StartOffset -and $_.Extent.EndOffset -le $invokeDefinition[0].Extent.EndOffset) -or
+      ($_.Extent.StartOffset -ge $concurrentDefinition[0].Extent.StartOffset -and $_.Extent.EndOffset -le $concurrentDefinition[0].Extent.EndOffset))
+  })
+  if ($nativeLaunches.Count -ne 2 -or $nativeLaunchesOutsideGuards.Count -ne 0) {
+    throw 'Static isolation regression: native product launches must remain inside the two guarded invocation helpers.'
   }
   $nativeTypeCommands = @($ast.FindAll({
     param($node)
@@ -1670,9 +1728,9 @@ function Assert-UiContract {
   if (-not $contract.stateModeSeparated) { throw 'Startup state and window/tray mode must be separate.' }
   if (-not $contract.startInTrayPrePaintSuppression) { throw 'Start-in-tray must suppress the first visible frame.' }
   if (-not $contract.refreshIsReadOnly) { throw 'Refresh must be read-only.' }
-  if (-not $contract.sortableColumns -or $contract.statusInitialSort -ne 'Enabled first' -or -not $contract.repeatedColumnClickReversesSort) { throw 'Every inventory column must sort, with Enabled first on the initial Status click and reversal on repeat.' }
+  if (-not $contract.sortableColumns -or -not $contract.keyboardAccessibleSorting -or $contract.statusInitialSort -ne 'Enabled first' -or -not $contract.repeatedColumnClickReversesSort) { throw 'Every inventory column must sort by mouse or keyboard, with Enabled first on the initial Status click and reversal on repeat.' }
   if (-not $contract.humanReadableNames -or -not $contract.appsAggregatedByCanonicalTarget -or -not $contract.appsNeverAggregatedByDisplayName -or -not $contract.allRoutesRemainRouteLevel) { throw 'The UI must expose readable names, one canonical app row, and every exact underlying route.' }
-  if (-not $contract.aggregateNonBulkActionsFailClosed -or -not $contract.aggregateBulkDisableTransactional -or -not $contract.aggregateManageRoutesOneClick) { throw 'Aggregate rows must provide transactional bulk disable while every ambiguous non-bulk action fails closed.' }
+  if (-not $contract.aggregateNonBulkActionsFailClosed -or -not $contract.aggregateBulkDisableTransactional -or -not $contract.aggregateBulkEnableTransactional -or -not $contract.aggregateManageRoutesOneClick) { throw 'Aggregate rows must provide transactional bulk enable/disable while every ambiguous non-bulk action fails closed.' }
   if (-not $contract.contextualActions -or -not $contract.globalToolsInMenu) { throw 'Context actions and global tools must be separated.' }
   if (-not $contract.keyboardShortcuts -or -not $contract.accessibilityNames -or -not $contract.emptyLoadingErrorStates) { throw 'UI accessibility/state contracts are incomplete.' }
   if ($contract.defaultNewMode -ne 'Window') { throw 'New startup entries must default to Window mode.' }
@@ -1683,6 +1741,7 @@ function Assert-UiContract {
   $statusIndex = [array]::IndexOf($columns, 'Status')
   $modeIndex = [array]::IndexOf($columns, 'Mode')
   if ($statusIndex -lt 0 -or $modeIndex -lt 0 -or $statusIndex -eq $modeIndex) { throw 'Status and Mode must be separate primary columns.' }
+  if (@($columns) -notcontains 'Risk') { throw 'The heuristic severity column must be labeled Risk, not startup impact.' }
   foreach ($detail in @('Location', 'Launch command')) {
     if (@($contract.detailFields) -notcontains $detail) { throw "UI detail field missing: $detail" }
   }
@@ -2099,8 +2158,8 @@ function Test-LiveMutationSuite {
 
     $bulkDisableSelfTest = Invoke-AppCommand @('--bulk-disable-self-test')
     $bulkDisableReceipt = $bulkDisableSelfTest.Output.Trim()
-    Assert-Match $bulkDisableReceipt '^BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true storesRestored=true$' 'Transactional bulk disable self-test did not prove fail-closed rollback, including StartupApproved metadata.'
-    'PASS bulk-disable transaction=true failedClosed=true registryRestored=true storesRestored=true'
+    Assert-Match $bulkDisableReceipt '^BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true$' 'Transactional bulk enable/disable self-test did not prove fail-closed rollback, including StartupApproved metadata.'
+    'PASS bulk-state transaction=true disableFailedClosed=true enableFailedClosed=true registryRestored=true storesRestored=true'
 
     foreach ($candidateService in @($serviceName, $demandServiceName)) {
       if ((Test-Path -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$candidateService") -or $null -ne (Get-Service -Name $candidateService -ErrorAction SilentlyContinue)) {
@@ -2208,6 +2267,26 @@ function Test-LiveMutationSuite {
 
     $targetArguments = "--smoke --live-fixture $suffix managed"
     [void]$createdTasks.Add($taskLocation)
+
+    # Prove the complete add decision is serialized, not only the final write. Eight separate
+    # processes race with different friendly names but one exact target/argument identity. Every
+    # caller must converge on one task; this is the real-world OpenWhispr/OpenWhisprLauncher case.
+    $racePrefix = $taskDisplayName + 'Race'
+    $raceArguments = "--smoke --live-fixture $suffix concurrent"
+    $raceArgumentSets = @(for ($raceIndex = 0; $raceIndex -lt 8; $raceIndex++) { ,@('--add-startup', ($racePrefix + $raceIndex), $disposableTarget, $raceArguments, 'normal') })
+    $raceResults = @(Invoke-ConcurrentAppCommands -ArgumentSets $raceArgumentSets)
+    $raceTasks = @(Get-ScheduledTaskFolderEntries -TaskPath '\MichStartupMaster\' | Where-Object { ([string]$_.Name).StartsWith($racePrefix, [StringComparison]::OrdinalIgnoreCase) })
+    foreach ($raceTask in $raceTasks) { if (@($createdTasks | Where-Object { [string]::Equals($_, [string]$raceTask.Location, [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0) { [void]$createdTasks.Add([string]$raceTask.Location) } }
+    if ($raceTasks.Count -ne 1) { throw "Concurrent equivalent adds created $($raceTasks.Count) routes instead of exactly one: $($raceTasks | ConvertTo-Json -Compress)" }
+    $raceWinner = [string]$raceTasks[0].Location
+    foreach ($raceResult in $raceResults) {
+      $raceMatch = [regex]::Match($raceResult.Output, 'task=(?<task>\\MichStartupMaster\\[^\s]+)')
+      if (-not $raceMatch.Success -or -not [string]::Equals($raceMatch.Groups['task'].Value, $raceWinner, [StringComparison]::OrdinalIgnoreCase)) { throw "Concurrent add did not converge on $raceWinner`: $($raceResult.Output)" }
+    }
+    [void](Invoke-AppCommand @('--remove-task', $raceWinner))
+    [void]$createdTasks.Remove($raceWinner)
+    if (@(Get-ScheduledTaskFolderEntries -TaskPath '\MichStartupMaster\' | Where-Object { ([string]$_.Name).StartsWith($racePrefix, [StringComparison]::OrdinalIgnoreCase) }).Count -ne 0) { throw "Concurrent-add fixture remained after cleanup: $raceWinner" }
+    "PASS concurrent-add processes=8 routes=1 converged=true cleanup=true"
 
     $firstAdd = Invoke-AppCommand @('--add-startup', $taskDisplayName, $disposableTarget, $targetArguments, 'normal')
     $ownedTasksAfterFirstAdd = @(Get-ScheduledTaskFolderEntries -TaskPath '\MichStartupMaster\' | Where-Object { ([string]$_.Name).StartsWith($taskDisplayName, [StringComparison]::OrdinalIgnoreCase) })
@@ -2522,7 +2601,7 @@ function Test-LiveMutationSuite {
   }
 
   if ($null -ne $suiteError -or $cleanupErrors.Count -ne 0) {
-    $primary = if ($null -eq $suiteError) { 'none' } else { $suiteError.Exception.Message }
+    $primary = if ($null -eq $suiteError) { 'none' } else { $suiteError.Exception.Message + ' at ' + $suiteError.ScriptStackTrace }
     $cleanup = if ($cleanupErrors.Count -eq 0) { 'none' } else { $cleanupErrors -join ' | ' }
     throw "Live mutation suite failed. primary=$primary cleanup=$cleanup"
   }

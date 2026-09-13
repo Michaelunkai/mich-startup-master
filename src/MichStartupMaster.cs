@@ -102,6 +102,7 @@ namespace MichStartupMaster
                 // Windows "Application Error" (0xe0434352) dialog at boot and in every test loop.
                 // Log it to %LOCALAPPDATA%\MichStartupMaster\crash.log and exit quietly instead.
                 LogUnhandledCrash("main", ex);
+                try { Console.Error.WriteLine("UNHANDLED " + ex); } catch { }
                 return 1;
             }
         }
@@ -111,7 +112,17 @@ namespace MichStartupMaster
             try
             {
                 Directory.CreateDirectory(AppData);
-                File.AppendAllText(Path.Combine(AppData, "crash.log"),
+                string crashPath = Path.Combine(AppData, "crash.log");
+                try
+                {
+                    if (File.Exists(crashPath) && new FileInfo(crashPath).Length > 1024 * 1024)
+                    {
+                        File.Copy(crashPath, crashPath + ".previous", true);
+                        File.WriteAllText(crashPath, "");
+                    }
+                }
+                catch { }
+                File.AppendAllText(crashPath,
                     string.Format("[{0:yyyy-MM-dd HH:mm:ss}] unhandled origin={1} type={2}\r\n{3}\r\n",
                         DateTime.Now, origin, ex == null ? "null" : ex.GetType().FullName,
                         ex == null ? "" : ex.ToString()));
@@ -144,7 +155,7 @@ namespace MichStartupMaster
                 }
                 if (cmd == "--state-store-worker") return StateStoreFile.Worker(args);
                 if (cmd == "--state-store-self-test") { Console.WriteLine(StateStoreFile.SelfTest()); return 0; }
-                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.0.0"); return 0; }
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.1.0"); return 0; }
                 if (cmd == "--list") { Console.WriteLine(StartupService.ToJson(StartupService.ScanAll())); return 0; }
                 if (cmd == "--audit-boot") return CliAuditCoverage(false);
                 if (cmd == "--audit-tray") return CliAuditCoverage(true);
@@ -5371,20 +5382,30 @@ namespace MichStartupMaster
         // change also makes shared registry-value routes reversible in the correct sequence.
         public static int DisableAllRoutes(IEnumerable<StartupItem> routes, bool expertConfirmed)
         {
+            return SetAllRoutesEnabled(routes, false, expertConfirmed);
+        }
+
+        public static int EnableAllRoutes(IEnumerable<StartupItem> routes, bool expertConfirmed)
+        {
+            return SetAllRoutesEnabled(routes, true, expertConfirmed);
+        }
+
+        private static int SetAllRoutesEnabled(IEnumerable<StartupItem> routes, bool enabledState, bool expertConfirmed)
+        {
             if (routes == null) throw new ArgumentNullException("routes");
-            List<StartupItem> enabled = routes.Where(item => item != null && item.Enabled)
+            List<StartupItem> candidates = routes.Where(item => item != null && item.Enabled != enabledState)
                 .GroupBy(item => item.Id ?? "", StringComparer.OrdinalIgnoreCase)
                 .Select(group => group.First())
                 .OrderBy(BulkMutationSourceKey, StringComparer.OrdinalIgnoreCase)
                 .ThenByDescending(BulkMutationComponentIndex)
                 .ThenBy(item => item.Id ?? "", StringComparer.OrdinalIgnoreCase)
                 .ToList();
-            if (enabled.Count == 0) return 0;
+            if (candidates.Count == 0) return 0;
 
             // Fail closed before the first write.  This is deliberately stricter than the
             // legacy single-route entry point because a disabled or externally-owned route in
             // an app summary must never turn a bulk request into a partial best-effort change.
-            foreach (StartupItem item in enabled) EnsureMutationAuthorized(item, expertConfirmed);
+            foreach (StartupItem item in candidates) EnsureMutationAuthorized(item, expertConfirmed);
 
             return StartupMutationCoordinator.Run(() =>
             {
@@ -5392,14 +5413,14 @@ namespace MichStartupMaster
                 StartupItem current = null;
                 try
                 {
-                    foreach (StartupItem item in enabled)
+                    foreach (StartupItem item in candidates)
                     {
                         current = item;
-                        StartupMutationSnapshot before = StartupMutationSnapshot.Capture(item, "Disable");
+                        StartupMutationSnapshot before = StartupMutationSnapshot.Capture(item, enabledState ? "Enable" : "Disable");
                         snapshots.Add(Tuple.Create(item, before));
-                        DisableCore(item);
+                        if (enabledState) EnableCore(item); else DisableCore(item);
                     }
-                    return enabled.Count;
+                    return candidates.Count;
                 }
                 catch (Exception ex)
                 {
@@ -5410,9 +5431,10 @@ namespace MichStartupMaster
                         catch (Exception rollbackEx) { rollbackErrors.Add((snapshots[index].Item1.Location ?? snapshots[index].Item1.Id ?? "route") + "=" + rollbackEx.GetBaseException().Message); }
                     }
                     string route = current == null ? "unknown route" : (current.Location ?? current.Id ?? "unknown route");
+                    string action = enabledState ? "enable" : "disable";
                     if (rollbackErrors.Count > 0)
-                        throw new InvalidOperationException("Bulk disable failed at " + route + " and rollback was incomplete: " + string.Join(" | ", rollbackErrors) + ". Cause: " + ex.GetBaseException().Message, ex);
-                    throw new InvalidOperationException("Bulk disable failed at " + route + "; every earlier startup route and intent store was restored. Cause: " + ex.GetBaseException().Message, ex);
+                        throw new InvalidOperationException("Bulk " + action + " failed at " + route + " and rollback was incomplete: " + string.Join(" | ", rollbackErrors) + ". Cause: " + ex.GetBaseException().Message, ex);
+                    throw new InvalidOperationException("Bulk " + action + " failed at " + route + "; every earlier startup route and intent store was restored. Cause: " + ex.GetBaseException().Message, ex);
                 }
             });
         }
@@ -5454,7 +5476,10 @@ namespace MichStartupMaster
             bool registryRestored = false;
             bool approvalRestored = false;
             bool storesRestored = false;
+            bool enableFailedClosed = false;
+            bool enableApprovalRestored = false;
             byte[] approvalBefore = { 2, 0, 0, 0, 11, 22, 33, 44 };
+            byte[] approvalDisabled = { 3, 0, 0, 0, 55, 66, 77, 88 };
             try
             {
                 using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
@@ -5498,8 +5523,23 @@ namespace MichStartupMaster
                     && enabledBefore == StoreFingerprint(Program.EnabledStore)
                     && protectedDisabledBefore == StoreFingerprint(Program.ProtectedDisabledStore)
                     && protectedQuietBefore == StoreFingerprint(Program.ProtectedQuietStore);
-                if (!failedClosed || !registryRestored || !approvalRestored || !storesRestored) throw new InvalidOperationException("BULK_DISABLE_SELF_TEST failed failedClosed=" + failedClosed.ToString().ToLowerInvariant() + " registryRestored=" + registryRestored.ToString().ToLowerInvariant() + " approvalRestored=" + approvalRestored.ToString().ToLowerInvariant() + " storesRestored=" + storesRestored.ToString().ToLowerInvariant());
-                return "BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true storesRestored=true";
+                using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                using (RegistryKey key = root.OpenSubKey(subKey, true)) key.SetValue(approvalName, approvalDisabled, RegistryValueKind.Binary);
+                approvalRoute.Enabled = false; approvalRoute.ApprovalData = (byte[])approvalDisabled.Clone(); missingTaskRoute.Enabled = false;
+                try { EnableAllRoutes(new[] { approvalRoute, missingTaskRoute }, false); }
+                catch (InvalidOperationException ex) { enableFailedClosed = ex.Message.IndexOf("every earlier startup route and intent store was restored", StringComparison.OrdinalIgnoreCase) >= 0; }
+                using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                using (RegistryKey key = root.OpenSubKey(subKey, false))
+                {
+                    byte[] after = key == null ? null : key.GetValue(approvalName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as byte[];
+                    enableApprovalRestored = after != null && after.SequenceEqual(approvalDisabled);
+                }
+                storesRestored = storesRestored && disabledBefore == StoreFingerprint(Program.DisabledStore)
+                    && enabledBefore == StoreFingerprint(Program.EnabledStore)
+                    && protectedDisabledBefore == StoreFingerprint(Program.ProtectedDisabledStore)
+                    && protectedQuietBefore == StoreFingerprint(Program.ProtectedQuietStore);
+                if (!failedClosed || !registryRestored || !approvalRestored || !enableFailedClosed || !enableApprovalRestored || !storesRestored) throw new InvalidOperationException("BULK_DISABLE_SELF_TEST failed failedClosed=" + failedClosed.ToString().ToLowerInvariant() + " registryRestored=" + registryRestored.ToString().ToLowerInvariant() + " approvalRestored=" + approvalRestored.ToString().ToLowerInvariant() + " enableFailedClosed=" + enableFailedClosed.ToString().ToLowerInvariant() + " enableApprovalRestored=" + enableApprovalRestored.ToString().ToLowerInvariant() + " storesRestored=" + storesRestored.ToString().ToLowerInvariant());
+                return "BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true";
             }
             finally
             {
@@ -6720,6 +6760,16 @@ namespace MichStartupMaster
         }
 
         private static string AddManagedStartupCore(string name, string targetPath, string arguments, bool trayMode, bool noDelay, Action afterIntentCommitted, StartupSourceSnapshot originalSource)
+        {
+            // The complete read/plan/write decision belongs to the same cross-process
+            // transaction. Without this outer lock, simultaneous Add requests can both
+            // observe no equivalent route, choose different task names, and create a
+            // duplicate before either inner commit becomes visible to the other process.
+            // CommitManagedTaskMutation and reconciliation intentionally support nesting.
+            return StartupMutationCoordinator.Run(() => AddManagedStartupCoreLocked(name, targetPath, arguments, trayMode, noDelay, afterIntentCommitted, originalSource));
+        }
+
+        private static string AddManagedStartupCoreLocked(string name, string targetPath, string arguments, bool trayMode, bool noDelay, Action afterIntentCommitted, StartupSourceSnapshot originalSource)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name is required");
             if (string.IsNullOrWhiteSpace(targetPath) || !File.Exists(targetPath)) throw new FileNotFoundException("Application not found", targetPath);
@@ -12724,12 +12774,13 @@ namespace MichStartupMaster
         private List<StartupItem> _items = new List<StartupItem>();
         private ListView _list;
         private TextBox _search;
+        private ComboBox _sortBy;
         private Label _summary, _visibleValue, _enabledValue, _disabledValue, _reviewValue, _managedValue, _hint;
         private Label _selectionTitle, _selectionMeta, _detailTitle, _detailBody, _emptyTitle, _emptyBody;
-        private Button _refresh, _disable, _enable, _add, _editSelected, _clearSearch, _quietSelected, _launchSelected, _copySelected, _tools, _retry, _emptyPrimary, _emptySecondary;
+        private Button _refresh, _disable, _enable, _add, _editSelected, _clearSearch, _sortDirection, _quietSelected, _launchSelected, _copySelected, _tools, _retry, _emptyPrimary, _emptySecondary;
         private ThemedFilterButton _showAll, _showRisky, _showCleanup, _showDisabled;
         private ContextMenuStrip _listMenu, _toolsMenu;
-        private ToolStripMenuItem _contextEdit, _contextState, _contextMode, _contextLaunch, _contextOpen, _contextCopy, _contextDelete;
+        private ToolStripMenuItem _contextEdit, _contextState, _contextEnableAll, _contextMode, _contextLaunch, _contextOpen, _contextCopy, _contextDelete;
         private Panel _emptyState;
         private ProgressBar _progress;
         private NotifyIcon _tray;
@@ -12742,6 +12793,7 @@ namespace MichStartupMaster
         private int _refreshVersion;
         private int _sortColumn = -1;
         private bool _sortAscending = true;
+        private bool _syncingSortControls;
         // Never open on an aggregate or a restricted subset.  The first visible inventory must
         // preserve every independently controllable startup registration one-for-one.
         private string _filterMode = "All";
@@ -12761,6 +12813,7 @@ namespace MichStartupMaster
         {
             internal string Key;
             internal string TargetIdentity;
+            internal string DisplayName;
             internal List<StartupItem> Routes;
             internal StartupItem Primary;
             internal bool IsAppSummary;
@@ -12778,8 +12831,9 @@ namespace MichStartupMaster
                 layout = "responsive-native-control-center",
                 defaultFilter = "All routes",
                 filters = new[] { "Apps", "All routes", "Needs attention", "Disabled" },
-                columns = new[] { "Application", "Status", "Mode", "Source", "Impact", "Startup entry" },
+                columns = new[] { "Application", "Status", "Mode", "Source", "Risk", "Startup entry" },
                 sortableColumns = true,
+                keyboardAccessibleSorting = true,
                 statusInitialSort = "Enabled first",
                 repeatedColumnClickReversesSort = true,
                 detailFields = new[] { "Location", "Launch command" },
@@ -12802,6 +12856,7 @@ namespace MichStartupMaster
                 defaultViewIsCompleteRouteInventory = true,
                 aggregateNonBulkActionsFailClosed = true,
                 aggregateBulkDisableTransactional = true,
+                aggregateBulkEnableTransactional = true,
                 aggregateManageRoutesOneClick = true,
                 contextualActions = true,
                 globalToolsInMenu = true,
@@ -12822,7 +12877,7 @@ namespace MichStartupMaster
                 elevationAndRebootReasons = true,
                 externalAuthorityState = true,
                 multiActionTasksDisableEditQuietAndRun = true,
-                minimumSize = new[] { 1060, 700 },
+                minimumSize = new[] { 900, 660 },
                 tools = new[] { "Add startup", "Edit startup", "Disable at boot", "Enable at boot", "Quiet (tray)", "Window mode", "Run now", "Open location", "Copy command", "Protect disabled", "Repair startup rules", "Verify coverage", "Open startup folders", "Permanently delete managed task" }
             });
         }
@@ -12967,9 +13022,12 @@ namespace MichStartupMaster
                     main.ApplyColumnSort(1);
                     var enabledFirst = main._list.Items.Cast<ListViewItem>().Select(i => (InventoryRow)i.Tag).ToList();
                     if (enabledFirst.Count == 0 || !enabledFirst[0].AllEnabled || enabledFirst.SkipWhile(row => row.AllEnabled).Any(row => row.AllEnabled)) throw new InvalidOperationException("The first Status click must group every enabled row first.");
+                    if (main._sortBy.SelectedIndex != 1 || main._sortDirection.AccessibleName.IndexOf("Ascending", StringComparison.OrdinalIgnoreCase) < 0 || main._list.AccessibleDescription.IndexOf("Status ascending", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Pointer sorting did not synchronize the accessible keyboard controls and announcement.");
                     main.ApplyColumnSort(1);
                     var disabledFirst = main._list.Items.Cast<ListViewItem>().Select(i => (InventoryRow)i.Tag).ToList();
                     if (disabledFirst.Count == 0 || !disabledFirst[0].AllDisabled || disabledFirst.SkipWhile(row => row.AllDisabled).Any(row => row.AllDisabled)) throw new InvalidOperationException("The second Status click must reverse the state sort and group disabled rows first.");
+                    main._sortBy.SelectedIndex = 3;
+                    if (main._sortColumn != 3 || !main._sortAscending || main._sortDirection.Text.IndexOf("Ascending", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Keyboard-accessible Sort by did not apply Source ascending.");
                     foreach (int column in new[] { 0, 2, 3, 4, 5 })
                     {
                         main._sortColumn = -1;
@@ -13016,9 +13074,9 @@ namespace MichStartupMaster
                     ListViewItem openSpeedyItem = main._list.Items.Cast<ListViewItem>().Single(i => ReferenceEquals(i.Tag, openSpeedy));
                     openSpeedyItem.Selected = true; openSpeedyItem.Focused = true; main._list.Select(); main.UpdateButtons(); main.UpdateContextMenu();
                     if (!main._editSelected.Enabled || main._editSelected.Text.IndexOf("Manage 2 routes", StringComparison.OrdinalIgnoreCase) < 0 || main._disable.Text.IndexOf("Disable all 1", StringComparison.OrdinalIgnoreCase) < 0 || !CanBulkDisable(openSpeedy, true) || main._launchSelected.Enabled || main._quietSelected.Enabled || main._copySelected.Enabled || main._disable.Enabled || main._enable.Enabled || main._contextState.Enabled || main._contextMode.Enabled || main._contextLaunch.Enabled || main._contextOpen.Enabled || main._contextCopy.Enabled || main._contextDelete.Enabled) throw new InvalidOperationException("Aggregate bulk-disable or fail-closed non-bulk actions are incorrect.");
-                    if (main._detailBody.Text.IndexOf("1 enabled", StringComparison.OrdinalIgnoreCase) < 0 || main._detailBody.Text.IndexOf("1 disabled", StringComparison.OrdinalIgnoreCase) < 0 || main._detailBody.Text.IndexOf("rollback-safe transaction", StringComparison.OrdinalIgnoreCase) < 0 || main._selectionMeta.Text.IndexOf("Disable all is one rollback-safe transaction", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Aggregate details omit route counts or transactional bulk-disable guidance.");
+                    if (main._detailBody.Text.IndexOf("1 enabled", StringComparison.OrdinalIgnoreCase) < 0 || main._detailBody.Text.IndexOf("1 disabled", StringComparison.OrdinalIgnoreCase) < 0 || main._detailBody.Text.IndexOf("rollback-safe transaction", StringComparison.OrdinalIgnoreCase) < 0 || main._selectionMeta.Text.IndexOf("rollback-safe transaction", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Aggregate details omit route counts or transactional bulk-change guidance.");
                     var blockedBulk = new InventoryRow { Routes = new List<StartupItem> { new StartupItem { Id = "preview|bulk|ok", Enabled = true, CanDisable = true }, new StartupItem { Id = "preview|bulk|blocked", Enabled = true, CanDisable = false, ExternalAuthority = "Policy" } }, Primary = openSpeedy.Primary, IsAppSummary = true };
-                    if (CanBulkDisable(blockedBulk, true) || BulkStateActionReason(blockedBulk).IndexOf("Policy", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Aggregate bulk disable does not fail closed before writes when one route is externally owned.");
+                    if (CanBulkDisable(blockedBulk, true) || BulkStateActionReason(blockedBulk, false).IndexOf("Policy", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Aggregate bulk disable does not fail closed before writes when one route is externally owned.");
                     ForceLayout(main);
                     var excluded = new HashSet<Control> { main._emptyState, main._progress, main._retry, main._disable, main._enable, main._quietSelected, main._launchSelected };
                     AssertVisibleContainment(main, "MainForm@" + scale.ToString("0.0"), excluded, ref checks);
@@ -13318,7 +13376,7 @@ namespace MichStartupMaster
             _runtimeEnabled = runtimeEnabled;
             _allowVisible = !startInTray;
             Text = "Mich Startup Master — Startup Control";
-            Width = 1360; Height = 820; MinimumSize = new Size(1060, 700);
+            Width = 1360; Height = 820; MinimumSize = new Size(900, 660);
             AutoScaleMode = AutoScaleMode.None;
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Bg; ForeColor = TextMain; Font = new Font("Segoe UI Variable Text", 9.5f); DoubleBuffered = true; Icon = Program.AppIcon; KeyPreview = true;
@@ -13494,7 +13552,7 @@ namespace MichStartupMaster
 
             var findArea = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface, ColumnCount = 1, RowCount = 2, Padding = new Padding(12, 8, 12, 6), Margin = new Padding(0, 0, 0, 8) };
             findArea.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            findArea.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f)); findArea.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            findArea.RowStyles.Add(new RowStyle(SizeType.Absolute, 32f)); findArea.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
             var findRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Margin = new Padding(0) };
             findRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70f)); findRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); findRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100f));
             findRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
@@ -13502,12 +13560,18 @@ namespace MichStartupMaster
             _search = StyledTextBox(); _search.Dock = DockStyle.Fill; _search.Margin = new Padding(0, 2, 8, 2); _search.AccessibleName = "Search startup inventory"; _search.AccessibleDescription = "Filter by application, entry, source, path, command, or status."; _search.TextChanged += (s, e) => RenderList(); findRow.Controls.Add(_search, 1, 0);
             _clearSearch = Button("C&lear", Surface2, 90); _clearSearch.Height = 32; _clearSearch.Margin = new Padding(4, 0, 0, 0); _clearSearch.Click += (s, e) => { _routeTargetFilter = null; _search.Clear(); RenderList(); _search.Focus(); }; findRow.Controls.Add(_clearSearch, 2, 0);
             findArea.Controls.Add(findRow, 0, 0);
-            var filters = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0), Padding = new Padding(70, 0, 0, 0) };
-            _showAll = FilterButton("&Apps", 100, "Apps");
-            _showRisky = FilterButton("All &routes", 120, "All");
-            _showCleanup = FilterButton("Needs &attention", 170, "Attention");
-            _showDisabled = FilterButton("&Disabled", 120, "Disabled");
+            var filters = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0), Padding = new Padding(0) };
+            _showAll = FilterButton("&Apps", 90, "Apps");
+            _showRisky = FilterButton("All &routes", 108, "All");
+            _showCleanup = FilterButton("Needs &attention", 154, "Attention");
+            _showDisabled = FilterButton("&Disabled", 108, "Disabled");
             filters.Controls.Add(_showAll); filters.Controls.Add(_showRisky); filters.Controls.Add(_showCleanup); filters.Controls.Add(_showDisabled);
+            filters.Controls.Add(new Label { Text = "Sort by", Width = 52, Height = 30, TextAlign = ContentAlignment.MiddleRight, ForeColor = Muted, Margin = new Padding(4, 0, 4, 0), AccessibleName = "Sort by label" });
+            _sortBy = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 132, Height = 30, BackColor = Surface2, ForeColor = TextMain, FlatStyle = FlatStyle.Flat, AccessibleName = "Sort by", AccessibleDescription = "Choose any inventory column to sort. Alt S focuses this control.", Margin = new Padding(0, 1, 6, 0) };
+            _sortBy.Items.AddRange(new object[] { "Application", "Status", "Mode", "Source", "Risk", "Startup entry" });
+            _sortBy.SelectedIndexChanged += (s, e) => { if (!_syncingSortControls && _sortBy.SelectedIndex >= 0) SetColumnSort(_sortBy.SelectedIndex, true); };
+            _sortDirection = Button("&Ascending", Surface2, 104); _sortDirection.Height = 30; _sortDirection.Margin = new Padding(0); _sortDirection.Click += (s, e) => ToggleSortDirection();
+            filters.Controls.Add(_sortBy); filters.Controls.Add(_sortDirection);
             findArea.Controls.Add(filters, 0, 1); root.Controls.Add(findArea, 0, 2);
 
             var inventory = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface, ColumnCount = 1, RowCount = 3, Padding = new Padding(1), Margin = new Padding(0) };
@@ -13534,7 +13598,7 @@ namespace MichStartupMaster
             _list = new ListView { Dock = DockStyle.Fill, Margin = new Padding(12, 0, 12, 0), View = View.Details, FullRowSelect = true, BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(19, 23, 29), ForeColor = TextMain, Font = new Font("Segoe UI Variable Text", 9.5f), HideSelection = false, OwnerDraw = true, MultiSelect = false, ShowItemToolTips = true, ShowGroups = false };
             _list.AccessibleName = "Startup inventory"; _list.AccessibleDescription = "Complete route-level Windows startup inventory. Each registration is shown once. Click any column header to sort; click it again to reverse. Use Space to enable or disable, Control Q to change window or quiet tray mode, and Shift F10 for all actions.";
             _list.SmallImageList = new ImageList { ImageSize = new Size(1, 38) };
-            _list.Columns.Add("Application", 290); _list.Columns.Add("Status", 112); _list.Columns.Add("Mode", 132); _list.Columns.Add("Source", 170); _list.Columns.Add("Impact", 142); _list.Columns.Add("Startup entry", 300);
+            _list.Columns.Add("Application", 290); _list.Columns.Add("Status", 112); _list.Columns.Add("Mode", 132); _list.Columns.Add("Source", 170); _list.Columns.Add("Risk", 142); _list.Columns.Add("Startup entry", 300);
             _list.DrawColumnHeader += DrawColumnHeader;
             _list.ColumnClick += (s, e) => ApplyColumnSort(e.Column);
             _list.DrawSubItem += DrawSubItem; _list.SelectedIndexChanged += (s, e) => UpdateButtons(); _list.MouseDown += SelectListItemOnRightClick; _list.DoubleClick += (s, e) => EditSelected(); _list.KeyDown += ListKeyDown;
@@ -13579,6 +13643,8 @@ namespace MichStartupMaster
             _tooltip.SetToolTip(_showRisky, "Show the complete startup inventory: one row per captured registration, including services, drivers, boot/logon hooks, and system internals.");
             _tooltip.SetToolTip(_showCleanup, "Show high-impact, script-based, or optional-startup items worth reviewing.");
             _tooltip.SetToolTip(_showDisabled, "Show entries currently kept from startup.");
+            _tooltip.SetToolTip(_sortBy, "Sort the current view by any column. Alt+S focuses this control.");
+            _tooltip.SetToolTip(_sortDirection, "Reverse the current sort direction.");
             _tooltip.SetToolTip(_editSelected, "Edit the selected app path, arguments, and startup mode.");
             _tooltip.SetToolTip(_quietSelected, "Configure Window or Quiet (tray). Actual startup presentation needs verification.");
             _tooltip.SetToolTip(_disable, "Disable this registration at boot without uninstalling the app.");
@@ -13601,13 +13667,14 @@ namespace MichStartupMaster
         {
             var menu = new ContextMenuStrip { ShowImageMargin = false };
             _contextState = new ToolStripMenuItem("Enable at boot", null, (s, e) => ToggleSelectedEnabled());
+            _contextEnableAll = new ToolStripMenuItem("Enable all disabled routes", null, (s, e) => EnableAllSelectedRoutes(SelectedRow()));
             _contextMode = new ToolStripMenuItem("Use Quiet (tray)", null, (s, e) => ToggleSelectedMode());
             _contextLaunch = new ToolStripMenuItem("Run now", null, (s, e) => LaunchSelectedNow());
             _contextEdit = new ToolStripMenuItem("Edit startup", null, (s, e) => EditSelected());
             _contextOpen = new ToolStripMenuItem("Open location", null, (s, e) => OpenSelectedLocation());
             _contextCopy = new ToolStripMenuItem("Copy launch command", null, (s, e) => CopySelectedCommand());
             _contextDelete = new ToolStripMenuItem("Permanently delete managed task...", null, (s, e) => DeleteManaged());
-            menu.Items.Add(_contextState); menu.Items.Add(_contextMode); menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(_contextState); menu.Items.Add(_contextEnableAll); menu.Items.Add(_contextMode); menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(_contextLaunch); menu.Items.Add(_contextEdit); menu.Items.Add(_contextOpen); menu.Items.Add(_contextCopy);
             menu.Items.Add(new ToolStripSeparator()); menu.Items.Add(_contextDelete);
             menu.Opening += (s, e) => UpdateContextMenu();
@@ -13743,12 +13810,14 @@ namespace MichStartupMaster
         private void ResizeListColumns()
         {
             if (_list == null || _list.Columns.Count != 6) return;
-            int status = (int)Math.Round(130 * _layoutScale), mode = (int)Math.Round(146 * _layoutScale), source = (int)Math.Round(176 * _layoutScale), impact = (int)Math.Round(138 * _layoutScale);
-            int fixedWidth = status + mode + source + impact;
-            int flexible = Math.Max((int)Math.Round(400 * _layoutScale), _list.ClientSize.Width - fixedWidth - (int)Math.Round(8 * _layoutScale));
-            _list.Columns[0].Width = Math.Max((int)Math.Round(210 * _layoutScale), (int)(flexible * .5));
-            _list.Columns[1].Width = status; _list.Columns[2].Width = mode; _list.Columns[3].Width = source; _list.Columns[4].Width = impact;
-            _list.Columns[5].Width = Math.Max((int)Math.Round(190 * _layoutScale), flexible - _list.Columns[0].Width);
+            float effectiveWidth = _list.ClientSize.Width / Math.Max(1f, _layoutScale);
+            bool compact = effectiveWidth < 840f;
+            int status = (int)Math.Round((compact ? 112 : 130) * _layoutScale), mode = (int)Math.Round((compact ? 122 : 146) * _layoutScale), source = (int)Math.Round((compact ? 132 : 176) * _layoutScale), risk = (int)Math.Round((compact ? 102 : 138) * _layoutScale);
+            int fixedWidth = status + mode + source + risk;
+            int flexible = Math.Max((int)Math.Round((compact ? 320 : 400) * _layoutScale), _list.ClientSize.Width - fixedWidth - (int)Math.Round(8 * _layoutScale));
+            _list.Columns[0].Width = Math.Max((int)Math.Round((compact ? 170 : 210) * _layoutScale), (int)(flexible * .5));
+            _list.Columns[1].Width = status; _list.Columns[2].Width = mode; _list.Columns[3].Width = source; _list.Columns[4].Width = risk;
+            _list.Columns[5].Width = Math.Max((int)Math.Round((compact ? 150 : 190) * _layoutScale), flexible - _list.Columns[0].Width);
         }
 
         private static void ApplyHighContrastTheme(Control root)
@@ -13926,6 +13995,8 @@ namespace MichStartupMaster
                     rows.Add(new InventoryRow { Key = "route|" + (item.Id ?? CanonicalTargetIdentity(item)), TargetIdentity = CanonicalTargetIdentity(item), Routes = new List<StartupItem> { item }, Primary = item, IsAppSummary = false });
                 }
             }
+            var repeatedNames = new HashSet<string>(rows.GroupBy(row => row.Primary.HumanName(), StringComparer.OrdinalIgnoreCase).Where(group => group.Count() > 1).Select(group => group.Key), StringComparer.OrdinalIgnoreCase);
+            foreach (InventoryRow row in rows) row.DisplayName = repeatedNames.Contains(row.Primary.HumanName()) ? row.Primary.HumanName() + "  ·  " + TargetDisambiguator(row.TargetIdentity) : row.Primary.HumanName();
             if (_sortColumn < 0) return rows.OrderBy(x => x.Primary.HumanName(), StringComparer.OrdinalIgnoreCase).ThenBy(x => x.TargetIdentity, StringComparer.OrdinalIgnoreCase).ToList();
             var sortKeys = rows.ToDictionary(row => row, row => SortTextForRow(row, _sortColumn, rows));
             rows.Sort((left, right) => CompareInventoryRows(left, right, sortKeys[left], sortKeys[right]));
@@ -13937,7 +14008,38 @@ namespace MichStartupMaster
             if (_list == null || column < 0 || column >= _list.Columns.Count) return;
             if (_sortColumn == column) _sortAscending = !_sortAscending;
             else { _sortColumn = column; _sortAscending = true; }
+            FinishSortChange();
+        }
+
+        private void SetColumnSort(int column, bool ascending)
+        {
+            if (_list == null || column < 0 || column >= _list.Columns.Count) return;
+            _sortColumn = column;
+            _sortAscending = ascending;
+            FinishSortChange();
+        }
+
+        private void ToggleSortDirection()
+        {
+            if (_sortColumn < 0) SetColumnSort(0, true);
+            else SetColumnSort(_sortColumn, !_sortAscending);
+        }
+
+        private void FinishSortChange()
+        {
             RenderList();
+            _syncingSortControls = true;
+            if (_sortBy != null) _sortBy.SelectedIndex = _sortColumn;
+            if (_sortDirection != null)
+            {
+                _sortDirection.Text = _sortAscending ? "&Ascending" : "&Descending";
+                _sortDirection.AccessibleName = (_sortAscending ? "Ascending" : "Descending") + "; activate for " + (_sortAscending ? "descending" : "ascending");
+            }
+            _syncingSortControls = false;
+            string announcement = "Sorted by " + _list.Columns[_sortColumn].Text + " " + (_sortAscending ? "ascending" : "descending") + ".";
+            _list.AccessibleDescription = announcement + " Use the Sort by control or column headers to change sorting.";
+            if (_hint != null) { _hint.Text = announcement; _hint.AccessibleDescription = announcement; }
+            try { AccessibilityNotifyClients(AccessibleEvents.DescriptionChange, -1); } catch { }
             _list.Invalidate();
         }
 
@@ -14037,8 +14139,9 @@ namespace MichStartupMaster
 
         private static string DisplayNameForRow(InventoryRow row, IList<InventoryRow> allRows)
         {
+            if (!string.IsNullOrWhiteSpace(row.DisplayName)) return row.DisplayName;
             string name = row.Primary.HumanName();
-            bool duplicateName = allRows.Count(x => string.Equals(x.Primary.HumanName(), name, StringComparison.OrdinalIgnoreCase)) > 1;
+            bool duplicateName = allRows != null && allRows.Count(x => string.Equals(x.Primary.HumanName(), name, StringComparison.OrdinalIgnoreCase)) > 1;
             return duplicateName ? name + "  ·  " + TargetDisambiguator(row.TargetIdentity) : name;
         }
 
@@ -14126,6 +14229,7 @@ namespace MichStartupMaster
         {
             bool editingText = ActiveControl is TextBox;
             if (editingText && (e.KeyCode == Keys.Delete || e.KeyCode == Keys.Enter || (e.Control && e.KeyCode == Keys.C))) return;
+            if (e.Alt && e.KeyCode == Keys.S) { _sortBy.Focus(); e.Handled = true; e.SuppressKeyPress = true; return; }
             if (e.KeyCode == Keys.Escape && !string.IsNullOrWhiteSpace(_routeTargetFilter)) { SetFilter("All"); e.Handled = true; return; }
             if (!_runtimeEnabled)
             {
@@ -14168,20 +14272,26 @@ namespace MichStartupMaster
             StartupItem x = exact ? row.Primary : null;
             bool app = exact && x.PopupLabel() != "N/A", ready = _runtimeEnabled && !_isRefreshing;
             int enabledRoutes = any ? row.Routes.Count(route => route.Enabled) : 0;
+            int disabledRoutes = any ? row.Routes.Count(route => !route.Enabled) : 0;
             bool bulkDisable = any && row.IsAmbiguous && enabledRoutes > 0;
+            bool bulkEnable = any && row.IsAmbiguous && disabledRoutes > 0;
             _editSelected.Text = any && row.IsAmbiguous ? "&Manage " + row.Routes.Count + " routes" : "&Edit";
             _editSelected.AccessibleName = any && row.IsAmbiguous ? "Manage " + row.Routes.Count + " startup routes" : "Edit startup";
             _editSelected.Width = Math.Max((int)Math.Round((any && row.IsAmbiguous ? 150 : 90) * _layoutScale), 90);
-            bool modeAction = CanUseLaunchMode(x, ready), launchAction = CanLaunchRoute(x, ready), stateAction = ready && ((exact && x.CanDisable && string.IsNullOrWhiteSpace(x.ExternalAuthority)) || (bulkDisable && CanBulkDisable(row, true)));
+            bool modeAction = CanUseLaunchMode(x, ready), launchAction = CanLaunchRoute(x, ready);
+            bool exactStateAction = ready && exact && x.CanDisable && string.IsNullOrWhiteSpace(x.ExternalAuthority);
             _editSelected.Enabled = any && row.IsAmbiguous ? !_isRefreshing : CanEditRoute(x, ready); _quietSelected.Enabled = modeAction; _launchSelected.Enabled = launchAction; _copySelected.Enabled = ready && exact && !string.IsNullOrWhiteSpace(x.Command);
             _disable.Text = bulkDisable ? "&Disable all " + enabledRoutes : "&Disable at boot";
             _disable.AccessibleName = bulkDisable ? "Disable all " + enabledRoutes + " enabled startup routes" : "Disable at boot";
-            _disable.Visible = (exact && x.Enabled) || bulkDisable; _enable.Visible = exact && !x.Enabled;
+            _enable.Text = bulkEnable ? "&Enable all " + disabledRoutes : "&Enable at boot";
+            _enable.AccessibleName = bulkEnable ? "Enable all " + disabledRoutes + " disabled startup routes" : "Enable at boot";
+            _disable.Visible = (exact && x.Enabled) || bulkDisable; _enable.Visible = (exact && !x.Enabled) || bulkEnable;
             _quietSelected.Visible = !any || exact; _launchSelected.Visible = !any || exact;
-            _disable.Enabled = stateAction && ((exact && x.Enabled) || bulkDisable); _enable.Enabled = stateAction && exact && !x.Enabled;
+            _disable.Enabled = (exactStateAction && x.Enabled) || (ready && bulkDisable && CanBulkDisable(row, true));
+            _enable.Enabled = (exactStateAction && !x.Enabled) || (ready && bulkEnable && CanBulkEnable(row, true));
             _quietSelected.Text = app && StartupService.IsQuietLaunch(x.Command ?? "", x.Location) ? "Use &window" : "Use &quiet tray";
             _selectionTitle.Text = any ? row.Primary.HumanName() : "Select an item to manage it";
-            _selectionMeta.Text = !any ? "State and startup mode are separate controls." : (row.IsAmbiguous ? row.Routes.Count + " startup routes  ·  " + enabledRoutes + " enabled  ·  Disable all is one rollback-safe transaction" : x.StateText() + "  ·  " + ModeText(x) + "  ·  " + x.EvidenceReason + "  ·  " + x.PresentationReason + "  ·  " + x.Source + (!x.Enabled && app ? "  ·  Enable before editing" : "") + CapabilitySummary(x));
+            _selectionMeta.Text = !any ? "State and startup mode are separate controls." : (row.IsAmbiguous ? row.Routes.Count + " startup routes  ·  " + enabledRoutes + " enabled  ·  Bulk changes are one rollback-safe transaction" : x.StateText() + "  ·  " + ModeText(x) + "  ·  " + x.EvidenceReason + "  ·  " + x.PresentationReason + "  ·  " + x.Source + (!x.Enabled && app ? "  ·  Enable before editing" : "") + CapabilitySummary(x));
             _detailTitle.Text = !any ? "Source details" : (row.IsAmbiguous ? row.Routes.Count + " registrations  ·  " + TargetCaption(row.TargetIdentity) : x.Source + "  ·  " + x.Name);
             _detailBody.Text = !any ? "Select a row to see its exact registration, location, and launch command." : DetailBodyFor(row);
             _detailBody.AccessibleDescription = _detailBody.Text;
@@ -14189,25 +14299,35 @@ namespace MichStartupMaster
             _tooltip.SetToolTip(_editSelected, editTip);
             _tooltip.SetToolTip(_quietSelected, ModeActionReason(x, "Choose whether this app starts in Window or Quiet (tray) mode."));
             _tooltip.SetToolTip(_launchSelected, ModeActionReason(x, "Run this exact launch action now."));
-            string stateTip = bulkDisable ? BulkStateActionReason(row) : StateActionReason(x);
-            _tooltip.SetToolTip(_disable, stateTip); _tooltip.SetToolTip(_enable, stateTip);
+            _tooltip.SetToolTip(_disable, bulkDisable ? BulkStateActionReason(row, false) : StateActionReason(x));
+            _tooltip.SetToolTip(_enable, bulkEnable ? BulkStateActionReason(row, true) : StateActionReason(x));
         }
 
         private static bool CanBulkDisable(InventoryRow row, bool ready)
         {
-            if (!ready || row == null || !row.IsAmbiguous) return false;
-            List<StartupItem> enabled = row.Routes.Where(route => route != null && route.Enabled).ToList();
-            return enabled.Count > 0 && enabled.All(route => route.CanDisable && string.IsNullOrWhiteSpace(route.ExternalAuthority));
+            return CanBulkSetEnabled(row, ready, false);
         }
 
-        private static string BulkStateActionReason(InventoryRow row)
+        private static bool CanBulkEnable(InventoryRow row, bool ready)
+        {
+            return CanBulkSetEnabled(row, ready, true);
+        }
+
+        private static bool CanBulkSetEnabled(InventoryRow row, bool ready, bool enabledState)
+        {
+            if (!ready || row == null || !row.IsAmbiguous) return false;
+            List<StartupItem> candidates = row.Routes.Where(route => route != null && route.Enabled != enabledState).ToList();
+            return candidates.Count > 0 && candidates.All(route => route.CanDisable && string.IsNullOrWhiteSpace(route.ExternalAuthority));
+        }
+
+        private static string BulkStateActionReason(InventoryRow row, bool enabledState)
         {
             if (row == null || !row.IsAmbiguous) return "Select an app with multiple startup routes first.";
-            List<StartupItem> enabled = row.Routes.Where(route => route != null && route.Enabled).ToList();
-            if (enabled.Count == 0) return "Every startup route for this app is already disabled.";
-            StartupItem blocked = enabled.FirstOrDefault(route => !string.IsNullOrWhiteSpace(route.ExternalAuthority) || !route.CanDisable);
+            List<StartupItem> candidates = row.Routes.Where(route => route != null && route.Enabled != enabledState).ToList();
+            if (candidates.Count == 0) return "Every startup route for this app is already " + (enabledState ? "enabled." : "disabled.");
+            StartupItem blocked = candidates.FirstOrDefault(route => !string.IsNullOrWhiteSpace(route.ExternalAuthority) || !route.CanDisable);
             if (blocked != null) return "All routes stay unchanged: " + StateActionReason(blocked);
-            return "Disable all " + enabled.Count + " enabled routes for this app as one transaction; any failure restores every route.";
+            return (enabledState ? "Enable" : "Disable") + " all " + candidates.Count + " " + (enabledState ? "disabled" : "enabled") + " routes for this app as one transaction; any failure restores every route.";
         }
 
         private static bool CanUseLaunchMode(StartupItem item, bool ready) { return ready && item != null && item.Enabled && item.PopupLabel() != "N/A" && StartupService.CanMutateStartupMode(item); }
@@ -14258,7 +14378,7 @@ namespace MichStartupMaster
             if (!row.IsAmbiguous) return DetailBodyFor(row.Primary);
             int enabled = row.Routes.Count(x => x.StateText() == "Enabled"), disabled = row.Routes.Count(x => x.StateText() == "Disabled");
             string sources = string.Join(", ", row.Routes.Select(x => x.Source).Distinct(StringComparer.OrdinalIgnoreCase));
-            return "Target: " + TargetCaption(row.TargetIdentity) + Environment.NewLine + enabled + " enabled  ·  " + disabled + " disabled  ·  " + (row.Routes.Count - enabled - disabled) + " unverified  ·  " + sources + Environment.NewLine + "Disable all enabled routes here in one rollback-safe transaction, or open All routes to manage one registration.";
+            return "Target: " + TargetCaption(row.TargetIdentity) + Environment.NewLine + enabled + " enabled  ·  " + disabled + " disabled  ·  " + (row.Routes.Count - enabled - disabled) + " unverified  ·  " + sources + Environment.NewLine + "Enable or disable every matching route here in one rollback-safe transaction, or open All routes to manage one registration.";
         }
 
         private void UpdateContextMenu()
@@ -14266,9 +14386,14 @@ namespace MichStartupMaster
             InventoryRow row = SelectedRow(); bool exact = row != null && !row.IsAmbiguous;
             var x = exact ? row.Primary : null; bool any = x != null; bool app = any && x.PopupLabel() != "N/A"; bool ready = _runtimeEnabled && !_isRefreshing;
             int enabledRoutes = row == null ? 0 : row.Routes.Count(route => route.Enabled);
+            int disabledRoutes = row == null ? 0 : row.Routes.Count(route => !route.Enabled);
             bool bulkDisable = row != null && row.IsAmbiguous && enabledRoutes > 0;
-            _contextState.Text = bulkDisable ? "Disable all " + enabledRoutes + " enabled routes" : (any && x.Enabled ? "Disable at boot" : "Enable at boot");
-            _contextState.Enabled = bulkDisable ? CanBulkDisable(row, ready) : ready && any && x.CanDisable && string.IsNullOrWhiteSpace(x.ExternalAuthority);
+            bool bulkEnable = row != null && row.IsAmbiguous && disabledRoutes > 0;
+            _contextState.Text = bulkDisable ? "Disable all " + enabledRoutes + " enabled routes" : (bulkEnable ? "Enable all " + disabledRoutes + " disabled routes" : (any && x.Enabled ? "Disable at boot" : "Enable at boot"));
+            _contextState.Enabled = bulkDisable ? CanBulkDisable(row, ready) : (bulkEnable ? CanBulkEnable(row, ready) : ready && any && x.CanDisable && string.IsNullOrWhiteSpace(x.ExternalAuthority));
+            _contextEnableAll.Visible = bulkDisable && bulkEnable;
+            _contextEnableAll.Text = "Enable all " + disabledRoutes + " disabled routes";
+            _contextEnableAll.Enabled = _contextEnableAll.Visible && CanBulkEnable(row, ready);
             _contextMode.Text = app && StartupService.IsQuietLaunch(x.Command ?? "", x.Location) ? "Use Window mode" : "Use Quiet (tray)";
             _contextMode.Enabled = CanUseLaunchMode(x, ready);
             _contextEdit.Text = row != null && row.IsAmbiguous ? "Manage " + row.Routes.Count + " routes" : "Edit startup";
@@ -14278,7 +14403,7 @@ namespace MichStartupMaster
 
         private InventoryRow SelectedRow() { return _list == null || _list.SelectedItems.Count == 0 ? null : _list.SelectedItems[0].Tag as InventoryRow; }
         private StartupItem Selected() { InventoryRow row = SelectedRow(); return row == null || row.IsAmbiguous ? null : row.Primary; }
-        private void ToggleSelectedEnabled() { InventoryRow row = SelectedRow(); if (row != null && row.IsAmbiguous) { DisableAllSelectedRoutes(row); return; } var x = Selected(); if (x == null || _isRefreshing || !_runtimeEnabled) return; if (x.Enabled) DisableSelected(); else EnableSelected(); }
+        private void ToggleSelectedEnabled() { InventoryRow row = SelectedRow(); if (row != null && row.IsAmbiguous) { if (row.Routes.Any(route => route.Enabled)) DisableAllSelectedRoutes(row); else EnableAllSelectedRoutes(row); return; } var x = Selected(); if (x == null || _isRefreshing || !_runtimeEnabled) return; if (x.Enabled) DisableSelected(); else EnableSelected(); }
         private void DisableSelected()
         {
             InventoryRow row = SelectedRow();
@@ -14303,7 +14428,7 @@ namespace MichStartupMaster
             if (row == null || !row.IsAmbiguous || _isRefreshing || !_runtimeEnabled) return;
             List<StartupItem> enabled = row.Routes.Where(route => route != null && route.Enabled).ToList();
             if (enabled.Count == 0) { SetStatus("Every startup route for this app is already disabled.", Muted); return; }
-            if (!CanBulkDisable(row, true)) { SetStatus(BulkStateActionReason(row), Warn); return; }
+            if (!CanBulkDisable(row, true)) { SetStatus(BulkStateActionReason(row, false), Warn); return; }
             bool expertConfirmed = enabled.Any(route => route.RequiresExpertConfirmation);
             string sources = string.Join(Environment.NewLine, enabled.Select(route => "• " + route.Source + " — " + route.Location));
             string message = "Disable every enabled startup route for " + row.Primary.HumanName() + "?" + Environment.NewLine + Environment.NewLine
@@ -14316,7 +14441,7 @@ namespace MichStartupMaster
             SetBusy(true, "Disabling all " + enabled.Count + " startup routes as one transaction...");
             Task.Run(() => StartupService.DisableAllRoutes(enabled, expertConfirmed)).ContinueWith(task =>
             {
-                if (IsDisposed) return;
+                if (IsDisposed || !IsHandleCreated) return;
                 BeginInvoke(new Action(() =>
                 {
                     _isRefreshing = false;
@@ -14336,11 +14461,50 @@ namespace MichStartupMaster
         }
         private void EnableSelected()
         {
+            InventoryRow row = SelectedRow();
+            if (row != null && row.IsAmbiguous) { EnableAllSelectedRoutes(row); return; }
             var x = Selected(); if (x == null || x.Enabled || _isRefreshing || !_runtimeEnabled) return;
             if (!x.CanDisable || !string.IsNullOrWhiteSpace(x.ExternalAuthority)) { SetStatus(StateActionReason(x), Warn); return; }
             bool expertConfirmed = x.RequiresExpertConfirmation;
             if (expertConfirmed && !ConfirmExpertStateChange(x, true)) return;
             try { StartupService.Enable(x, expertConfirmed); Toast("Enabled at boot", x.HumanName() + " will run from this startup route." + (x.RequiresReboot ? " Restart Windows to verify the change." : "")); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Enable failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        }
+
+        private void EnableAllSelectedRoutes(InventoryRow row)
+        {
+            if (row == null || !row.IsAmbiguous || _isRefreshing || !_runtimeEnabled) return;
+            List<StartupItem> disabled = row.Routes.Where(route => route != null && !route.Enabled).ToList();
+            if (disabled.Count == 0) { SetStatus("Every startup route for this app is already enabled.", Muted); return; }
+            if (!CanBulkEnable(row, true)) { SetStatus(BulkStateActionReason(row, true), Warn); return; }
+            bool expertConfirmed = disabled.Any(route => route.RequiresExpertConfirmation);
+            string sources = string.Join(Environment.NewLine, disabled.Select(route => "• " + route.Source + " — " + route.Location));
+            string message = "Enable every disabled startup route for " + row.Primary.HumanName() + "?" + Environment.NewLine + Environment.NewLine
+                + disabled.Count + " route" + (disabled.Count == 1 ? "" : "s") + " will be enabled:" + Environment.NewLine + sources + Environment.NewLine + Environment.NewLine
+                + "This is one transaction. If any route fails, Startup Master restores every route and intent store to its original state.";
+            if (expertConfirmed) message += Environment.NewLine + Environment.NewLine + "One or more routes are high-impact Windows startup components and require expert confirmation.";
+            if (MessageBox.Show(this, message, "Enable all app routes", MessageBoxButtons.YesNo, expertConfirmed ? MessageBoxIcon.Warning : MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+
+            _isRefreshing = true;
+            SetBusy(true, "Enabling all " + disabled.Count + " startup routes as one transaction...");
+            Task.Run(() => StartupService.EnableAllRoutes(disabled, expertConfirmed)).ContinueWith(task =>
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                BeginInvoke(new Action(() =>
+                {
+                    _isRefreshing = false;
+                    SetBusy(false, "");
+                    if (task.Exception == null)
+                    {
+                        Toast("All startup routes enabled", task.Result + " route" + (task.Result == 1 ? "" : "s") + " enabled for " + row.Primary.HumanName() + ".");
+                        RefreshItems();
+                    }
+                    else
+                    {
+                        MessageBox.Show(task.Exception.GetBaseException().Message, "Bulk enable failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        UpdateButtons();
+                    }
+                }));
+            });
         }
         private bool ConfirmExpertStateChange(StartupItem item, bool enabling)
         {
