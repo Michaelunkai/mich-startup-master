@@ -1670,6 +1670,7 @@ function Assert-UiContract {
   if (-not $contract.stateModeSeparated) { throw 'Startup state and window/tray mode must be separate.' }
   if (-not $contract.startInTrayPrePaintSuppression) { throw 'Start-in-tray must suppress the first visible frame.' }
   if (-not $contract.refreshIsReadOnly) { throw 'Refresh must be read-only.' }
+  if (-not $contract.sortableColumns -or $contract.statusInitialSort -ne 'Enabled first' -or -not $contract.repeatedColumnClickReversesSort) { throw 'Every inventory column must sort, with Enabled first on the initial Status click and reversal on repeat.' }
   if (-not $contract.humanReadableNames -or -not $contract.appsAggregatedByCanonicalTarget -or -not $contract.appsNeverAggregatedByDisplayName -or -not $contract.allRoutesRemainRouteLevel) { throw 'The UI must expose readable names, one canonical app row, and every exact underlying route.' }
   if (-not $contract.aggregateNonBulkActionsFailClosed -or -not $contract.aggregateBulkDisableTransactional -or -not $contract.aggregateManageRoutesOneClick) { throw 'Aggregate rows must provide transactional bulk disable while every ambiguous non-bulk action fails closed.' }
   if (-not $contract.contextualActions -or -not $contract.globalToolsInMenu) { throw 'Context actions and global tools must be separated.' }

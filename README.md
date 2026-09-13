@@ -11,6 +11,7 @@ The default view is **All routes**: every discovered Windows startup registratio
 
 - Responsive, high-DPI WinForms UI with a compact header, search, four focused filters, contextual actions, keyboard access, accessible names, and explicit loading/empty/error states.
 - Separate **Enabled/Disabled** and **Window/Quiet (tray)** columns and controls.
+- Click any inventory column header to sort by its displayed value; click it again to reverse. The first **Status** click places all enabled entries first.
 - **Refresh is read-only.** Repair and protection are explicit Tools actions.
 - Exact repeated adds reuse one canonical managed route. The boot agent transactionally retires exact duplicates and disabled `Launcher`/`Launch` aliases, including their saved quiet/enabled intent, so they cannot reappear after reboot.
 - The **Apps** tab exposes **Disable all** for an app with multiple routes. Every route is authorized before the first write; if any route fails, all earlier routes and intent stores are restored.

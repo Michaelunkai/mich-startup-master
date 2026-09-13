@@ -12740,6 +12740,8 @@ namespace MichStartupMaster
         private bool _watchScanRunning;
         private bool _emptyRetryMode;
         private int _refreshVersion;
+        private int _sortColumn = -1;
+        private bool _sortAscending = true;
         // Never open on an aggregate or a restricted subset.  The first visible inventory must
         // preserve every independently controllable startup registration one-for-one.
         private string _filterMode = "All";
@@ -12777,6 +12779,9 @@ namespace MichStartupMaster
                 defaultFilter = "All routes",
                 filters = new[] { "Apps", "All routes", "Needs attention", "Disabled" },
                 columns = new[] { "Application", "Status", "Mode", "Source", "Impact", "Startup entry" },
+                sortableColumns = true,
+                statusInitialSort = "Enabled first",
+                repeatedColumnClickReversesSort = true,
                 detailFields = new[] { "Location", "Launch command" },
                 modeLabels = new[] { "Window", "Quiet (tray)", "Not supported" },
                 stateModeSeparated = true,
@@ -12955,6 +12960,27 @@ namespace MichStartupMaster
                         if (!main.BuildVisibleRows(query).Any(row => row.Primary != null && string.Equals(row.Primary.Id, route.Id, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException("A route cannot be found by searching its displayed name: " + route.Id);
                     }
                     checks += main._items.Count;
+
+                    // Every visible column is an interactive sort key. Status intentionally
+                    // uses operational state order so the first click places Enabled first,
+                    // instead of the alphabetical order that would place Disabled first.
+                    main.ApplyColumnSort(1);
+                    var enabledFirst = main._list.Items.Cast<ListViewItem>().Select(i => (InventoryRow)i.Tag).ToList();
+                    if (enabledFirst.Count == 0 || !enabledFirst[0].AllEnabled || enabledFirst.SkipWhile(row => row.AllEnabled).Any(row => row.AllEnabled)) throw new InvalidOperationException("The first Status click must group every enabled row first.");
+                    main.ApplyColumnSort(1);
+                    var disabledFirst = main._list.Items.Cast<ListViewItem>().Select(i => (InventoryRow)i.Tag).ToList();
+                    if (disabledFirst.Count == 0 || !disabledFirst[0].AllDisabled || disabledFirst.SkipWhile(row => row.AllDisabled).Any(row => row.AllDisabled)) throw new InvalidOperationException("The second Status click must reverse the state sort and group disabled rows first.");
+                    foreach (int column in new[] { 0, 2, 3, 4, 5 })
+                    {
+                        main._sortColumn = -1;
+                        main.ApplyColumnSort(column);
+                        var ascending = main._list.Items.Cast<ListViewItem>().Select(item => item.SubItems[column].Text).ToList();
+                        if (!IsOrderedText(ascending, true)) throw new InvalidOperationException("Column did not sort ascending on its first click: " + main._list.Columns[column].Text + ".");
+                        main.ApplyColumnSort(column);
+                        var descending = main._list.Items.Cast<ListViewItem>().Select(item => item.SubItems[column].Text).ToList();
+                        if (!IsOrderedText(descending, false)) throw new InvalidOperationException("Column did not reverse its sort on the second click: " + main._list.Columns[column].Text + "; values=" + string.Join(" | ", descending) + ".");
+                    }
+                    checks += 12;
 
                     // The empty-state recovery is an inventory escape hatch, not a shortcut to
                     // the aggregate Apps view.  A stale search must recover every exact route.
@@ -13506,10 +13532,11 @@ namespace MichStartupMaster
             selectionBar.Controls.Add(selectionActions, 1, 0); inventory.Controls.Add(selectionBar, 0, 0);
 
             _list = new ListView { Dock = DockStyle.Fill, Margin = new Padding(12, 0, 12, 0), View = View.Details, FullRowSelect = true, BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(19, 23, 29), ForeColor = TextMain, Font = new Font("Segoe UI Variable Text", 9.5f), HideSelection = false, OwnerDraw = true, MultiSelect = false, ShowItemToolTips = true, ShowGroups = false };
-            _list.AccessibleName = "Startup inventory"; _list.AccessibleDescription = "Complete route-level Windows startup inventory. Each registration is shown once. Use Space to enable or disable, Control Q to change window or quiet tray mode, and Shift F10 for all actions.";
+            _list.AccessibleName = "Startup inventory"; _list.AccessibleDescription = "Complete route-level Windows startup inventory. Each registration is shown once. Click any column header to sort; click it again to reverse. Use Space to enable or disable, Control Q to change window or quiet tray mode, and Shift F10 for all actions.";
             _list.SmallImageList = new ImageList { ImageSize = new Size(1, 38) };
             _list.Columns.Add("Application", 290); _list.Columns.Add("Status", 112); _list.Columns.Add("Mode", 132); _list.Columns.Add("Source", 170); _list.Columns.Add("Impact", 142); _list.Columns.Add("Startup entry", 300);
             _list.DrawColumnHeader += DrawColumnHeader;
+            _list.ColumnClick += (s, e) => ApplyColumnSort(e.Column);
             _list.DrawSubItem += DrawSubItem; _list.SelectedIndexChanged += (s, e) => UpdateButtons(); _list.MouseDown += SelectListItemOnRightClick; _list.DoubleClick += (s, e) => EditSelected(); _list.KeyDown += ListKeyDown;
             _listMenu = BuildListContextMenu(); _list.ContextMenuStrip = _listMenu;
             _list.Resize += (s, e) => ResizeListColumns();
@@ -13648,7 +13675,8 @@ namespace MichStartupMaster
             Color foreground = SystemInformation.HighContrast ? SystemColors.ControlText : TextMain;
             using (var b = new SolidBrush(background)) e.Graphics.FillRectangle(b, e.Bounds);
             using (var p = new Pen(SystemInformation.HighContrast ? SystemColors.ControlDark : Border)) e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
-            using (var font = new Font(_list.Font, FontStyle.Bold)) TextRenderer.DrawText(e.Graphics, e.Header.Text, font, new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height), foreground, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+            string headerText = e.Header.Text + (_sortColumn == e.ColumnIndex ? (_sortAscending ? "  ▲" : "  ▼") : "");
+            using (var font = new Font(_list.Font, FontStyle.Bold)) TextRenderer.DrawText(e.Graphics, headerText, font, new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height), foreground, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
         }
 
         private void DrawSubItem(object sender, DrawListViewSubItemEventArgs e)
@@ -13845,9 +13873,9 @@ namespace MichStartupMaster
             foreach (InventoryRow row in rows)
             {
                 string application = DisplayNameForRow(row, rows);
-                string status = row.AllEnabled ? "● Enabled" : (row.AllDisabled ? "○ Disabled" : (row.Routes.Any(x => x.StateText() == "Drifted") ? "Drifted" : (row.Routes.Any(x => x.StateText() == "Unknown") ? "Unknown" : "◐ Mixed")));
-                string source = row.Routes.Select(x => x.Source ?? "").Distinct(StringComparer.OrdinalIgnoreCase).Count() == 1 ? row.Primary.Source : row.Routes.Count + " routes";
-                string entry = row.Routes.Count == 1 ? row.Primary.Name : row.Routes.Count + " registrations";
+                string status = StatusTextForRow(row);
+                string source = SourceTextForRow(row);
+                string entry = EntryTextForRow(row);
                 var li = new ListViewItem(application) { Tag = row, ToolTipText = row.IsAmbiguous ? row.Routes.Count + " startup routes for " + TargetCaption(row.TargetIdentity) + ". Open All routes to manage one registration." : row.Primary.Source + " — " + row.Primary.Location };
                 li.SubItems.Add(status); li.SubItems.Add(AggregateModeText(row)); li.SubItems.Add(source); li.SubItems.Add(AggregateImpactText(row)); li.SubItems.Add(entry);
                 _list.Items.Add(li);
@@ -13868,6 +13896,7 @@ namespace MichStartupMaster
             if (!_isRefreshing)
             {
                 string viewStatus = rows.Count == 0 ? "No matches in this view." : (_filterMode == "Apps" ? "Showing " + rows.Count + " apps representing " + rows.Sum(x => x.Routes.Count) + " startup routes. Open All routes to manage duplicates safely." : (!string.IsNullOrWhiteSpace(_routeTargetFilter) ? "Showing " + rows.Count + " exact routes for " + TargetCaption(_routeTargetFilter) + ". Select one registration to manage it safely." : "Showing " + rows.Count + " startup routes. Refresh is read-only."));
+                if (_sortColumn >= 0 && _sortColumn < _list.Columns.Count) viewStatus += " Sorted by " + _list.Columns[_sortColumn].Text + " " + (_sortAscending ? "ascending." : "descending.");
                 SetStatus(viewStatus, Muted);
             }
             if (rows.Count == 0) ShowEmptyState(_items.Count == 0 ? "No startup routes were found" : "No startup items match this view", string.IsNullOrWhiteSpace(q) ? "Choose All routes or another view, or add an application." : "Clear the search to return to the current view.", false);
@@ -13897,7 +13926,81 @@ namespace MichStartupMaster
                     rows.Add(new InventoryRow { Key = "route|" + (item.Id ?? CanonicalTargetIdentity(item)), TargetIdentity = CanonicalTargetIdentity(item), Routes = new List<StartupItem> { item }, Primary = item, IsAppSummary = false });
                 }
             }
-            return rows.OrderBy(x => x.Primary.HumanName(), StringComparer.OrdinalIgnoreCase).ThenBy(x => x.TargetIdentity, StringComparer.OrdinalIgnoreCase).ToList();
+            if (_sortColumn < 0) return rows.OrderBy(x => x.Primary.HumanName(), StringComparer.OrdinalIgnoreCase).ThenBy(x => x.TargetIdentity, StringComparer.OrdinalIgnoreCase).ToList();
+            var sortKeys = rows.ToDictionary(row => row, row => SortTextForRow(row, _sortColumn, rows));
+            rows.Sort((left, right) => CompareInventoryRows(left, right, sortKeys[left], sortKeys[right]));
+            return rows;
+        }
+
+        private void ApplyColumnSort(int column)
+        {
+            if (_list == null || column < 0 || column >= _list.Columns.Count) return;
+            if (_sortColumn == column) _sortAscending = !_sortAscending;
+            else { _sortColumn = column; _sortAscending = true; }
+            RenderList();
+            _list.Invalidate();
+        }
+
+        private int CompareInventoryRows(InventoryRow left, InventoryRow right, string leftText, string rightText)
+        {
+            int comparison;
+            if (_sortColumn == 1) comparison = StatusSortRank(left).CompareTo(StatusSortRank(right));
+            else comparison = StringComparer.CurrentCultureIgnoreCase.Compare(leftText, rightText);
+            if (!_sortAscending) comparison = -comparison;
+            if (comparison != 0) return comparison;
+            comparison = StringComparer.CurrentCultureIgnoreCase.Compare(left.Primary.HumanName(), right.Primary.HumanName());
+            if (comparison != 0) return comparison;
+            comparison = StringComparer.OrdinalIgnoreCase.Compare(left.TargetIdentity ?? "", right.TargetIdentity ?? "");
+            return comparison != 0 ? comparison : StringComparer.OrdinalIgnoreCase.Compare(left.Key ?? "", right.Key ?? "");
+        }
+
+        private static string SortTextForRow(InventoryRow row, int column, IList<InventoryRow> allRows)
+        {
+            if (column == 0) return DisplayNameForRow(row, allRows);
+            if (column == 1) return StatusTextForRow(row);
+            if (column == 2) return AggregateModeText(row);
+            if (column == 3) return SourceTextForRow(row);
+            if (column == 4) return AggregateImpactText(row);
+            if (column == 5) return EntryTextForRow(row);
+            return "";
+        }
+
+        private static string StatusTextForRow(InventoryRow row)
+        {
+            if (row.AllEnabled) return "● Enabled";
+            if (row.AllDisabled) return "○ Disabled";
+            if (row.Routes.Any(x => x.StateText() == "Drifted")) return "Drifted";
+            if (row.Routes.Any(x => x.StateText() == "Unknown")) return "Unknown";
+            return "◐ Mixed";
+        }
+
+        private static int StatusSortRank(InventoryRow row)
+        {
+            if (row.AllEnabled) return 0;
+            if (!row.AllDisabled && !row.Routes.Any(x => x.StateText() == "Drifted" || x.StateText() == "Unknown")) return 1;
+            if (row.Routes.Any(x => x.StateText() == "Unknown")) return 2;
+            if (row.Routes.Any(x => x.StateText() == "Drifted")) return 3;
+            return 4;
+        }
+
+        private static string SourceTextForRow(InventoryRow row)
+        {
+            return row.Routes.Select(x => x.Source ?? "").Distinct(StringComparer.OrdinalIgnoreCase).Count() == 1 ? row.Primary.Source : row.Routes.Count + " routes";
+        }
+
+        private static string EntryTextForRow(InventoryRow row)
+        {
+            return row.Routes.Count == 1 ? row.Primary.Name : row.Routes.Count + " registrations";
+        }
+
+        private static bool IsOrderedText(IList<string> values, bool ascending)
+        {
+            for (int index = 1; index < values.Count; index++)
+            {
+                int comparison = StringComparer.CurrentCultureIgnoreCase.Compare(values[index - 1] ?? "", values[index] ?? "");
+                if ((ascending && comparison > 0) || (!ascending && comparison < 0)) return false;
+            }
+            return true;
         }
 
         private static string SearchText(StartupItem item)
