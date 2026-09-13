@@ -1,69 +1,40 @@
+[CmdletBinding()]
+param(
+    [string]$ExecutablePath = (Join-Path $env:LOCALAPPDATA 'Programs\MichStartupMaster\MichStartupMaster.exe')
+)
+
 $ErrorActionPreference = 'Stop'
 
-$taskName = '\MichStartupMaster\MichStartupMasterApp'
-$installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\MichStartupMaster'
-$exe = Join-Path $installDirectory 'MichStartupMaster.exe'
-$launcher = Join-Path $installDirectory 'MichStartupMasterAgent.vbs'
-$wscript = 'C:\Windows\System32\wscript.exe'
-$userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$xmlPath = Join-Path $env:TEMP 'MichStartupMaster-local-task.xml'
+function Invoke-AppCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Executable,
 
-foreach ($path in @($exe, $launcher, $wscript)) {
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "Required local startup path was not found: $path"
+        [Parameter(Mandatory = $true)]
+        [string]$Command
+    )
+
+    $commandOutput = @(& $Executable $Command 2>&1)
+    $commandExitCode = $LASTEXITCODE
+    $receipt = ($commandOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+    if ($commandExitCode -ne 0) {
+        throw "MichStartupMaster $Command failed with exit code $commandExitCode. $receipt"
     }
+    return $receipt.Trim()
 }
 
-$escapedWscript = [System.Security.SecurityElement]::Escape($wscript)
-$escapedLauncher = [System.Security.SecurityElement]::Escape($launcher)
-$escapedDirectory = [System.Security.SecurityElement]::Escape($installDirectory)
-$xml = @"
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>Mich Startup Master managed startup agent</Description>
-    <URI>\MichStartupMaster\MichStartupMasterApp</URI>
-  </RegistrationInfo>
-  <Principals>
-    <Principal id="Author">
-      <UserId>$userSid</UserId>
-      <LogonType>InteractiveToken</LogonType>
-    </Principal>
-  </Principals>
-  <Settings>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <IdleSettings>
-      <Duration>PT10M</Duration>
-      <WaitTimeout>PT1H</WaitTimeout>
-      <StopOnIdleEnd>true</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-  </Settings>
-  <Triggers>
-    <LogonTrigger />
-  </Triggers>
-  <Actions Context="Author">
-    <Exec>
-      <Command>$escapedWscript</Command>
-      <Arguments>//B //Nologo &quot;$escapedLauncher&quot;</Arguments>
-      <WorkingDirectory>$escapedDirectory</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>
-"@
-
-[System.IO.File]::WriteAllText($xmlPath, $xml, [System.Text.Encoding]::Unicode)
-try {
-    & schtasks.exe /Create /TN $taskName /XML $xmlPath /F
-    if ($LASTEXITCODE -ne 0) {
-        throw "schtasks.exe failed with exit code $LASTEXITCODE"
-    }
-} finally {
-    Remove-Item -LiteralPath $xmlPath -Force -ErrorAction SilentlyContinue
+if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
+    throw "Required local executable was not found: $ExecutablePath"
 }
 
-schtasks.exe /Query /TN $taskName /FO LIST /V
+$resolvedExe = (Resolve-Path -LiteralPath $ExecutablePath -ErrorAction Stop).ProviderPath
+$registrationReceipt = Invoke-AppCommand -Executable $resolvedExe -Command '--register-agent'
+$verificationReceipt = Invoke-AppCommand -Executable $resolvedExe -Command '--verify-agent'
+
+[pscustomobject]@{
+    StartupRoute = '\MichStartupMaster\MichStartupMasterApp'
+    Executable = $resolvedExe
+    Arguments = '--agent'
+    RegistrationReceipt = $registrationReceipt
+    VerificationReceipt = $verificationReceipt
+} | Format-List

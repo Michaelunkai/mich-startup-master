@@ -15,10 +15,14 @@ build/*
 dist/
 
 # Runtime-generated logs/temp
+.freebuff/
 *.log
 *.tmp
 *.cache
 artifacts/runtime-output/*
+artifacts/build-staging/
+artifacts/portable/
+artifacts/pre-overhaul-*/
 artifacts/proof/*.png
 _preview_screen.html
 

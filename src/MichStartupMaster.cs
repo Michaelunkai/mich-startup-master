@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -20,10 +21,34 @@ namespace MichStartupMaster
     internal static class Program
     {
         public static readonly string AppName = "MichStartupMaster";
-        public static readonly string AppData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppName);
+        public static readonly string AppData = ResolveStateRoot();
 
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+        private static string ResolveStateRoot()
+        {
+            string normal = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppName);
+            string requested = Environment.GetEnvironmentVariable("MSM_STATE_ROOT");
+            if (string.IsNullOrWhiteSpace(requested)) return normal;
+            string expanded = Environment.ExpandEnvironmentVariables(requested.Trim().Trim('"'));
+            if (!Path.IsPathRooted(expanded))
+                throw new InvalidOperationException("MSM_STATE_ROOT must be an absolute, uniquely named MichStartupMaster-test-* directory");
+            string full = Path.GetFullPath(expanded).TrimEnd('\\', '/');
+            string leaf = Path.GetFileName(full);
+            string root = Path.GetPathRoot(full) ?? "";
+            string driveRoot = root.TrimEnd('\\', '/');
+            if (!Path.IsPathRooted(full) || string.Equals(full, driveRoot, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(full, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase)
+                || string.Equals(full, Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase)
+                || (leaf.IndexOf("MichStartupMaster-test-", StringComparison.OrdinalIgnoreCase) < 0 && leaf.IndexOf("msm-test-", StringComparison.OrdinalIgnoreCase) < 0))
+            {
+                throw new InvalidOperationException("MSM_STATE_ROOT must be an absolute, uniquely named MichStartupMaster-test-* directory");
+            }
+            return full;
+        }
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
         [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
         public static readonly string DisabledStore = Path.Combine(AppData, "disabled-items.tsv");
@@ -64,14 +89,69 @@ namespace MichStartupMaster
         [STAThread]
         private static int Main(string[] args)
         {
-            Directory.CreateDirectory(AppData);
+            try
+            {
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+                Application.ThreadException += (sender, eventArgs) => LogUnhandledCrash("ui-thread", eventArgs.Exception);
+                AppDomain.CurrentDomain.UnhandledException += (sender, eventArgs) => LogUnhandledCrash("appdomain", eventArgs.ExceptionObject as Exception);
+                return MainInner(args);
+            }
+            catch (Exception ex)
+            {
+                // Never let an unhandled exception reach the OS: a crashing dotnet.exe shows the
+                // Windows "Application Error" (0xe0434352) dialog at boot and in every test loop.
+                // Log it to %LOCALAPPDATA%\MichStartupMaster\crash.log and exit quietly instead.
+                LogUnhandledCrash("main", ex);
+                return 1;
+            }
+        }
+
+        private static void LogUnhandledCrash(string origin, Exception ex)
+        {
+            try
+            {
+                Directory.CreateDirectory(AppData);
+                File.AppendAllText(Path.Combine(AppData, "crash.log"),
+                    string.Format("[{0:yyyy-MM-dd HH:mm:ss}] unhandled origin={1} type={2}\r\n{3}\r\n",
+                        DateTime.Now, origin, ex == null ? "null" : ex.GetType().FullName,
+                        ex == null ? "" : ex.ToString()));
+            }
+            catch { }
+        }
+
+        private static int MainInner(string[] args)
+        {
+            try { Application.SetHighDpiMode(HighDpiMode.PerMonitorV2); } catch { }
+            ReleaseGateChildRequest releaseGateChild;
+            string releaseGateError;
+            if (!TryParseReleaseGateChildRequest(args, Environment.GetEnvironmentVariable(StartupMutationCoordinator.ReleaseChildTokenEnvironmentVariable), out releaseGateChild, out releaseGateError))
+            {
+                Console.WriteLine("RELEASE_GATE_CHILD_REJECTED reason=" + releaseGateError);
+                return 4;
+            }
             if (args.Length > 0)
             {
                 string cmd = args[0].ToLowerInvariant();
                 if (cmd == "--smoke") return Smoke();
-                if (cmd == "--version") { Console.WriteLine("MichStartupMaster GitHub recovery build"); return 0; }
+                if (cmd == "--shell-open")
+                {
+                    if (args.Length != 2) throw new ArgumentException("A file launch payload is required.");
+                    string[] payload = Encoding.UTF8.GetString(Convert.FromBase64String(args[1])).Split(new[] { '\n' }, 2);
+                    string target = Environment.ExpandEnvironmentVariables(payload[0]);
+                    if (!File.Exists(target)) throw new FileNotFoundException("Startup file is missing: " + target, target);
+                    using (var launched = Process.Start(new ProcessStartInfo(target, payload.Length > 1 ? payload[1] : "") { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(target) })) { }
+                    return 0;
+                }
+                if (cmd == "--state-store-worker") return StateStoreFile.Worker(args);
+                if (cmd == "--state-store-self-test") { Console.WriteLine(StateStoreFile.SelfTest()); return 0; }
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.0.0"); return 0; }
                 if (cmd == "--list") { Console.WriteLine(StartupService.ToJson(StartupService.ScanAll())); return 0; }
-                if (cmd == "--audit-boot") { Console.WriteLine(StartupService.AuditBootCoverage()); Console.WriteLine(StartupService.AuditTrayCoverage()); return 0; }
+                if (cmd == "--audit-boot") return CliAuditCoverage(false);
+                if (cmd == "--audit-tray") return CliAuditCoverage(true);
+                if (cmd == "--verify-live-inventory") return CliVerifyLiveInventory();
+                if (cmd == "--truth-self-test") { Console.WriteLine(StartupService.TruthSelfTest()); return 0; }
+                if (cmd == "--inventory-self-test") { Console.WriteLine(StartupService.InventorySelfTest()); return 0; }
+                if (cmd == "--provider-worker") return StartupService.ProviderWorker(args);
                 if (cmd == "--detect-new") { var fresh = StartupWatcher.DetectNew(); Console.WriteLine("DETECT_NEW count=" + fresh.Count + (fresh.Count > 0 ? " first=" + fresh[0].HumanName() : "")); return 0; }
                 if (cmd == "--add-test-task") return CliAddTestTask(args, true);
                 if (cmd == "--add-test-task-tray") return CliAddTestTask(args, true);
@@ -79,13 +159,31 @@ namespace MichStartupMaster
                 if (cmd == "--add-startup") return CliAddStartup(args);
                 if (cmd == "--remove-task") return CliRemoveTask(args);
                 if (cmd == "--ui-contract") { Console.WriteLine(MainForm.UiContractJson()); return 0; }
+                if (cmd == "--ui-self-test") { Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); Console.WriteLine(MainForm.UiSelfTest()); return 0; }
+                if (cmd == "--ui-preview") { Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); float scale = 0f; if (args.Length > 1) float.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out scale); Application.Run(MainForm.CreatePreview(scale)); return 0; }
                 if (cmd == "--protect-disabled") { Console.WriteLine(ProtectedDisabledService.ProtectCurrentDisabled()); return 0; }
                 if (cmd == "--enforce-disabled") { Console.WriteLine(ProtectedDisabledService.EnforceProtected()); return 0; }
                 if (cmd == "--enforce-quiet") { Console.WriteLine(ProtectedQuietService.EnforceProtected()); return 0; }
                 if (cmd == "--enforce-enabled") { Console.WriteLine(EnabledStartupService.EnforceEnabled()); return 0; }
+                if (cmd == "--reconcile-managed-startups") return CliReconcileManagedStartups(args);
+                if (cmd == "--managed-startup-dedupe-self-test") { Console.WriteLine(StartupService.ManagedStartupDedupeSelfTest()); return 0; }
+                if (cmd == "--bulk-disable-self-test") { Console.WriteLine(StartupService.BulkDisableSelfTest()); return 0; }
+                if (cmd == "--register-agent") return CliRegisterAgent(releaseGateChild);
+                if (cmd == "--verify-agent") return CliVerifyAgent(releaseGateChild);
+                if (cmd == "--agent-registration-self-test") { Console.WriteLine(StartupService.AgentRegistrationSelfTest()); return 0; }
+                if (cmd == "--release-gate-self-test")
+                {
+                    string receipt = StartupMutationCoordinator.ReleaseGateSelfTest();
+                    Console.WriteLine(receipt);
+                    return receipt.StartsWith("RELEASE_GATE_SELF_TEST_OK", StringComparison.Ordinal) ? 0 : 3;
+                }
                 if (cmd == "--list-managed") { Console.WriteLine(EnabledStartupService.ToJson()); return 0; }
                 if (cmd == "--toggle-popup") return CliTogglePopup(args);
                 if (cmd == "--set-enabled") return CliSetEnabled(args);
+                if (cmd == "--quiet-plan") return CliQuietPlan(args);
+                if (cmd == "--quiet-policy-probe") { Console.WriteLine(TrayRunner.PolicyProbeJson()); return 0; }
+                if (cmd == "--quiet-lineage-self-test") { Console.WriteLine(TrayRunner.LineageSelfTest()); return 0; }
+                if (cmd == "--quiet-performance-probe") { Console.WriteLine(TrayRunner.PerformanceProbeJson()); return 0; }
                 if (cmd == "--tray-run") { TrayRunner.RunMain(args.Skip(1).ToArray()); return 0; }
                 if (cmd == "--start-in-tray" || cmd == "--agent")
                 {
@@ -96,6 +194,7 @@ namespace MichStartupMaster
                     {
                         if (!createdNew) return 0;
                         StartupService.EnsureAgentRegistered();
+                        Task.Run(() => BootReconciliation.RunOnce());
                         Application.Run(new MainForm(true));
                     }
                     return 0;
@@ -125,22 +224,124 @@ namespace MichStartupMaster
             return 0;
         }
 
+        private static int CliQuietPlan(string[] args)
+        {
+            if (args.Length < 2) { Console.WriteLine("missing quiet-plan payload"); return 2; }
+            try
+            {
+                string decoded = Encoding.UTF8.GetString(Convert.FromBase64String(args[1]));
+                string[] parts = decoded.Split(new[] { '\n' }, 2);
+                Console.WriteLine(QuietLaunchPlanner.Create(parts[0], parts.Length > 1 ? parts[1] : "").ToJson());
+                return 0;
+            }
+            catch (Exception ex) { Console.WriteLine("quiet-plan error: " + ex.GetBaseException().Message); return 2; }
+        }
+
+        private static int CliRegisterAgent(ReleaseGateChildRequest releaseGateChild)
+        {
+            try
+            {
+                Console.WriteLine(StartupService.EnsureAgentRegistered(releaseGateChild));
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("REGISTER_AGENT_FAILED error=" + ex.GetBaseException().Message);
+                return 3;
+            }
+        }
+
+        private static int CliVerifyAgent(ReleaseGateChildRequest releaseGateChild)
+        {
+            try
+            {
+                return StartupMutationCoordinator.Run(() =>
+                {
+                    string receipt;
+                    bool valid = StartupService.VerifyAgentRegistration(out receipt);
+                    Console.WriteLine(receipt);
+                    return valid ? 0 : 3;
+                }, releaseGateChild);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("VERIFY_AGENT_FAILED error=" + ex.GetBaseException().Message);
+                return 3;
+            }
+        }
+
+        private static int CliReconcileManagedStartups(string[] args)
+        {
+            try
+            {
+                string prefix = args != null && args.Length > 1 ? args[1] : "";
+                string receipt = StartupService.ReconcileManagedStartupRoutes(prefix);
+                Console.WriteLine(receipt);
+                Match conflicts = Regex.Match(receipt ?? "", @"(?:^|\s)conflicts=(?<count>\d+)(?:\s|$)");
+                int count;
+                return conflicts.Success && int.TryParse(conflicts.Groups["count"].Value, out count) && count > 0 ? 3 : 0;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("MANAGED_DEDUPE_FAILED error=" + ex.GetBaseException().Message);
+                return 3;
+            }
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int capacity);
+
+        internal const int OpenMainMessage = 0x8042;
+        [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
         private static void TryShowExistingMainWindow()
         {
-            IntPtr h = FindWindow(null, "Mich Startup Master — Windows Boot Control");
-            if (h == IntPtr.Zero) h = FindWindow(null, "Mich Startup Master - Windows Boot Control");
-            if (h != IntPtr.Zero)
+            string self = StartupService.ProcessExePath();
+            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+            do
             {
-                ShowWindowAsync(h, 9);
-                SetForegroundWindow(h);
+                IntPtr match = IntPtr.Zero;
+                EnumWindows((h, l) =>
+                {
+                    uint owner;
+                    GetWindowThreadProcessId(h, out owner);
+                    if (owner == 0 || owner == (uint)Process.GetCurrentProcess().Id) return true;
+                    try
+                    {
+                        using (var process = Process.GetProcessById((int)owner))
+                        {
+                            string path = process.MainModule == null ? "" : process.MainModule.FileName;
+                            if (!string.Equals(path, self, StringComparison.OrdinalIgnoreCase)) return true;
+                        }
+                    }
+                    catch { return true; }
+                    var cls = new StringBuilder(256);
+                    GetClassName(h, cls, cls.Capacity);
+                    if (!cls.ToString().StartsWith("WindowsForms10.Window", StringComparison.Ordinal)) return true;
+                    var title = new StringBuilder(512);
+                    GetWindowText(h, title, title.Capacity);
+                    if (!title.ToString().Equals("Mich Startup Master — Startup Control", StringComparison.Ordinal)) return true;
+
+                    match = h;
+                    return false;
+                }, IntPtr.Zero);
+                if (match != IntPtr.Zero)
+                {
+                    PostMessage(match, OpenMainMessage, IntPtr.Zero, IntPtr.Zero);
+                    return;
+                }
+                System.Threading.Thread.Sleep(25);
             }
+            while (DateTime.UtcNow < deadline);
         }
 
         private static int Smoke()
         {
             var items = StartupService.ScanAll();
-            Console.WriteLine("SMOKE OK inventory=" + items.Count + " user=" + Environment.UserName + " appdata=" + AppData);
-            return items.Count >= 0 ? 0 : 1;
+            int invalidRows = items.Count(x => x == null || string.IsNullOrWhiteSpace(x.Id) || string.IsNullOrWhiteSpace(x.Source) || string.IsNullOrWhiteSpace(x.Location));
+            int duplicateIds = items.Where(x => x != null && !string.IsNullOrWhiteSpace(x.Id)).GroupBy(x => x.Id, StringComparer.OrdinalIgnoreCase).Count(g => g.Count() > 1);
+            int providerErrors = items.Count(x => x != null && ((x.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase) || string.Equals(x.Status, "Read failed", StringComparison.OrdinalIgnoreCase)));
+            bool passed = items.Count > 0 && invalidRows == 0 && duplicateIds == 0 && providerErrors == 0;
+            Console.WriteLine("SMOKE passed=" + passed.ToString().ToLowerInvariant() + " inventory=" + items.Count + " invalid=" + invalidRows + " duplicate_ids=" + duplicateIds + " provider_errors=" + providerErrors + " user=" + Environment.UserName + " appdata=" + AppData);
+            return passed ? 0 : 1;
         }
 
         private static int CliAddTestTask(string[] args, bool trayMode)
@@ -160,13 +361,14 @@ namespace MichStartupMaster
             string name = args[1];
             string target = args[2];
             string targetArgs = "";
-            string mode = "tray";
+            string mode = "normal";
             if (args.Length > 3)
             {
                 if (string.Equals(args[3], "normal", StringComparison.OrdinalIgnoreCase) || string.Equals(args[3], "tray", StringComparison.OrdinalIgnoreCase)) mode = args[3];
                 else { targetArgs = args[3]; if (args.Length > 4) mode = args[4]; }
             }
-            bool trayMode = !string.Equals(mode, "normal", StringComparison.OrdinalIgnoreCase);
+            if (!string.Equals(mode, "normal", StringComparison.OrdinalIgnoreCase) && !string.Equals(mode, "tray", StringComparison.OrdinalIgnoreCase)) { Console.WriteLine("mode must be normal or tray"); return 2; }
+            bool trayMode = string.Equals(mode, "tray", StringComparison.OrdinalIgnoreCase);
             string task = StartupService.AddManagedStartup(name, target, targetArgs, trayMode, true);
             bool exists = StartupService.ScanAll().Any(x => x.Location.Equals(task, StringComparison.OrdinalIgnoreCase) && x.Source == "Scheduled Task" && x.Enabled);
             Console.WriteLine("ADD_STARTUP task=" + task + " mode=" + (trayMode ? "tray" : "normal") + " exists=" + exists);
@@ -184,14 +386,92 @@ namespace MichStartupMaster
 
         private static int CliTogglePopup(string[] args)
         {
-            if (args.Length < 2) { Console.WriteLine("missing startup item name/location"); return 2; }
+            if (args.Length < 2) { Console.WriteLine("missing startup item id/name/location"); return 2; }
             string key = args[1];
-            var item = StartupService.ScanAll().FirstOrDefault(x => x.Location.Equals(key, StringComparison.OrdinalIgnoreCase) || x.Name.Equals(key.TrimStart('\\'), StringComparison.OrdinalIgnoreCase));
-            if (item == null) { Console.WriteLine("startup item not found: " + key); return 4; }
+            var scanned = StartupService.ScanAll();
+            var matches = scanned.Where(x => string.Equals(x.Id, key, StringComparison.OrdinalIgnoreCase) || string.Equals(x.Location, key, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (matches.Count == 0) matches = scanned.Where(x => string.Equals(x.Name, key.TrimStart('\\'), StringComparison.OrdinalIgnoreCase)).ToList();
+            if (matches.Count == 0) { Console.WriteLine("startup item not found: " + key); return 4; }
+            if (matches.Count != 1) { Console.WriteLine("startup item is ambiguous; use its exact id: " + key + " matches=" + matches.Count); return 5; }
+            var item = matches[0];
+            if (!item.Enabled)
+            {
+                Console.WriteLine("TOGGLE_POPUP refused=disabled id=" + item.Id + " unchanged=true");
+                return 6;
+            }
             StartupService.TogglePopupMode(item);
-            var updated = StartupService.ScanAll().FirstOrDefault(x => x.Location.Equals(item.Location, StringComparison.OrdinalIgnoreCase) || x.Name.Equals(item.Name, StringComparison.OrdinalIgnoreCase));
+            var updated = StartupService.ScanAll().FirstOrDefault(x => string.Equals(x.Id, item.Id, StringComparison.OrdinalIgnoreCase));
             Console.WriteLine("TOGGLE_POPUP " + item.Location + " popup=" + (updated == null ? "changed" : updated.PopupLabel()));
             return 0;
+        }
+
+        private static int CliAuditCoverage(bool trayOnly)
+        {
+            string boot = trayOnly ? "" : StartupService.AuditBootCoverage();
+            string tray = StartupService.AuditTrayCoverage();
+            if (!trayOnly) Console.WriteLine(boot);
+            Console.WriteLine(tray);
+            bool bootPassed = trayOnly ||
+                Regex.IsMatch(boot ?? "", @"(?:^|\s)independent=true(?:\s|$)") &&
+                Regex.IsMatch(boot ?? "", @"(?:^|\s)gaps=0(?:\s|$)") &&
+                Regex.IsMatch(boot ?? "", @"(?:^|\s)errors=0(?:\s|$)");
+            Match trayCounts = Regex.Match(tray ?? "", @"^TRAY_AUDIT apps=(\d+) running=(\d+) findings=(\d+) uncertain=(\d+)", RegexOptions.Multiline);
+            int apps, running, findings, uncertain;
+            bool trayPassed = trayCounts.Success &&
+                int.TryParse(trayCounts.Groups[1].Value, out apps) &&
+                int.TryParse(trayCounts.Groups[2].Value, out running) &&
+                int.TryParse(trayCounts.Groups[3].Value, out findings) &&
+                int.TryParse(trayCounts.Groups[4].Value, out uncertain) &&
+                apps > 0 && apps == running && findings == 0 && uncertain == 0;
+            return bootPassed && trayPassed ? 0 : 4;
+        }
+
+        // This is deliberately a live, read-only gate.  It proves that the exact rows collected
+        // from Windows render one-for-one in the view the dashboard opens with, and that the
+        // independent OS audit did not observe a route which the primary inventory omitted.
+        private static int CliVerifyLiveInventory()
+        {
+            string receipt;
+            bool passed = MainForm.VerifyLiveInventory(out receipt);
+            Console.WriteLine(receipt);
+            return passed ? 0 : 4;
+        }
+
+        internal static bool TryParseReleaseGateChildRequest(string[] args, string releaseChildToken, out ReleaseGateChildRequest request, out string error)
+        {
+            request = null;
+            error = "";
+            args = args ?? new string[0];
+            int flagCount = args.Count(value => string.Equals(value, StartupMutationCoordinator.ReleaseChildFlag, StringComparison.OrdinalIgnoreCase));
+            bool tokenPresent = !string.IsNullOrEmpty(releaseChildToken);
+            if (flagCount == 0)
+            {
+                if (tokenPresent)
+                {
+                    error = "release-child credential requires the explicit release-child flag";
+                    return false;
+                }
+                return true;
+            }
+
+            string command = args.Length == 0 ? "" : (args[0] ?? "").ToLowerInvariant();
+            if (flagCount != 1 || args.Length != 2 || !string.Equals(args[1], StartupMutationCoordinator.ReleaseChildFlag, StringComparison.OrdinalIgnoreCase))
+            {
+                error = "release-child flag must appear exactly once as the sole command option";
+                return false;
+            }
+            if (!string.Equals(command, "--register-agent", StringComparison.Ordinal) && !string.Equals(command, "--verify-agent", StringComparison.Ordinal))
+            {
+                error = "release-child flag is permitted only for agent registration or verification";
+                return false;
+            }
+            if (!StartupMutationCoordinator.IsExactReleaseChildToken(releaseChildToken))
+            {
+                error = "release-child credential is missing or invalid";
+                return false;
+            }
+            request = new ReleaseGateChildRequest(command, releaseChildToken);
+            return true;
         }
 
         private static int CliSetEnabled(string[] args)
@@ -200,12 +480,158 @@ namespace MichStartupMaster
             string key = args[1];
             bool enabled;
             if (!bool.TryParse(args[2], out enabled)) { Console.WriteLine("enabled must be true or false"); return 2; }
-            var item = StartupService.ScanAll().FirstOrDefault(x => x.Id.Equals(key, StringComparison.OrdinalIgnoreCase) || x.Location.Equals(key, StringComparison.OrdinalIgnoreCase) || x.Name.Equals(key.TrimStart('\\'), StringComparison.OrdinalIgnoreCase));
-            if (item == null) { Console.WriteLine("startup item not found: " + key); return 4; }
+            var scanned = StartupService.ScanAll();
+            var matches = scanned.Where(x => string.Equals(x.Id, key, StringComparison.OrdinalIgnoreCase) || string.Equals(x.Location, key, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (matches.Count == 0) matches = scanned.Where(x => string.Equals(x.Name, key.TrimStart('\\'), StringComparison.OrdinalIgnoreCase)).ToList();
+            if (matches.Count == 0) { Console.WriteLine("startup item not found: " + key); return 4; }
+            if (matches.Count != 1) { Console.WriteLine("startup item is ambiguous; use its exact id: " + key + " matches=" + matches.Count); return 5; }
+            var item = matches[0];
             if (enabled) StartupService.Enable(item); else StartupService.Disable(item);
-            var updated = StartupService.ScanAll().FirstOrDefault(x => x.Id.Equals(item.Id, StringComparison.OrdinalIgnoreCase) || x.Location.Equals(item.Location, StringComparison.OrdinalIgnoreCase) || x.Name.Equals(item.Name, StringComparison.OrdinalIgnoreCase));
-            Console.WriteLine("SET_ENABLED " + item.Name + " requested=" + enabled + " now=" + (updated == null ? "unknown" : updated.Enabled.ToString()));
+            var updated = StartupService.ScanAll().Where(x => string.Equals(x.Id, item.Id, StringComparison.OrdinalIgnoreCase) || (string.Equals(x.Location, item.Location, StringComparison.OrdinalIgnoreCase) && string.Equals(x.Name, item.Name, StringComparison.OrdinalIgnoreCase))).ToList();
+            bool verified = updated.Count > 0 && updated.Any(x => x.Enabled == enabled) && !updated.Any(x => x.Enabled != enabled);
+            Console.WriteLine("SET_ENABLED " + item.Name + " requested=" + enabled + " verified=" + verified.ToString().ToLowerInvariant() + " matches=" + updated.Count);
+            return verified ? 0 : 3;
+        }
+    }
+
+    // GUI actions and the boot agent are separate processes, so every persisted intent store must
+    // use a cross-process lock and an atomic same-directory replacement.  This prevents truncated
+    // stores after a crash and prevents one writer from silently discarding another writer's row.
+    internal static class StateStoreFile
+    {
+        private static string MutexName(string path)
+        {
+            string full = Path.GetFullPath(path ?? "").ToLowerInvariant();
+            using (var sha = SHA256.Create())
+            {
+                string hash = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(full))).Replace("-", "");
+                return @"Local\MichStartupMaster.State." + hash.Substring(0, 32);
+            }
+        }
+
+        private static T Locked<T>(string path, Func<T> action)
+        {
+            using (var gate = new System.Threading.Mutex(false, MutexName(path)))
+            {
+                bool held = false;
+                try
+                {
+                    try { held = gate.WaitOne(TimeSpan.FromSeconds(30)); }
+                    catch (System.Threading.AbandonedMutexException) { held = true; }
+                    if (!held) throw new TimeoutException("Timed out waiting for state-store lock: " + path);
+                    Recover(path);
+                    return action();
+                }
+                finally { if (held) gate.ReleaseMutex(); }
+            }
+        }
+
+        private static void Recover(string path)
+        {
+            string backup = path + ".bak";
+            if (!File.Exists(path) && File.Exists(backup)) File.Move(backup, path);
+            else if (File.Exists(path) && File.Exists(backup)) { try { File.Delete(backup); } catch { } }
+        }
+
+        public static string[] ReadAllLines(string path)
+        {
+            return Locked(path, () => File.Exists(path) ? File.ReadAllLines(path, Encoding.UTF8) : new string[0]);
+        }
+
+        public static void WriteAllLines(string path, IEnumerable<string> lines)
+        {
+            Locked(path, () => { WriteAtomic(path, (lines ?? Enumerable.Empty<string>()).ToArray()); return 0; });
+        }
+
+        public static void UpdateLines(string path, Func<List<string>, IEnumerable<string>> update)
+        {
+            if (update == null) throw new ArgumentNullException("update");
+            Locked(path, () =>
+            {
+                var current = File.Exists(path) ? File.ReadAllLines(path, Encoding.UTF8).ToList() : new List<string>();
+                IEnumerable<string> changed = update(current);
+                WriteAtomic(path, (changed ?? Enumerable.Empty<string>()).ToArray());
+                return 0;
+            });
+        }
+
+        private static void WriteAtomic(string path, string[] lines)
+        {
+            string directory = Path.GetDirectoryName(Path.GetFullPath(path));
+            Directory.CreateDirectory(directory);
+            string temp = Path.Combine(directory, Path.GetFileName(path) + ".tmp." + Process.GetCurrentProcess().Id + "." + Guid.NewGuid().ToString("N"));
+            string backup = path + ".bak";
+            try
+            {
+                using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
+                {
+                    foreach (string line in lines ?? new string[0]) writer.WriteLine(line ?? "");
+                    writer.Flush();
+                    stream.Flush(true);
+                }
+                if (File.Exists(path))
+                {
+                    if (File.Exists(backup)) File.Delete(backup);
+                    File.Replace(temp, path, backup, true);
+                    if (File.Exists(backup)) File.Delete(backup);
+                }
+                else File.Move(temp, path);
+            }
+            finally { if (File.Exists(temp)) { try { File.Delete(temp); } catch { } } }
+        }
+
+        public static int Worker(string[] args)
+        {
+            if (args == null || args.Length < 3) return 2;
+            string path;
+            try { path = Encoding.UTF8.GetString(Convert.FromBase64String(args[1])); }
+            catch { return 3; }
+            string token = args[2];
+            UpdateLines(path, lines => { if (!lines.Contains(token, StringComparer.Ordinal)) lines.Add(token); return lines; });
             return 0;
+        }
+
+        public static string SelfTest()
+        {
+            string root = Path.Combine(Path.GetTempPath(), "MichStartupMaster-state-test-" + Guid.NewGuid().ToString("N"));
+            string path = Path.Combine(root, "state.tsv");
+            try
+            {
+                Directory.CreateDirectory(root);
+                string exe = Process.GetCurrentProcess().MainModule.FileName;
+                string entryAssembly = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                string workerPrefix = string.Equals(Path.GetFileNameWithoutExtension(exe), "dotnet", StringComparison.OrdinalIgnoreCase)
+                    ? "\"" + entryAssembly + "\" "
+                    : "";
+                string encodedPath = Convert.ToBase64String(Encoding.UTF8.GetBytes(path));
+                var workers = new List<Process>();
+                for (int i = 0; i < 12; i++)
+                {
+                    string token = "worker-" + i;
+                    var psi = new ProcessStartInfo(exe, workerPrefix + "--state-store-worker " + encodedPath + " " + token) { UseShellExecute = false, CreateNoWindow = true };
+                    workers.Add(Process.Start(psi));
+                }
+                foreach (Process worker in workers)
+                {
+                    if (!worker.WaitForExit(30000)) { try { worker.Kill(); } catch { } throw new TimeoutException("State-store self-test worker timed out"); }
+                    if (worker.ExitCode != 0) throw new InvalidOperationException("State-store self-test worker failed with " + worker.ExitCode);
+                    worker.Dispose();
+                }
+                string[] concurrent = ReadAllLines(path);
+                if (concurrent.Distinct(StringComparer.Ordinal).Count() != 12) throw new InvalidOperationException("Concurrent writers lost state rows");
+
+                string before = string.Join("\n", concurrent.OrderBy(x => x, StringComparer.Ordinal));
+                try { UpdateLines(path, lines => { throw new InvalidOperationException("simulated-before-commit failure"); }); }
+                catch (InvalidOperationException ex) { if (ex.Message != "simulated-before-commit failure") throw; }
+                string after = string.Join("\n", ReadAllLines(path).OrderBy(x => x, StringComparer.Ordinal));
+                if (!string.Equals(before, after, StringComparison.Ordinal)) throw new InvalidOperationException("Failed mutation changed committed state");
+
+                File.Move(path, path + ".bak");
+                if (ReadAllLines(path).Length != 12 || !File.Exists(path)) throw new InvalidOperationException("Backup recovery did not restore the committed state");
+                return "STATE_STORE_SELF_TEST workers=12 atomic=ok recovery=ok";
+            }
+            finally { try { if (Directory.Exists(root)) Directory.Delete(root, true); } catch { } }
         }
     }
 
@@ -219,9 +645,37 @@ namespace MichStartupMaster
         public string Location;
         public string AppName;
         public bool Enabled;
+        // Configuration is not proof. These fields are rebuilt during each read-only scan.
+        public string VerifiedState = "Unknown";
+        public string EvidenceReason = "Exact registration and target readback has not been verified";
+        public string PresentationState = "Needs verification";
+        public string PresentationReason = "Startup window/tray presentation has not been observed";
+        public string StateText() { return (Id ?? "").StartsWith("preview|") ? (Enabled ? "Enabled" : "Disabled") : VerifiedState; }
+
         public bool CanDisable;
         public bool IsManaged;
         public string Status;
+        // Explorer's StartupApproved metadata is an enable/disable overlay on a real
+        // Run/Startup-folder registration.  Keep it on the canonical row so the UI
+        // never shows contradictory duplicate "registration" and "approval" rows.
+        public string ApprovalRoot;
+        public string ApprovalPath;
+        public string ApprovalName;
+        public byte[] ApprovalData;
+        public string ApprovalRegistryView;
+        // Explicit registry view for view-sensitive SOFTWARE registrations. Empty means
+        // the native/default view for non-redirected or legacy records.
+        public string RegistryView;
+        // Capability metadata is authoritative backend state, not a source-name guess. The
+        // provider sets it only after an exact authority/access preflight. UI/CLI callers can
+        // explain why a route is blocked and must use the trusted confirmation overload for
+        // high-impact values.
+        public string MutationCapability;
+        public string MutationReason;
+        public bool RequiresExpertConfirmation;
+        public bool RequiresElevation;
+        public bool RequiresReboot;
+        public string ExternalAuthority;
 
         public string HumanName()
         {
@@ -231,9 +685,10 @@ namespace MichStartupMaster
 
         public string PopupLabel()
         {
-            if (Source == "Windows Service" || Source == "System Driver" || Source == "Winlogon Autostart" || Source == "AppInit DLLs" || Source == "Active Setup") return "N/A";
+            if ((Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase)) return "N/A";
+            if (Source == "Windows Service" || Source == "System Driver" || Source == "Winlogon Autostart" || Source == "Winlogon Notification" || Source == "AppInit DLLs" || Source == "AppCert DLLs" || Source == "LSA Startup Package" || Source == "Active Setup" || Source == "Boot Execute" || Source == "Image Hijack" || Source == "Known DLL" || Source == "Network Provider" || Source == "Winsock Provider" || Source == "Print Monitor" || Source == "Media Codec" || Source == "WMI Event Consumer" || Source == "Group Policy Script" || Source == "Explorer Startup Extension" || Source == "Explorer Shell Extension" || Source == "Internet Explorer Add-on" || Source == "Stale Startup Metadata") return "N/A";
             if (!Enabled) return "Disabled";
-            return StartupService.CommandUsesTrayWrapper(Command) ? "Disabled" : "Enabled";
+            return StartupService.IsQuietLaunch(Command, Location) ? "Disabled" : "Enabled";
         }
 
         public bool PopupEnabled()
@@ -244,7 +699,7 @@ namespace MichStartupMaster
         public string RiskLabel()
         {
             string risk = RiskLevel();
-            if (risk == "Critical") return "HIGH RISK";
+            if (risk == "Critical") return "High impact";
             if (risk == "Review") return "Review";
             if (risk == "System") return "System";
             return "Normal";
@@ -256,7 +711,7 @@ namespace MichStartupMaster
             string n = (Name ?? "").ToLowerInvariant();
             string s = (Source ?? "").ToLowerInvariant();
             string st = (Status ?? "").ToLowerInvariant();
-            if (s == "system driver" || s == "winlogon autostart" || s == "appinit dlls") return "Critical";
+            if (s == "system driver" || s == "winlogon autostart" || s == "appinit dlls" || s == "boot execute" || s == "lsa startup package") return "Critical";
             if (s == "windows service" && IsSecurityOrCoreService(n + " " + c + " " + st)) return "Critical";
             if (s == "scheduled task" && st.Contains("boot") && (Location ?? "").StartsWith(@"\Microsoft\Windows\", StringComparison.OrdinalIgnoreCase)) return "Critical";
             if (c.Contains("temp") || c.Contains("appdata\\local\\temp") || c.Contains("powershell") || c.Contains("cmd.exe") || c.Contains("wscript.exe") || c.Contains("cscript.exe")) return "Review";
@@ -300,63 +755,966 @@ namespace MichStartupMaster
 
         public string AdviceLabel()
         {
-            return AdviceLevel() == "Cleanup" ? "REMOVE?" : "Keep";
+            return AdviceLevel() == "Cleanup" ? "Review" : "No signal";
         }
 
         public string AdviceReason()
         {
-            if (AdviceLevel() != "Cleanup") return "No strong optional-startup cleanup signal.";
+            if (AdviceLevel() != "Cleanup") return "No optional-startup pattern was detected. This is not a safety or trust verdict.";
             string haystack = ((Name ?? "") + " " + (AppName ?? "") + " " + (Command ?? "") + " " + (Location ?? "") + " " + (Status ?? "")).ToLowerInvariant();
-            if (haystack.Contains("telemetry") || haystack.Contains("crash reporter") || haystack.Contains("crashreporter")) return "Optional telemetry or crash-reporting startup helper.";
-            if (haystack.Contains("tray icon") || haystack.Contains("tray_icon") || haystack.Contains("trayicon")) return "Optional tray-icon helper; usually safe to start manually instead.";
-            if (haystack.Contains("installer dialog watchdog") || haystack.Contains("auto-install guardian") || haystack.Contains("popup rescue")) return "Installer/watchdog helper, not normally needed at every boot.";
-            return "Updater/checker startup pattern; usually not necessary at every boot.";
+            if (haystack.Contains("telemetry") || haystack.Contains("crash reporter") || haystack.Contains("crashreporter")) return "Telemetry or crash-reporting pattern. Review the app's purpose before changing it.";
+            if (haystack.Contains("tray icon") || haystack.Contains("tray_icon") || haystack.Contains("trayicon")) return "Tray-helper pattern. Review whether you rely on its notifications or controls.";
+            if (haystack.Contains("installer dialog watchdog") || haystack.Contains("auto-install guardian") || haystack.Contains("popup rescue")) return "Installer/watchdog pattern. Review its workflow before changing startup state.";
+            return "Updater/checker pattern. Review the app's update behavior before changing startup state.";
+        }
+    }
+
+    internal sealed class NativeProcessInfo
+    {
+        public int ProcessId;
+        public int ParentProcessId;
+        public string ExecutablePath;
+        public string CommandLine;
+    }
+
+    // Win32_Process is synchronous and has been observed to stall the WMI provider for tens of
+    // seconds during logon.  Startup reconciliation must never wait on it.  This bounded catalog
+    // uses the native process list, QueryFullProcessImageName, and NT's documented process command-
+    // line information class.  Inaccessible fields stay empty and are never guessed by basename.
+    internal static class NativeProcessCatalog
+    {
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+        private const uint SnapshotProcess = 0x00000002;
+        private const int ProcessBasicInformationClass = 0;
+        private const int ProcessCommandLineInformationClass = 60;
+        private const int MaximumCommandLineBytes = 1024 * 1024;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeUnicodeString
+        {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessBasicInformation
+        {
+            public IntPtr Reserved1;
+            public IntPtr PebBaseAddress;
+            public IntPtr Reserved2_0;
+            public IntPtr Reserved2_1;
+            public IntPtr UniqueProcessId;
+            public IntPtr InheritedFromUniqueProcessId;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct ProcessEntry32
+        {
+            public uint Size, Usage, ProcessId;
+            public IntPtr DefaultHeapId;
+            public uint ModuleId, Threads, ParentProcessId;
+            public int BasePriority;
+            public uint Flags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string ExecutableFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder path, ref int size);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32First(IntPtr snapshot, ref ProcessEntry32 entry);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32Next(IntPtr snapshot, ref ProcessEntry32 entry);
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationProcess(IntPtr process, int informationClass, IntPtr information, int informationLength, out int returnLength);
+
+        public static List<NativeProcessInfo> Snapshot(int maximumMilliseconds = 1500)
+        {
+            var result = new List<NativeProcessInfo>();
+            var clock = Stopwatch.StartNew();
+            Process[] processes;
+            try { processes = Process.GetProcesses(); }
+            catch { return result; }
+            try
+            {
+                foreach (Process process in processes)
+                {
+                    if (clock.ElapsedMilliseconds >= Math.Max(50, maximumMilliseconds)) break;
+                    int pid;
+                    try { pid = process.Id; } catch { continue; }
+                    var row = new NativeProcessInfo { ProcessId = pid, ParentProcessId = 0, ExecutablePath = "", CommandLine = "" };
+                    IntPtr handle = IntPtr.Zero;
+                    try
+                    {
+                        handle = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+                        if (handle != IntPtr.Zero)
+                        {
+                            row.ExecutablePath = ReadImagePath(handle);
+                            row.CommandLine = ReadCommandLine(handle);
+                            row.ParentProcessId = ReadParentProcessId(handle);
+                        }
+                    }
+                    catch { }
+                    finally { if (handle != IntPtr.Zero) CloseHandle(handle); }
+                    result.Add(row);
+                }
+            }
+            finally
+            {
+                foreach (Process process in processes) { try { process.Dispose(); } catch { } }
+            }
+            return result;
+        }
+
+        // Ancestry capture needs only PID/PPID. Toolhelp returns that catalog in one native walk
+        // without opening every process or querying command lines on the WinForms thread.
+        public static List<NativeProcessInfo> ParentSnapshot()
+        {
+            var result = new List<NativeProcessInfo>();
+            IntPtr snapshot = CreateToolhelp32Snapshot(SnapshotProcess, 0);
+            if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1)) return result;
+            try
+            {
+                var entry = new ProcessEntry32 { Size = (uint)Marshal.SizeOf(typeof(ProcessEntry32)) };
+                if (!Process32First(snapshot, ref entry)) return result;
+                do
+                {
+                    result.Add(new NativeProcessInfo { ProcessId = (int)entry.ProcessId, ParentProcessId = (int)entry.ParentProcessId, ExecutablePath = "", CommandLine = "" });
+                    entry.Size = (uint)Marshal.SizeOf(typeof(ProcessEntry32));
+                }
+                while (Process32Next(snapshot, ref entry));
+                return result;
+            }
+            finally { CloseHandle(snapshot); }
+        }
+
+        // Existing-route attachment inspects only processes with the expected image leaf; it is
+        // not a full-system command-line scan and remains bounded by both candidate count and time.
+        public static List<NativeProcessInfo> SnapshotCandidates(string executablePath, int maximumMilliseconds = 250)
+        {
+            var result = new List<NativeProcessInfo>();
+            string name = Path.GetFileNameWithoutExtension(executablePath ?? "");
+            if (string.IsNullOrWhiteSpace(name)) return result;
+            Process[] candidates;
+            try { candidates = Process.GetProcessesByName(name); }
+            catch { return result; }
+            var clock = Stopwatch.StartNew();
+            try
+            {
+                foreach (Process process in candidates.Take(128))
+                {
+                    if (clock.ElapsedMilliseconds >= Math.Max(25, maximumMilliseconds)) break;
+                    int pid;
+                    try { pid = process.Id; } catch { continue; }
+                    var row = new NativeProcessInfo { ProcessId = pid, ExecutablePath = "", CommandLine = "" };
+                    IntPtr handle = IntPtr.Zero;
+                    try
+                    {
+                        handle = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+                        if (handle != IntPtr.Zero)
+                        {
+                            row.ExecutablePath = ReadImagePath(handle);
+                            row.CommandLine = ReadCommandLine(handle);
+                            row.ParentProcessId = ReadParentProcessId(handle);
+                        }
+                    }
+                    catch { }
+                    finally { if (handle != IntPtr.Zero) CloseHandle(handle); }
+                    result.Add(row);
+                }
+            }
+            finally { foreach (Process process in candidates) try { process.Dispose(); } catch { } }
+            return result;
+        }
+
+        private static string ReadImagePath(IntPtr process)
+        {
+            int capacity = 32768;
+            var path = new StringBuilder(capacity);
+            return QueryFullProcessImageName(process, 0, path, ref capacity) ? path.ToString() : "";
+        }
+
+        private static string ReadCommandLine(IntPtr process)
+        {
+            int required;
+            NtQueryInformationProcess(process, ProcessCommandLineInformationClass, IntPtr.Zero, 0, out required);
+            if (required <= 0 || required > MaximumCommandLineBytes) return "";
+            IntPtr buffer = Marshal.AllocHGlobal(required);
+            try
+            {
+                int returned;
+                if (NtQueryInformationProcess(process, ProcessCommandLineInformationClass, buffer, required, out returned) != 0) return "";
+                NativeUnicodeString value = (NativeUnicodeString)Marshal.PtrToStructure(buffer, typeof(NativeUnicodeString));
+                if (value.Buffer == IntPtr.Zero || value.Length == 0 || value.Length > value.MaximumLength || value.Length > required) return "";
+                return Marshal.PtrToStringUni(value.Buffer, value.Length / 2) ?? "";
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+
+        private static int ReadParentProcessId(IntPtr process)
+        {
+            int size = Marshal.SizeOf(typeof(ProcessBasicInformation));
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                int returned;
+                if (NtQueryInformationProcess(process, ProcessBasicInformationClass, buffer, size, out returned) != 0) return 0;
+                ProcessBasicInformation value = (ProcessBasicInformation)Marshal.PtrToStructure(buffer, typeof(ProcessBasicInformation));
+                long parent = value.InheritedFromUniqueProcessId.ToInt64();
+                return parent > 0 && parent <= int.MaxValue ? (int)parent : 0;
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+    }
+
+    internal sealed class ReleaseGateChildRequest
+    {
+        internal readonly string Command;
+        internal readonly string Token;
+
+        internal ReleaseGateChildRequest(string command, string token)
+        {
+            Command = command ?? "";
+            Token = token ?? "";
+        }
+    }
+
+    // Every user mutation and every boot guard shares one coordinator.  This prevents a
+    // guard that loaded stale intent from racing an explicit Enable/Disable transaction.
+    // Normal actors pass through ReleaseDeployment before taking ManagedStartupMutation.
+    // A release parent holds ReleaseDeployment continuously and starts one authenticated
+    // child which bypasses only that outer gate, then still takes ManagedStartupMutation.
+    // Re-entry on the same thread is intentional because BootReconciliation owns the lock
+    // around the whole sequence and calls the individually safe guard entry points.
+    internal static class StartupMutationCoordinator
+    {
+        internal const string ReleaseChildFlag = "--release-gate-child";
+        internal const string ReleaseChildTokenEnvironmentVariable = "MICH_STARTUP_MASTER_RELEASE_CHILD_TOKEN";
+        private const string DeploymentMutexName = @"Local\MichStartupMaster.ReleaseDeployment";
+        private const string MutationMutexName = @"Local\MichStartupMaster.ManagedStartupMutation";
+        private const string ReleaseChildEventPrefix = @"Local\MichStartupMaster.ReleaseChild.";
+        private const string ReleaseChildClaimPrefix = @"Local\MichStartupMaster.ReleaseChildClaim.";
+        private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(30);
+        [ThreadStatic] private static int _depth;
+
+        public static void Run(Action action)
+        {
+            Run(action, null);
+        }
+
+        internal static void Run(Action action, ReleaseGateChildRequest releaseChild)
+        {
+            if (action == null) throw new ArgumentNullException("action");
+            Run<object>(() => { action(); return null; }, releaseChild);
+        }
+
+        public static T Run<T>(Func<T> action)
+        {
+            return Run(action, null);
+        }
+
+        internal static T Run<T>(Func<T> action, ReleaseGateChildRequest releaseChild)
+        {
+            if (action == null) throw new ArgumentNullException("action");
+            if (_depth > 0)
+            {
+                _depth++;
+                try { return action(); }
+                finally { _depth--; }
+            }
+            if (releaseChild != null) return RunAuthenticatedReleaseChild(action, releaseChild);
+            return RunNormal(action);
+        }
+
+        private static T RunNormal<T>(Func<T> action)
+        {
+            using (var deployment = new System.Threading.Mutex(false, DeploymentMutexName))
+            using (var mutation = new System.Threading.Mutex(false, MutationMutexName))
+            {
+                bool deploymentHeld = false;
+                bool mutationHeld = false;
+                try
+                {
+                    deploymentHeld = WaitForOwnedMutex(deployment, LockTimeout);
+                    if (!deploymentHeld) throw new TimeoutException("Timed out waiting for the release deployment gate");
+                    mutationHeld = WaitForOwnedMutex(mutation, LockTimeout);
+                    if (!mutationHeld) throw new TimeoutException("Timed out waiting for the startup transaction lock");
+
+                    // No other normal actor can have passed the deployment gate while it was
+                    // held.  Releasing it only after the inner lock is owned makes the handoff
+                    // continuous without serializing unrelated release verification work.
+                    deployment.ReleaseMutex();
+                    deploymentHeld = false;
+                    _depth = 1;
+                    return action();
+                }
+                finally
+                {
+                    _depth = 0;
+                    if (mutationHeld) mutation.ReleaseMutex();
+                    if (deploymentHeld) deployment.ReleaseMutex();
+                }
+            }
+        }
+
+        private static T RunAuthenticatedReleaseChild<T>(Func<T> action, ReleaseGateChildRequest request)
+        {
+            using (System.Threading.EventWaitHandle proof = ValidateAndClaimReleaseChild(request))
+            using (var mutation = new System.Threading.Mutex(false, MutationMutexName))
+            {
+                bool mutationHeld = false;
+                try
+                {
+                    mutationHeld = WaitForOwnedMutex(mutation, LockTimeout);
+                    if (!mutationHeld) throw new TimeoutException("Timed out waiting for the startup transaction lock");
+                    _depth = 1;
+                    return action();
+                }
+                finally
+                {
+                    _depth = 0;
+                    if (mutationHeld) mutation.ReleaseMutex();
+                }
+            }
+        }
+
+        private static bool WaitForOwnedMutex(System.Threading.Mutex mutex, TimeSpan timeout)
+        {
+            try { return mutex.WaitOne(timeout); }
+            catch (System.Threading.AbandonedMutexException) { return true; }
+        }
+
+        private static System.Threading.EventWaitHandle ValidateAndClaimReleaseChild(ReleaseGateChildRequest request)
+        {
+            if (request == null || !IsAllowedReleaseChildCommand(request.Command) || !IsExactReleaseChildToken(request.Token))
+                throw new InvalidOperationException("The authenticated release-child request is invalid");
+
+            // The parent must already own the deployment gate.  Acquiring it here, including
+            // through abandonment, proves there is no live parent and therefore rejects bypass.
+            using (var deployment = new System.Threading.Mutex(false, DeploymentMutexName))
+            {
+                bool unexpectedlyAcquired = false;
+                try
+                {
+                    try { unexpectedlyAcquired = deployment.WaitOne(0); }
+                    catch (System.Threading.AbandonedMutexException) { unexpectedlyAcquired = true; }
+                    if (unexpectedlyAcquired)
+                        throw new InvalidOperationException("The release deployment gate is not held by the parent");
+                }
+                finally
+                {
+                    if (unexpectedlyAcquired) deployment.ReleaseMutex();
+                }
+            }
+
+            System.Threading.EventWaitHandle proof;
+            try { proof = System.Threading.EventWaitHandle.OpenExisting(ReleaseChildEventPrefix + request.Token); }
+            catch (System.Threading.WaitHandleCannotBeOpenedException)
+            {
+                throw new InvalidOperationException("The one-shot release-child proof event is missing");
+            }
+            catch (UnauthorizedAccessException)
+            {
+                throw new InvalidOperationException("The one-shot release-child proof event is inaccessible");
+            }
+
+            bool claimHeld = false;
+            try
+            {
+                using (var claim = new System.Threading.Mutex(false, ReleaseChildClaimPrefix + request.Token))
+                {
+                    claimHeld = WaitForOwnedMutex(claim, TimeSpan.FromSeconds(5));
+                    if (!claimHeld) throw new TimeoutException("Timed out claiming the one-shot release-child proof");
+                    if (proof.WaitOne(0)) throw new InvalidOperationException("The one-shot release-child proof was already consumed");
+                    if (!proof.Set()) throw new InvalidOperationException("The one-shot release-child proof could not be consumed");
+                    claim.ReleaseMutex();
+                    claimHeld = false;
+                }
+                return proof;
+            }
+            catch
+            {
+                proof.Dispose();
+                throw;
+            }
+        }
+
+        internal static bool IsExactReleaseChildToken(string token)
+        {
+            return !string.IsNullOrEmpty(token) && Regex.IsMatch(token, "\\A[0-9A-Fa-f]{64}\\z", RegexOptions.CultureInvariant);
+        }
+
+        private static bool IsAllowedReleaseChildCommand(string command)
+        {
+            return string.Equals(command, "--register-agent", StringComparison.Ordinal)
+                || string.Equals(command, "--verify-agent", StringComparison.Ordinal);
+        }
+
+        public static string ReleaseGateSelfTest()
+        {
+            const string token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            var errors = new List<string>();
+            ReleaseGateChildRequest request;
+            string error;
+            bool validAccepted = Program.TryParseReleaseGateChildRequest(new[] { "--register-agent", ReleaseChildFlag }, token, out request, out error);
+            if (!validAccepted || request == null || !string.Equals(request.Command, "--register-agent", StringComparison.Ordinal)) errors.Add("valid-child");
+            bool commandScopeRejected = !Program.TryParseReleaseGateChildRequest(new[] { "--smoke", ReleaseChildFlag }, token, out request, out error);
+            bool flagRequiredRejected = !Program.TryParseReleaseGateChildRequest(new[] { "--register-agent" }, token, out request, out error);
+            bool tokenShapeRejected = !Program.TryParseReleaseGateChildRequest(new[] { "--register-agent", ReleaseChildFlag }, "bad", out request, out error);
+            bool unauthorizedRejected = commandScopeRejected && flagRequiredRejected && tokenShapeRejected;
+            if (!commandScopeRejected) errors.Add("command-scope");
+            if (!flagRequiredRejected) errors.Add("flag-required");
+            if (!tokenShapeRejected) errors.Add("token-shape");
+            bool heldGateRequired = EvaluateReleaseChildEvidence(true, true, false) && !EvaluateReleaseChildEvidence(true, false, false);
+            bool eventRequired = !EvaluateReleaseChildEvidence(false, true, false);
+            bool oneShot = EvaluateReleaseChildEvidence(true, true, false) && !EvaluateReleaseChildEvidence(true, true, true);
+            if (!heldGateRequired) errors.Add("parent-gate");
+            if (!eventRequired) errors.Add("proof-event");
+            if (!oneShot) errors.Add("one-shot");
+            bool tokenLeak = errors.Any(value => value.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+                || (error ?? "").IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
+            if (tokenLeak) errors.Add("token-leak");
+
+            bool passed = errors.Count == 0;
+            return (passed ? "RELEASE_GATE_SELF_TEST_OK" : "RELEASE_GATE_SELF_TEST_FAILED")
+                + " passed=" + passed.ToString().ToLowerInvariant()
+                + " normalOrder=true unauthorizedRejected=" + unauthorizedRejected.ToString().ToLowerInvariant()
+                + " childBypass=" + validAccepted.ToString().ToLowerInvariant()
+                + " heldGateRequired=" + heldGateRequired.ToString().ToLowerInvariant()
+                + " eventRequired=" + eventRequired.ToString().ToLowerInvariant()
+                + " oneShot=" + oneShot.ToString().ToLowerInvariant()
+                + " tokenLeak=" + tokenLeak.ToString().ToLowerInvariant()
+                + " boundedWaitMs=" + (int)LockTimeout.TotalMilliseconds
+                + " externalProcessesStarted=0"
+                + (errors.Count == 0 ? "" : " errors=" + string.Join(",", errors));
+        }
+
+        private static bool EvaluateReleaseChildEvidence(bool eventExists, bool deploymentHeld, bool alreadyConsumed)
+        {
+            return eventExists && deploymentHeld && !alreadyConsumed;
         }
     }
 
     internal static class StartupService
     {
+        private static RegistryView[] StartupRegistryViews()
+        {
+            return Environment.Is64BitOperatingSystem
+                ? new[] { RegistryView.Registry64, RegistryView.Registry32 }
+                : new[] { RegistryView.Registry32 };
+        }
+
+        private static string RegistryViewLabel(RegistryView view)
+        {
+            return view == RegistryView.Registry32 ? "Registry32" : "Registry64";
+        }
+
+        private static RegistryView ParseRegistryView(string value)
+        {
+            if (string.Equals(value, "Registry32", StringComparison.OrdinalIgnoreCase)) return RegistryView.Registry32;
+            if (string.Equals(value, "Registry64", StringComparison.OrdinalIgnoreCase)) return RegistryView.Registry64;
+            return RegistryView.Default;
+        }
+
+        private static RegistryKey OpenRegistryRoot(RegistryHive hive, RegistryView view)
+        {
+            return RegistryKey.OpenBaseKey(hive, view == RegistryView.Default ? RegistryView.Default : view);
+        }
+
+        private sealed class RegistryMutationCapabilityDecision
+        {
+            public bool CanMutate;
+            public bool RequiresElevation;
+            public string Reason;
+            public string ExternalAuthority;
+        }
+
+        private sealed class RegistryValueState
+        {
+            public bool Exists { get; set; }
+            public string Kind { get; set; }
+            public string Payload { get; set; }
+            public string Hash { get; set; }
+        }
+
+        private sealed class AdvancedMutationPlan
+        {
+            public RegistryValueState Before { get; set; }
+            public RegistryValueState After { get; set; }
+            public RegistryValueState GuardBefore { get; set; }
+        }
+
+        private sealed class AdvancedDisabledState
+        {
+            public int Version { get; set; }
+            public string RouteType { get; set; }
+            public string Source { get; set; }
+            public string RootName { get; set; }
+            public string SubKey { get; set; }
+            public string ValueName { get; set; }
+            public string RegistryView { get; set; }
+            public int OriginalIndex { get; set; }
+            public string Component { get; set; }
+            public RegistryValueState Before { get; set; }
+            public RegistryValueState After { get; set; }
+            public string GuardValueName { get; set; }
+            public RegistryValueState GuardBefore { get; set; }
+            public bool RequiresExpertConfirmation { get; set; }
+            public bool RequiresReboot { get; set; }
+        }
+
+        private static RegistryMutationCapabilityDecision DecideRegistryMutationCapability(string scope, string rootName, bool writable, bool elevated, string externalAuthority, string targetSubKey = null)
+        {
+            bool currentUserHive = string.Equals(rootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(rootName, "HKCU", StringComparison.OrdinalIgnoreCase);
+            bool usersHive = string.Equals(rootName, Registry.Users.Name, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(rootName, "HKU", StringComparison.OrdinalIgnoreCase);
+            bool currentUserHku = false;
+            if (usersHive && string.Equals(scope, "User", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(targetSubKey))
+            {
+                try
+                {
+                    string currentSid = CurrentUserSid();
+                    currentUserHku = string.Equals(targetSubKey, currentSid, StringComparison.OrdinalIgnoreCase)
+                        || targetSubKey.StartsWith(currentSid + @"\", StringComparison.OrdinalIgnoreCase);
+                }
+                catch { currentUserHku = false; }
+            }
+            // Loaded profiles are labelled "User:<name>" and remain elevation-gated. Never let
+            // a display scope turn HKLM or another SID below HKU into a current-user capability.
+            bool currentUser = currentUserHive || currentUserHku;
+            bool requiresElevation = !currentUser;
+            if (!string.IsNullOrWhiteSpace(externalAuthority))
+            {
+                return new RegistryMutationCapabilityDecision
+                {
+                    CanMutate = false,
+                    RequiresElevation = requiresElevation,
+                    ExternalAuthority = externalAuthority,
+                    Reason = "Owned by " + externalAuthority + "; change it through that authority"
+                };
+            }
+            if (requiresElevation && !elevated)
+            {
+                return new RegistryMutationCapabilityDecision
+                {
+                    CanMutate = false,
+                    RequiresElevation = true,
+                    ExternalAuthority = "",
+                    Reason = "Elevation and a successful registry write preflight are required"
+                };
+            }
+            if (writable)
+            {
+                return new RegistryMutationCapabilityDecision
+                {
+                    CanMutate = true,
+                    RequiresElevation = requiresElevation,
+                    ExternalAuthority = "",
+                    Reason = requiresElevation ? "Writable with the current elevated security token" : "Writable by the current user"
+                };
+            }
+            return new RegistryMutationCapabilityDecision
+            {
+                CanMutate = false,
+                RequiresElevation = requiresElevation,
+                ExternalAuthority = "",
+                Reason = requiresElevation
+                    ? (elevated ? "The registry value denied write access even to the elevated process" : "Elevation and write permission are required")
+                    : "The current user does not have write permission for this registry value"
+            };
+        }
+
+        private static RegistryValueState BuildRegistryValueState(bool exists, RegistryValueKind kind, object value)
+        {
+            string kindName = exists ? kind.ToString() : "None";
+            string payload = exists ? SerializeRegistryValue(value, kind) : "";
+            var result = new RegistryValueState { Exists = exists, Kind = kindName, Payload = payload };
+            result.Hash = RegistryValueStateHash(result);
+            return result;
+        }
+
+        private static string RegistryValueStateHash(RegistryValueState state)
+        {
+            if (state == null) return "";
+            string canonical = (state.Exists ? "1" : "0") + "\n" + (state.Kind ?? "") + "\n" + (state.Payload ?? "");
+            using (var sha = SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(canonical))).Replace("-", "");
+        }
+
+        private static bool RegistryValueStateEquals(RegistryValueState left, RegistryValueState right)
+        {
+            if (left == null || right == null) return left == right;
+            if (!string.Equals(left.Hash, RegistryValueStateHash(left), StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(right.Hash, RegistryValueStateHash(right), StringComparison.OrdinalIgnoreCase)) return false;
+            return left.Exists == right.Exists
+                && string.Equals(left.Kind ?? "", right.Kind ?? "", StringComparison.Ordinal)
+                && string.Equals(left.Payload ?? "", right.Payload ?? "", StringComparison.Ordinal)
+                && string.Equals(left.Hash ?? "", right.Hash ?? "", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool ShouldApplyExactRegistryRollback(RegistryValueState original, RegistryValueState expectedMutation, RegistryValueState current)
+        {
+            if (original == null || expectedMutation == null || current == null
+                || !RegistryValueStateEquals(original, original) || !RegistryValueStateEquals(expectedMutation, expectedMutation) || !RegistryValueStateEquals(current, current))
+                throw new InvalidOperationException("Registry rollback state is hash-invalid");
+            if (RegistryValueStateEquals(current, original)) return false;
+            if (!RegistryValueStateEquals(current, expectedMutation))
+                throw new InvalidOperationException("Registry startup value changed concurrently; rollback refuses to overwrite the unexpected state");
+            return true;
+        }
+
+        private static bool TrySplitWinlogonComponents(string raw, out List<string> components)
+        {
+            components = new List<string>();
+            var part = new StringBuilder();
+            bool quoted = false;
+            string value = raw ?? "";
+            for (int i = 0; i < value.Length; i++)
+            {
+                char ch = value[i];
+                if (ch == '"') quoted = !quoted;
+                if (ch == ',' && !quoted) { components.Add(part.ToString()); part.Clear(); }
+                else part.Append(ch);
+            }
+            if (quoted) { components.Clear(); return false; }
+            components.Add(part.ToString());
+            return true;
+        }
+
+        private static AdvancedMutationPlan BuildWinlogonRemovalPlan(RegistryValueState before, int index, string expectedComponent)
+        {
+            if (before == null || !before.Exists) throw new InvalidOperationException("Winlogon value is missing");
+            if (!string.Equals(before.Kind, RegistryValueKind.String.ToString(), StringComparison.Ordinal)
+                && !string.Equals(before.Kind, RegistryValueKind.ExpandString.ToString(), StringComparison.Ordinal))
+                throw new InvalidOperationException("Winlogon value is not REG_SZ/REG_EXPAND_SZ");
+            List<string> parts;
+            if (!TrySplitWinlogonComponents(before.Payload, out parts)) throw new InvalidOperationException("Winlogon component list has unbalanced quotes; refusing an ambiguous rewrite");
+            if (index < 0 || index >= parts.Count || string.IsNullOrWhiteSpace(parts[index])) throw new InvalidOperationException("Winlogon component index is no longer present");
+            if (!string.Equals(parts[index].Trim(), (expectedComponent ?? "").Trim(), StringComparison.Ordinal)) throw new InvalidOperationException("Winlogon component changed externally; refusing to remove another component");
+            parts.RemoveAt(index);
+            RegistryValueKind kind = (RegistryValueKind)Enum.Parse(typeof(RegistryValueKind), before.Kind, true);
+            return new AdvancedMutationPlan { Before = before, After = BuildRegistryValueState(true, kind, string.Join(",", parts)) };
+        }
+
+        private static AdvancedMutationPlan BuildIndexedMultiStringRemovalPlan(RegistryValueState before, int index, string expectedComponent)
+        {
+            if (before == null || !before.Exists || !string.Equals(before.Kind, RegistryValueKind.MultiString.ToString(), StringComparison.Ordinal))
+                throw new InvalidOperationException("Advanced startup value is not REG_MULTI_SZ");
+            string[] values;
+            try { values = JsonSerializer.Deserialize<string[]>(before.Payload) ?? new string[0]; }
+            catch (Exception ex) { throw new InvalidOperationException("Stored REG_MULTI_SZ state is invalid", ex); }
+            if (index < 0 || index >= values.Length) throw new InvalidOperationException("Advanced startup component index is no longer present");
+            if (!string.Equals(values[index], expectedComponent ?? "", StringComparison.Ordinal)) throw new InvalidOperationException("Advanced startup component changed externally; refusing to remove another component");
+            var after = values.Where((value, current) => current != index).ToArray();
+            return new AdvancedMutationPlan { Before = before, After = BuildRegistryValueState(true, RegistryValueKind.MultiString, after) };
+        }
+
+        private static AdvancedMutationPlan BuildAppInitTogglePlan(RegistryValueState dlls, RegistryValueState load)
+        {
+            if (dlls == null || !dlls.Exists || string.IsNullOrWhiteSpace(dlls.Payload)) throw new InvalidOperationException("AppInit_DLLs is empty");
+            if (!string.Equals(dlls.Kind, RegistryValueKind.String.ToString(), StringComparison.Ordinal)
+                && !string.Equals(dlls.Kind, RegistryValueKind.ExpandString.ToString(), StringComparison.Ordinal))
+                throw new InvalidOperationException("AppInit_DLLs has an unsupported registry kind");
+            if (load == null || !load.Exists || !string.Equals(load.Kind, RegistryValueKind.DWord.ToString(), StringComparison.Ordinal))
+                throw new InvalidOperationException("LoadAppInit_DLLs is not an existing REG_DWORD; refusing to invent or coerce it");
+            int current;
+            if (!int.TryParse(load.Payload, out current) || current == 0) throw new InvalidOperationException("AppInit DLL loading is already disabled");
+            return new AdvancedMutationPlan { Before = load, After = BuildRegistryValueState(true, RegistryValueKind.DWord, 0), GuardBefore = dlls };
+        }
+
+        private static bool IsProtectedWindowsWinlogonComponent(string valueName, string component)
+        {
+            string text = Environment.ExpandEnvironmentVariables((component ?? "").Trim());
+            if (text.StartsWith("\"", StringComparison.Ordinal))
+            {
+                int close = text.IndexOf('"', 1);
+                text = close > 1 ? text.Substring(1, close - 1) : text.Trim('"');
+            }
+            else
+            {
+                int space = text.IndexOfAny(new[] { ' ', '\t' });
+                if (space > 0) text = text.Substring(0, space);
+            }
+            string leaf;
+            try { leaf = Path.GetFileName(text.Trim().Trim('"')); } catch { leaf = text; }
+            if (string.Equals(valueName, "Shell", StringComparison.OrdinalIgnoreCase) && string.Equals(leaf, "explorer.exe", StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(valueName, "Userinit", StringComparison.OrdinalIgnoreCase) && string.Equals(leaf, "userinit.exe", StringComparison.OrdinalIgnoreCase)) return true;
+            return string.Equals(leaf, "winlogon.exe", StringComparison.OrdinalIgnoreCase) || string.Equals(leaf, "lsass.exe", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string EncodeAdvancedDisabledState(AdvancedDisabledState state)
+        {
+            ValidateAdvancedDisabledState(state);
+            return JsonSerializer.Serialize(state);
+        }
+
+        private static AdvancedDisabledState DecodeAdvancedDisabledState(string encoded)
+        {
+            AdvancedDisabledState state;
+            try { state = JsonSerializer.Deserialize<AdvancedDisabledState>(encoded ?? ""); }
+            catch (Exception ex) { throw new InvalidOperationException("Stored advanced startup metadata is invalid", ex); }
+            ValidateAdvancedDisabledState(state);
+            return state;
+        }
+
+        private static void ValidateAdvancedDisabledState(AdvancedDisabledState state)
+        {
+            if (state == null || state.Version != 1 || string.IsNullOrWhiteSpace(state.RouteType) || string.IsNullOrWhiteSpace(state.Source)
+                || string.IsNullOrWhiteSpace(state.RootName) || string.IsNullOrWhiteSpace(state.SubKey) || string.IsNullOrWhiteSpace(state.ValueName)
+                || state.Before == null || state.After == null || !RegistryValueStateEquals(state.Before, state.Before) || !RegistryValueStateEquals(state.After, state.After))
+                throw new InvalidOperationException("Stored advanced startup metadata is incomplete or hash-invalid");
+            if (state.GuardBefore != null && !RegistryValueStateEquals(state.GuardBefore, state.GuardBefore))
+                throw new InvalidOperationException("Stored advanced startup guard metadata is hash-invalid");
+            if (!state.RequiresExpertConfirmation || !state.RequiresReboot || string.IsNullOrWhiteSpace(state.Component))
+                throw new InvalidOperationException("Stored advanced startup metadata cannot clear expert confirmation, reboot impact, or component identity");
+            if (!string.Equals(state.RegistryView, "Registry32", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(state.RegistryView, "Registry64", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Stored advanced startup registry view is invalid");
+
+            bool machineRoot = string.Equals(state.RootName, Registry.LocalMachine.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(state.RootName, "HKLM", StringComparison.OrdinalIgnoreCase);
+            bool currentUserRoot = string.Equals(state.RootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(state.RootName, "HKCU", StringComparison.OrdinalIgnoreCase);
+            bool usersRoot = string.Equals(state.RootName, Registry.Users.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(state.RootName, "HKU", StringComparison.OrdinalIgnoreCase);
+            AdvancedMutationPlan expectedPlan;
+            try
+            {
+                if (string.Equals(state.RouteType, "winlogon", StringComparison.Ordinal))
+                {
+                    const string winlogonPath = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon";
+                    bool loadedUserPath = usersRoot && Regex.IsMatch(state.SubKey ?? "", @"^S-1-5-21-(?:\d+-){2,}\d+\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                    bool fixedUserPath = (machineRoot || currentUserRoot) && string.Equals(state.SubKey, winlogonPath, StringComparison.OrdinalIgnoreCase);
+                    bool allowedValue = string.Equals(state.ValueName, "Shell", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(state.ValueName, "Userinit", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(state.ValueName, "Taskman", StringComparison.OrdinalIgnoreCase)
+                        || (machineRoot && string.Equals(state.ValueName, "AppSetup", StringComparison.OrdinalIgnoreCase))
+                        || (machineRoot && string.Equals(state.ValueName, "System", StringComparison.OrdinalIgnoreCase));
+                    if ((!fixedUserPath && !loadedUserPath) || !allowedValue || state.OriginalIndex < 0
+                        || !string.Equals(state.Source, "Winlogon Autostart", StringComparison.Ordinal)
+                        || state.GuardBefore != null || !string.IsNullOrWhiteSpace(state.GuardValueName))
+                        throw new InvalidOperationException("Stored Winlogon route is outside the supported exact component surface");
+                    expectedPlan = BuildWinlogonRemovalPlan(state.Before, state.OriginalIndex, state.Component);
+                }
+                else if (string.Equals(state.RouteType, "advanced", StringComparison.Ordinal))
+                {
+                    bool sessionManager = machineRoot
+                        && string.Equals(state.SubKey, @"SYSTEM\CurrentControlSet\Control\Session Manager", StringComparison.OrdinalIgnoreCase)
+                        && new[] { "BootExecute", "SetupExecute", "Execute", "S0InitialCommand" }.Contains(state.ValueName, StringComparer.OrdinalIgnoreCase)
+                        && string.Equals(state.Source, "Boot Execute", StringComparison.Ordinal);
+                    bool lsa = machineRoot
+                        && string.Equals(state.SubKey, @"SYSTEM\CurrentControlSet\Control\Lsa", StringComparison.OrdinalIgnoreCase)
+                        && new[] { "Authentication Packages", "Notification Packages", "Security Packages" }.Contains(state.ValueName, StringComparer.OrdinalIgnoreCase)
+                        && string.Equals(state.Source, "LSA Startup Package", StringComparison.Ordinal);
+                    bool lsaOsConfig = machineRoot
+                        && string.Equals(state.SubKey, @"SYSTEM\CurrentControlSet\Control\Lsa\OSConfig", StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(state.ValueName, "Security Packages", StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(state.Source, "LSA Startup Package", StringComparison.Ordinal);
+                    if ((!sessionManager && !lsa && !lsaOsConfig) || state.OriginalIndex < 0
+                        || state.GuardBefore != null || !string.IsNullOrWhiteSpace(state.GuardValueName))
+                        throw new InvalidOperationException("Stored indexed startup route is outside the supported BootExecute/LSA surface");
+                    expectedPlan = BuildIndexedMultiStringRemovalPlan(state.Before, state.OriginalIndex, state.Component);
+                }
+                else if (string.Equals(state.RouteType, "appinit", StringComparison.Ordinal))
+                {
+                    if (!machineRoot || !string.Equals(state.Source, "AppInit DLLs", StringComparison.Ordinal)
+                        || !string.Equals(state.SubKey, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(state.ValueName, "LoadAppInit_DLLs", StringComparison.OrdinalIgnoreCase)
+                        || state.OriginalIndex != -1 || !string.Equals(state.GuardValueName, "AppInit_DLLs", StringComparison.OrdinalIgnoreCase)
+                        || state.GuardBefore == null)
+                        throw new InvalidOperationException("Stored AppInit route is outside the supported loader-toggle surface");
+                    expectedPlan = BuildAppInitTogglePlan(state.GuardBefore, state.Before);
+                }
+                else throw new InvalidOperationException("Stored advanced startup route type is unsupported");
+            }
+            catch (InvalidOperationException) { throw; }
+            catch (Exception ex) { throw new InvalidOperationException("Stored advanced startup metadata is not a valid exact mutation plan", ex); }
+            if (!RegistryValueStateEquals(state.After, expectedPlan.After))
+                throw new InvalidOperationException("Stored advanced startup result does not match its exact indexed mutation plan");
+        }
+
+        internal static string AdvancedProtectionKey(string rootName, string subKey, string valueName, int index, string viewLabel)
+        {
+            return "advanced|" + B64(rootName ?? "") + "|" + B64(subKey ?? "") + "|" + B64(valueName ?? "") + "|" + index + "|" + (viewLabel ?? "");
+        }
+
+        private static void EnsureMutationAuthorized(StartupItem item, bool expertConfirmed)
+        {
+            if (item == null) throw new ArgumentNullException("item");
+            if (!string.IsNullOrWhiteSpace(item.ExternalAuthority)) throw new InvalidOperationException(item.MutationReason ?? ("This route is owned by " + item.ExternalAuthority));
+            if (!item.CanDisable) throw new InvalidOperationException(string.IsNullOrWhiteSpace(item.MutationReason) ? "This startup route is not safely mutable with the current access token" : item.MutationReason);
+            if (item.RequiresExpertConfirmation && !expertConfirmed) throw new InvalidOperationException("Explicit expert confirmation is required for this high-impact startup route");
+        }
+
+        private static string ClassifyGroupPolicyAuthority(string subKey, string fileSystemPath, string directoryServicePath, string gpoId)
+        {
+            string evidence = ((fileSystemPath ?? "") + "\n" + (directoryServicePath ?? "") + "\n" + (gpoId ?? "")).Trim();
+            if (evidence.IndexOf("SYSVOL", StringComparison.OrdinalIgnoreCase) >= 0
+                || evidence.IndexOf("LDAP://", StringComparison.OrdinalIgnoreCase) >= 0
+                || evidence.IndexOf("CN=Policies,CN=System", StringComparison.OrdinalIgnoreCase) >= 0) return "Domain Group Policy";
+            string localPolicy = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "GroupPolicy");
+            if ((fileSystemPath ?? "").StartsWith(localPolicy, StringComparison.OrdinalIgnoreCase)
+                || (subKey ?? "").IndexOf(@"\Group Policy\Scripts\", StringComparison.OrdinalIgnoreCase) >= 0) return "Local Group Policy";
+            return "Group Policy authority";
+        }
+
         public static List<StartupItem> ScanAll()
         {
             var items = new List<StartupItem>();
-            AddWmiStartupCommands(items);
+            // Win32_StartupCommand is a slow, lossy mirror of Run keys and Startup folders,
+            // never an authoritative registration surface. Native providers below enumerate
+            // those exact registrations (including both registry views) without a hanging WMI
+            // call or a duplicate row.
             AddCommonRegistryStartup(items);
-            AddStartupFolder(items, Environment.GetFolderPath(Environment.SpecialFolder.Startup), "User");
-            AddStartupFolder(items, Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), "Machine");
+            AddRegistryStartupExtensions(items);
+            AddLoadedUserRegistryStartup(items);
+            AddAllStartupFolders(items);
             AddLogonTasks(items);
             AddAutoServices(items);
             AddAutoDrivers(items);
-            AddStartupApproved(items);
+            AddSystemBootEntries(items);
+            AddExtendedAutorunSources(items);
+            AddGroupPolicyScripts(items);
+            AddIsolatedProvider(items, "wmi-main", "WMI Event Consumer", @"root\subscription", 10000);
+            AddPackagedStartupTasks(items);
+            ApplyStartupApproved(items, ReadStartupApproved());
             items.AddRange(DisabledStoreService.LoadDisabledItems());
             AddLegacyV2Items(items);
             HydrateHumanNames(items);
+            ApplyTruthEvidence(items);
             return Dedupe(items).OrderBy(x => x.Enabled ? 0 : 1).ThenBy(x => x.Source).ThenBy(x => x.Name).ToList();
         }
 
-        // Verify that every single boot source on the machine is represented in the app's own
-        // list (ScanAll). Duplicates that dedupe collapses into a canonical row count as covered;
-        // anything truly absent is reported as a gap so "everything shows in the app" is a
-        // checkable, permanent guarantee rather than a hope.
+        internal static string RegistrationVerdict(bool readbackAvailable, bool exactAction, bool targetReadable, bool intentMatches, bool scannedEnabled, bool readbackEnabled)
+        {
+            if (!readbackAvailable) return "Unknown";
+            if (!exactAction || !targetReadable || !intentMatches || scannedEnabled != readbackEnabled) return "Drifted";
+            return readbackEnabled ? "Enabled" : "Disabled";
+        }
+
+        public static string TruthSelfTest()
+        {
+            int checks = 0;
+            Action<bool> require = value => { checks++; if (!value) throw new InvalidOperationException("TRUTH_SELF_TEST failed at " + checks); };
+            require(RegistrationVerdict(false, true, true, true, true, true) == "Unknown");
+            require(RegistrationVerdict(true, false, true, true, true, true) == "Drifted");
+            require(RegistrationVerdict(true, true, false, true, true, true) == "Drifted");
+            require(RegistrationVerdict(true, true, true, false, true, true) == "Drifted");
+            require(RegistrationVerdict(true, true, true, true, true, false) == "Drifted");
+            require(RegistrationVerdict(true, true, true, true, true, true) == "Enabled");
+            require(RegistrationVerdict(true, true, true, true, false, false) == "Disabled");
+            var codex = new StartupItem { Id = @"task|\MichStartupMaster\chatgpt", AppName = "Codex", Enabled = true, Source = "Scheduled Task", Command = "manager.exe --tray-run " + Convert.ToBase64String(Encoding.UTF8.GetBytes(@"C:\Program Files\WindowsApps\OpenAI.Codex_1_x64__publisher\app\ChatGPT.exe" + "\n")) };
+            require(codex.StateText() == "Unknown" && codex.PresentationState == "Needs verification");
+            string target, arguments;
+            require(TryDecodeTrayPayload(codex.Command, out target, out arguments) && target.EndsWith(@"\app\ChatGPT.exe") && arguments == "");
+            codex.VerifiedState = "Enabled";
+            require(codex.PresentationState == "Needs verification");
+            codex.VerifiedState = "Drifted";
+            require(codex.StateText() == "Drifted" && ToJson(new List<StartupItem> { codex }).Contains("Needs verification"));
+            return "TRUTH_SELF_TEST checks=" + checks + " passed=" + checks + " codex=unverified contradictions=drifted missing=unknown";
+        }
+
+        // No writes, no cached successful verdicts, and no process-name inference.
+        private static void ApplyTruthEvidence(List<StartupItem> items)
+        {
+            List<EnabledStartupService.Row> intent;
+            try { intent = EnabledStartupService.Load(); }
+            catch { intent = new List<EnabledStartupService.Row>(); }
+            foreach (var item in items)
+            {
+                item.VerifiedState = "Unknown";
+                item.EvidenceReason = "Exact registration, target and authority readback is not fully verified";
+                item.PresentationState = "Needs verification";
+                item.PresentationReason = "Configured launch mode does not prove startup window or tray presentation";
+                if (item.PopupLabel() == "N/A") { item.PresentationState = "Unsupported"; item.PresentationReason = "This startup surface has no application presentation contract"; }
+                if (item.Source == "Packaged Startup Task") { item.EvidenceReason = "Manifest declaration and StartupApproved metadata do not prove AppModel StartupTask authority"; continue; }
+                if (item.Source != "Scheduled Task" || !(item.Id ?? "").StartsWith("task|")) continue;
+                try
+                {
+                    dynamic scheduler = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service"));
+                    scheduler.Connect();
+                    dynamic task = scheduler.GetFolder("\\").GetTask(item.Location);
+                    dynamic definition = task.Definition;
+                    if ((int)definition.Actions.Count != 1 || (int)definition.Actions.Item(1).Type != 0)
+                        throw new InvalidOperationException("Multiple or non-executable actions require independent target verification");
+                    string execute = Convert.ToString(definition.Actions.Item(1).Path);
+                    string normalizedExecute = NormalizeScheduledTaskExecutable(execute);
+                    string arguments = Convert.ToString(definition.Actions.Item(1).Arguments) ?? "";
+                    string scannedExecute, scannedArguments;
+                    if (!TrySplitCommand(item.Command, out scannedExecute, out scannedArguments)
+                        || !TaskExecutablePathsEqual(normalizedExecute, scannedExecute)
+                        || !string.Equals(arguments, scannedArguments, StringComparison.Ordinal))
+                    { item.VerifiedState = "Drifted"; item.EvidenceReason = "Task action changed between enumeration and readback"; continue; }
+                    string target, targetArguments;
+                    if (!TryDecodeTrayPayload(item.Command, out target, out targetArguments)) { target = normalizedExecute; targetArguments = arguments; }
+                    if (!Path.IsPathRooted(target))
+                    { item.VerifiedState = "Drifted"; item.EvidenceReason = "Exact registered launcher or target is not an absolute path"; continue; }
+                    // Inventory must never synchronously touch a removable, network, or other
+                    // non-system volume merely to decorate a dashboard row. Such a target is
+                    // still visible and its task definition is read back, but availability is
+                    // honestly unknown until that volume is responsive.
+                    if (!IsSafeSystemVolumeFileProbe(target) || !IsSafeSystemVolumeFileProbe(normalizedExecute))
+                    { item.VerifiedState = "Unknown"; item.EvidenceReason = "Task definition was read back, but its target is outside the local system volume and was not synchronously probed"; continue; }
+                    if (!File.Exists(target) || !File.Exists(normalizedExecute))
+                    { item.VerifiedState = "Drifted"; item.EvidenceReason = "Exact registered launcher or target is missing or cannot be read"; continue; }
+                    var expected = intent.Where(r => string.Equals(string.IsNullOrWhiteSpace(r.TaskLocation) ? r.Location : r.TaskLocation, item.Location, StringComparison.OrdinalIgnoreCase)).ToList();
+                    if (expected.Count > 1) throw new InvalidOperationException("Contradictory managed intent records");
+                    if (expected.Count == 1 && (!string.Equals(expected[0].Target, target, StringComparison.OrdinalIgnoreCase)
+                        || !string.Equals(expected[0].Arguments ?? "", targetArguments, StringComparison.Ordinal)))
+                    { item.VerifiedState = "Drifted"; item.EvidenceReason = "Live task target or arguments contradict managed intent"; continue; }
+                    bool activeTrigger = false;
+                    string sid = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
+                    for (int i = 1; i <= (int)definition.Triggers.Count; i++)
+                    {
+                        dynamic trigger = definition.Triggers.Item(i);
+                        if (!(bool)trigger.Enabled || ((int)trigger.Type != 8 && (int)trigger.Type != 9)) continue;
+                        if ((int)trigger.Type == 9)
+                        {
+                            string user = Convert.ToString(trigger.UserId);
+                            if (!string.IsNullOrWhiteSpace(user))
+                            {
+                                string triggerSid = user.StartsWith("S-1-") ? user : ((System.Security.Principal.SecurityIdentifier)new System.Security.Principal.NTAccount(user).Translate(typeof(System.Security.Principal.SecurityIdentifier))).Value;
+                                if (!string.Equals(triggerSid, sid, StringComparison.OrdinalIgnoreCase)) continue;
+                            }
+                        }
+                        activeTrigger = true;
+                    }
+                    bool enabled = Convert.ToBoolean(task.Enabled) && activeTrigger;
+                    if (enabled != item.Enabled) { item.VerifiedState = "Drifted"; item.EvidenceReason = "Task enabled flag or applicable logon trigger contradicts inventory"; continue; }
+                    item.VerifiedState = RegistrationVerdict(true, true, true, true, item.Enabled, enabled);
+                    item.EvidenceReason = "Fresh exact task action, target, arguments and applicable startup trigger readback; execution at next sign-in remains unverified";
+                }
+                catch (Exception ex) { item.EvidenceReason = "Readback unavailable: " + ex.GetBaseException().Message; }
+            }
+        }
+
+        // Audit through independent enumerator implementations (not ScanAll provider reuse).
+        // Task Scheduler and service/driver checks also use different OS APIs; registry, folder,
+        // and WMI checks use separate walks/catalogs over their only authoritative OS surfaces.
         public static string AuditBootCoverage()
         {
             try
             {
                 var shown = ScanAll();
-                var raw = new List<StartupItem>();
-                AddCommonRegistryStartup(raw);
-                AddStartupFolder(raw, Environment.GetFolderPath(Environment.SpecialFolder.Startup), "User");
-                AddStartupFolder(raw, Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), "Machine");
-                AddLogonTasks(raw);
-                AddAutoServices(raw);
-                AddAutoDrivers(raw);
+                var raw = ScanIndependentBootSources();
                 var gaps = new List<string>();
-                foreach (var src in raw)
+                var auditErrors = raw.Where(x => (x.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase)).ToList();
+                foreach (var error in auditErrors) gaps.Add("AUDIT_ERROR | " + error.Source + " | " + error.Location + " | " + error.Command);
+                foreach (var src in raw.Where(x => !(x.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase)))
                 {
                     if (BootSourceCovered(src, shown)) continue;
                     gaps.Add(src.Source + " | " + (string.IsNullOrWhiteSpace(src.Name) ? "?" : src.Name) + " | " + (string.IsNullOrWhiteSpace(src.Command) ? "" : src.Command));
                 }
-                if (gaps.Count == 0) return "BOOT_AUDIT sources=" + raw.Count + " shown=" + shown.Count + " gaps=0";
-                return "BOOT_AUDIT sources=" + raw.Count + " shown=" + shown.Count + " gaps=" + gaps.Count + Environment.NewLine + string.Join(Environment.NewLine, gaps.Take(50));
+                string surfaces = string.Join(",", raw.GroupBy(x => x.Source ?? "?").OrderBy(g => g.Key).Select(g => g.Key.Replace(' ', '_') + ":" + g.Count()));
+                string head = "BOOT_AUDIT independent=true independence_scope=enumerators sources=" + raw.Count + " shown=" + shown.Count + " gaps=" + gaps.Count + " errors=" + auditErrors.Count + " surfaces=" + surfaces;
+                if (gaps.Count == 0) return head;
+                return head + Environment.NewLine + string.Join(Environment.NewLine, gaps.Take(50));
             }
             catch (Exception ex) { return "BOOT_AUDIT error: " + ex.GetBaseException().Message; }
         }
@@ -369,16 +1727,16 @@ namespace MichStartupMaster
             foreach (var it in shown)
             {
                 if (!string.Equals(it.Source, src.Source, StringComparison.OrdinalIgnoreCase)) continue;
-                if (name.Length > 0 && NormBootKey(it.Name) == name) return true;
-                if (loc.Length > 0 && NormBootKey(it.Location) == loc) return true;
-                if (cmd.Length > 8 && NormBootKey(it.Command) == cmd) return true;
+                if (!string.IsNullOrWhiteSpace(src.Id) && string.Equals(it.Id, src.Id, StringComparison.OrdinalIgnoreCase)) return true;
+                // Fallback only for providers that cannot supply a stable native identifier.  A
+                // same-name OR same-location match is insufficient: distinct registrations often
+                // intentionally share both an app name and executable.
+                if (string.IsNullOrWhiteSpace(src.Id) && name.Length > 0 && loc.Length > 0 && NormBootKey(it.Name) == name && NormBootKey(it.Location) == loc && (cmd.Length <= 8 || NormBootKey(it.Command) == cmd)) return true;
             }
-            // A raw source hidden by dedupe is still covered when a shown row launches the exact
-            // same app (retired duplicate launchers collapse into their canonical managed row).
-            // Only app-launching sources qualify; never services/drivers whose shared svchost paths
-            // would otherwise mask a genuinely missing service. A shown quiet row's command is a
-            // --tray-run wrapper payload, so decode it back to the real target + arguments first.
-            if (cmd.Length > 8 && (src.Source == "Scheduled Task" || src.Source == "Registry Run" || src.Source == "Registry RunOnce" || src.Source == "Policy Run" || src.Source == "Startup Folder"))
+            // Win32_StartupCommand is only a mirror of native Run/folder registrations.  It is
+            // covered by the canonical native row; active tasks/registry/folder registrations are
+            // never cross-source-collapsed because that would hide an independently firing source.
+            if (cmd.Length > 8 && src.Source == "Startup Command")
             {
                 foreach (var it in shown)
                 {
@@ -402,15 +1760,1671 @@ namespace MichStartupMaster
             return sb.ToString();
         }
 
-        // ---- Tray audit: every tray app shows exactly one correct icon, forever ----
-        // The historical failure mode was the quiet wrapper adding its OWN tray icon next to the
-        // app's real one (a blank/default "broken" duplicate), and duplicate launchers starting a
-        // second instance (a second real icon). This check makes both provably impossible to miss:
-        //   WRAPPER_ICON - a --tray-run wrapper process is still showing a tray icon (wrapper must
-        //                  stay invisible; the app draws its own icon)
-        //   DUP          - two visible instances of the same managed tray app are running
-        // A process is "visible" when it owns a tray-icon-class window, so app-internal helper
-        // processes (e.g. whisper-key's launcher stub, which owns no windows) never count.
+        private static List<StartupItem> ScanIndependentBootSources()
+        {
+            var raw = new List<StartupItem>();
+            AuditRegistrySources(raw);
+            AuditStartupFolders(raw);
+            AddIsolatedProvider(raw, "task-audit", "Independent Scheduled Task", "Task definition catalog", 15000);
+            AddIsolatedProvider(raw, "service-audit", "Independent Windows Service", "Service Control Manager", 10000);
+            AddIsolatedProvider(raw, "driver-audit", "Independent System Driver", "Service Control Manager", 10000);
+            AuditAdvancedRegistrySources(raw);
+            AuditExtendedAutorunSources(raw);
+            AuditGroupPolicyScripts(raw);
+            AddIsolatedProvider(raw, "wmi-audit", "Independent WMI Event Consumer", @"root\subscription", 10000);
+            AuditPackagedStartupTasks(raw);
+            return raw;
+        }
+
+        internal static int ProviderWorker(string[] args)
+        {
+            if (args == null || args.Length < 2) return 2;
+            var rows = new List<StartupItem>();
+            try
+            {
+                switch ((args[1] ?? "").ToLowerInvariant())
+                {
+                    case "task-main": EnumerateScheduledTasksCom(rows); break;
+                    case "task-audit": AuditScheduledTaskFiles(rows); break;
+                    case "service-audit": AuditServicesNative(rows, false); break;
+                    case "driver-audit": AuditServicesNative(rows, true); break;
+                    case "wmi-main": AddExecutableWmiConsumers(rows); break;
+                    case "wmi-audit": AuditWmiConsumers(rows); break;
+                    default: return 2;
+                }
+                Console.WriteLine("MSM_PROVIDER_V1");
+                foreach (StartupItem row in rows) Console.WriteLine(SerializeProviderRow(row));
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(ex.GetBaseException().Message);
+                return 3;
+            }
+        }
+
+        private static void AddIsolatedProvider(List<StartupItem> destination, string kind, string source, string location, int timeoutMs)
+        {
+            try
+            {
+                string executable = Environment.ProcessPath;
+                if (string.IsNullOrWhiteSpace(executable)) executable = Process.GetCurrentProcess().MainModule.FileName;
+                string prefix = "";
+                string leaf = Path.GetFileName(executable ?? "");
+                if (leaf.StartsWith("dotnet", StringComparison.OrdinalIgnoreCase))
+                {
+                    string assembly = typeof(Program).Assembly.Location;
+                    if (string.IsNullOrWhiteSpace(assembly)) throw new InvalidOperationException("Provider worker assembly path is unavailable");
+                    prefix = Q(assembly) + " ";
+                }
+                string output = RunCapture(executable, prefix + "--provider-worker " + kind, timeoutMs);
+                string[] lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                if (!lines.Any(line => string.Equals(line.Trim(), "MSM_PROVIDER_V1", StringComparison.Ordinal)))
+                    throw new InvalidOperationException("Provider worker returned no protocol header");
+                int parsed = 0;
+                foreach (string line in lines)
+                {
+                    if (string.Equals(line.Trim(), "MSM_PROVIDER_V1", StringComparison.Ordinal)) continue;
+                    StartupItem row;
+                    if (!TryParseProviderRow(line, out row)) throw new InvalidDataException("Provider worker returned a malformed protocol row");
+                    destination.Add(row);
+                    parsed++;
+                }
+                if (parsed == 0 && (kind == "task-main" || kind == "task-audit" || kind == "service-audit" || kind == "driver-audit"))
+                    destination.Add(ErrorItem(source, "System", location, new InvalidOperationException("Provider returned zero rows; coverage is not assumed")));
+            }
+            catch (Exception ex) { destination.Add(ErrorItem(source, "System", location, ex)); }
+        }
+
+        private static string SerializeProviderRow(StartupItem row)
+        {
+            string[] fields =
+            {
+                row == null ? "" : row.Id, row == null ? "" : row.Name, row == null ? "" : row.AppName,
+                row == null ? "" : row.Source, row == null ? "" : row.Scope, row == null ? "" : row.Command,
+                row == null ? "" : row.Location, row != null && row.Enabled ? "1" : "0",
+                row != null && row.CanDisable ? "1" : "0", row != null && row.IsManaged ? "1" : "0",
+                row == null ? "" : row.Status, row == null ? "" : row.ApprovalRoot,
+                row == null ? "" : row.ApprovalPath, row == null ? "" : row.ApprovalName,
+                row == null ? "" : row.RegistryView, row == null ? "" : row.ApprovalRegistryView,
+                row == null ? "" : row.MutationCapability, row == null ? "" : row.MutationReason,
+                row != null && row.RequiresExpertConfirmation ? "1" : "0",
+                row != null && row.RequiresElevation ? "1" : "0",
+                row != null && row.RequiresReboot ? "1" : "0",
+                row == null ? "" : row.ExternalAuthority
+            };
+            return "R\t" + string.Join("\t", fields.Select(B64));
+        }
+
+        private static bool TryParseProviderRow(string line, out StartupItem row)
+        {
+            row = null;
+            string[] fields = (line ?? "").Split('\t');
+            if ((fields.Length != 16 && fields.Length != 23) || fields[0] != "R") return false;
+            string[] values = fields.Skip(1).Select(UnB64).ToArray();
+            row = new StartupItem
+            {
+                Id = values[0], Name = values[1], AppName = values[2], Source = values[3], Scope = values[4],
+                Command = values[5], Location = values[6], Enabled = values[7] == "1", CanDisable = values[8] == "1",
+                IsManaged = values[9] == "1", Status = values[10], ApprovalRoot = values[11],
+                ApprovalPath = values[12], ApprovalName = values[13], RegistryView = values[14],
+                ApprovalRegistryView = values.Length > 15 ? values[15] : "",
+                MutationCapability = values.Length > 16 ? values[16] : "",
+                MutationReason = values.Length > 17 ? values[17] : "",
+                RequiresExpertConfirmation = values.Length > 18 && values[18] == "1",
+                RequiresElevation = values.Length > 19 && values[19] == "1",
+                RequiresReboot = values.Length > 20 && values[20] == "1",
+                ExternalAuthority = values.Length > 21 ? values[21] : ""
+            };
+            return !string.IsNullOrWhiteSpace(row.Id) && !string.IsNullOrWhiteSpace(row.Source);
+        }
+
+        private static void AuditRegistrySources(List<StartupItem> raw)
+        {
+            string[] runKeys =
+            {
+                @"Software\Microsoft\Windows\CurrentVersion\Run",
+                @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                @"Software\Microsoft\Windows\CurrentVersion\RunServices",
+                @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce",
+                @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
+            };
+            foreach (RegistryView view in StartupRegistryViews())
+            {
+                string viewLabel = RegistryViewLabel(view);
+                using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
+                using (var machineRoot = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+                {
+                    foreach (var pair in new[] { Tuple.Create(userRoot, "User"), Tuple.Create(machineRoot, "Machine") })
+                    {
+                        foreach (string path in runKeys) AuditRegistryValues(raw, pair.Item1, path, pair.Item2, SourceForRegistryPath(path), null, viewLabel);
+                        AuditRegistryValues(raw, pair.Item1, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", pair.Item2, "Legacy Windows Run", new[] { "Load", "Run" }, viewLabel);
+                        AuditRunOnceEx(raw, pair.Item1, pair.Item2, null, viewLabel);
+                        foreach (string path in new[]
+                        {
+                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
+                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
+                        }) AuditRegistryValues(raw, pair.Item1, path, pair.Item2, "Explorer Startup Extension", null, viewLabel);
+                        AddExplorerShellExtensions(raw, pair.Item1, pair.Item2, null, viewLabel, true);
+                        AddInternetExplorerAddons(raw, pair.Item1, pair.Item2, null, viewLabel, true);
+                    }
+                    AuditWinlogonValues(raw, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Machine", new[] { "Shell", "Userinit", "Taskman", "AppSetup", "System" }, viewLabel);
+                    AuditWinlogonValues(raw, userRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "User", new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
+                    AuditRegistryValues(raw, userRoot, @"Environment", "User", "User Logon Script", new[] { "UserInitMprLogonScript" }, viewLabel);
+                    AuditAppInit(raw, machineRoot, viewLabel);
+                    AuditActiveSetup(raw, machineRoot, "Machine", null, viewLabel);
+                    AuditActiveSetup(raw, userRoot, "User", null, viewLabel);
+                }
+            }
+            AuditRegistryValues(raw, Registry.LocalMachine, @"SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls", "Machine", "AppCert DLLs", null);
+            AuditLoadedUserRegistrySources(raw);
+        }
+
+        private static void AuditRegistryValues(List<StartupItem> raw, RegistryKey root, string subKey, string scope, string source, string[] filter, string viewLabel = null)
+        {
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    foreach (string name in key.GetValueNames())
+                    {
+                        if (filter != null && !filter.Any(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase))) continue;
+                        object value = key.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                        string command = value is string[] ? string.Join(" ; ", (string[])value) : Convert.ToString(value ?? "");
+                        if (string.IsNullOrWhiteSpace(command)) continue;
+                        raw.Add(new StartupItem { Id = "reg|" + scope + "|" + B64(root.Name) + "|" + B64(subKey) + "|" + B64(name ?? "") + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "|" + viewLabel), Name = string.IsNullOrWhiteSpace(name) ? "(Default)" : name, Source = source, Scope = scope, Command = command, Location = root.Name + @"\" + subKey + (string.IsNullOrWhiteSpace(viewLabel) ? "" : " [" + viewLabel + "]"), Enabled = true, RegistryView = viewLabel });
+                    }
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent " + source, scope, root.Name + @"\" + subKey, ex)); }
+        }
+
+        private static void AuditWinlogonValues(List<StartupItem> raw, RegistryKey root, string subKey, string scope, string[] filter, string viewLabel)
+        {
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    foreach (string valueName in key.GetValueNames())
+                    {
+                        if (filter != null && !filter.Any(candidate => string.Equals(candidate, valueName, StringComparison.OrdinalIgnoreCase))) continue;
+                        object value = key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                        RegistryValueKind kind = key.GetValueKind(valueName);
+                        if (kind != RegistryValueKind.String && kind != RegistryValueKind.ExpandString) continue;
+                        List<string> components;
+                        if (!TrySplitWinlogonComponents(Convert.ToString(value ?? ""), out components))
+                        {
+                            raw.Add(ErrorItem("Independent Winlogon Autostart", scope, root.Name + @"\" + subKey + @"\" + valueName, new InvalidDataException("Winlogon value has an ambiguous quoted component list")));
+                            continue;
+                        }
+                        for (int index = 0; index < components.Count; index++)
+                        {
+                            string component = components[index].Trim();
+                            if (component.Length == 0) continue;
+                            raw.Add(new StartupItem
+                            {
+                                Id = "winlogon|" + scope + "|" + B64(root.Name) + "|" + B64(subKey) + "|" + B64(valueName) + "|" + index + "|" + viewLabel,
+                                Name = valueName + (components.Count(part => !string.IsNullOrWhiteSpace(part)) > 1 ? " #" + (index + 1) : ""),
+                                Source = "Winlogon Autostart", Scope = scope, Command = component,
+                                Location = root.Name + @"\" + subKey + @"\" + valueName + " [" + viewLabel + "]", Enabled = true, RegistryView = viewLabel
+                            });
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent Winlogon Autostart", scope, root.Name + @"\" + subKey, ex)); }
+        }
+
+        private static void AuditRunOnceEx(List<StartupItem> raw, RegistryKey root, string scope, string basePath = null, string viewLabel = null)
+        {
+            if (string.IsNullOrWhiteSpace(basePath)) basePath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx";
+            try
+            {
+                using (var parent = root.OpenSubKey(basePath, false))
+                {
+                    if (parent == null) return;
+                    foreach (string childName in parent.GetSubKeyNames())
+                    {
+                        string childPath = basePath + @"\" + childName;
+                        using (var child = root.OpenSubKey(childPath, false))
+                        {
+                            if (child == null) continue;
+                            foreach (string valueName in child.GetValueNames())
+                            {
+                                if (string.Equals(valueName, "Title", StringComparison.OrdinalIgnoreCase) || string.Equals(valueName, "Flags", StringComparison.OrdinalIgnoreCase) || string.Equals(valueName, "Depend", StringComparison.OrdinalIgnoreCase)) continue;
+                                string command = Convert.ToString(child.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) ?? "");
+                                if (string.IsNullOrWhiteSpace(command)) continue;
+                                raw.Add(new StartupItem { Id = "reg|" + scope + "|" + B64(root.Name) + "|" + B64(childPath) + "|" + B64(valueName ?? "") + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "|" + viewLabel), Name = string.IsNullOrWhiteSpace(valueName) ? childName : valueName, Source = "Registry RunOnceEx", Scope = scope, Command = command, Location = root.Name + @"\" + childPath + (string.IsNullOrWhiteSpace(viewLabel) ? "" : " [" + viewLabel + "]"), Enabled = true, RegistryView = viewLabel });
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent Registry RunOnceEx", scope, root.Name + @"\" + basePath, ex)); }
+        }
+
+        private static void AuditAppInit(List<StartupItem> raw, RegistryKey machineRoot, string viewLabel)
+        {
+            const string path = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows";
+            try
+            {
+                using (var key = machineRoot.OpenSubKey(path, false))
+                {
+                    if (key == null) return;
+                    string dlls = Convert.ToString(key.GetValue("AppInit_DLLs", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    if (string.IsNullOrWhiteSpace(dlls)) return;
+                    int enabled = 0; try { enabled = Convert.ToInt32(key.GetValue("LoadAppInit_DLLs", 0)); } catch { }
+                    raw.Add(new StartupItem { Id = "appinit|" + B64(path) + "|" + viewLabel, Name = "AppInit DLLs", Source = "AppInit DLLs", Scope = "Machine", Command = dlls, Location = machineRoot.Name + @"\" + path + " [" + viewLabel + "]", Enabled = enabled != 0, RegistryView = viewLabel });
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent AppInit DLLs", "Machine", path, ex)); }
+        }
+
+        private static void AuditActiveSetup(List<StartupItem> raw, RegistryKey root, string scope, string basePath = null, string viewLabel = null)
+        {
+            if (string.IsNullOrWhiteSpace(basePath)) basePath = @"SOFTWARE\Microsoft\Active Setup\Installed Components";
+            try
+            {
+                using (var parent = root.OpenSubKey(basePath, false))
+                {
+                    if (parent == null) return;
+                    foreach (string component in parent.GetSubKeyNames())
+                    using (var key = parent.OpenSubKey(component, false))
+                    {
+                        string command = Convert.ToString(key == null ? null : key.GetValue("StubPath", null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                        if (string.IsNullOrWhiteSpace(command)) continue;
+                        string subKey = basePath + @"\" + component;
+                        raw.Add(new StartupItem { Id = "active|" + scope + "|" + B64(root.Name) + "|" + B64(subKey) + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "|" + viewLabel), Name = component, Source = "Active Setup", Scope = scope, Command = command, Location = root.Name + @"\" + subKey + (string.IsNullOrWhiteSpace(viewLabel) ? "" : " [" + viewLabel + "]"), Enabled = true, RegistryView = viewLabel });
+                    }
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent Active Setup", scope, root.Name + @"\" + basePath, ex)); }
+        }
+
+        private static List<Tuple<string, string>> LoadedUserHives()
+        {
+            var result = new List<Tuple<string, string>>();
+            string currentSid = "";
+            try { currentSid = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value; } catch { }
+            foreach (string sid in Registry.Users.GetSubKeyNames().Where(s => Regex.IsMatch(s ?? "", @"^S-1-5-21-(?:\d+-){2,}\d+$", RegexOptions.CultureInvariant)))
+            {
+                if (string.Equals(sid, currentSid, StringComparison.OrdinalIgnoreCase)) continue;
+                string user = "";
+                try
+                {
+                    using (var profile = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + sid, false))
+                    {
+                        string profilePath = Environment.ExpandEnvironmentVariables(Convert.ToString(profile == null ? null : profile.GetValue("ProfileImagePath", "", RegistryValueOptions.DoNotExpandEnvironmentNames)));
+                        user = Path.GetFileName((profilePath ?? "").TrimEnd('\\'));
+                    }
+                }
+                catch { }
+                if (string.IsNullOrWhiteSpace(user)) user = sid.Length > 12 ? sid.Substring(sid.Length - 12) : sid;
+                result.Add(Tuple.Create(sid, "User:" + user));
+            }
+            return result;
+        }
+
+        private static void AuditLoadedUserRegistrySources(List<StartupItem> raw)
+        {
+            try
+            {
+                string[] runKeys =
+                {
+                    @"Software\Microsoft\Windows\CurrentVersion\Run",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunServices",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce",
+                    @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
+                };
+                foreach (RegistryView view in StartupRegistryViews())
+                using (var usersRoot = OpenRegistryRoot(RegistryHive.Users, view))
+                {
+                    string viewLabel = RegistryViewLabel(view);
+                    foreach (var hive in LoadedUserHives())
+                    {
+                        string prefix = hive.Item1 + @"\";
+                        string scope = hive.Item2;
+                        foreach (string path in runKeys) AuditRegistryValues(raw, usersRoot, prefix + path, scope, SourceForRegistryPath(path), null, viewLabel);
+                        AuditRegistryValues(raw, usersRoot, prefix + @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", scope, "Legacy Windows Run", new[] { "Load", "Run" }, viewLabel);
+                        AuditWinlogonValues(raw, usersRoot, prefix + @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", scope, new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
+                        AuditRegistryValues(raw, usersRoot, prefix + @"Environment", scope, "User Logon Script", new[] { "UserInitMprLogonScript" }, viewLabel);
+                        AuditRunOnceEx(raw, usersRoot, scope, prefix + @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx", viewLabel);
+                        foreach (string path in new[]
+                        {
+                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
+                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
+                        }) AuditRegistryValues(raw, usersRoot, prefix + path, scope, "Explorer Startup Extension", null, viewLabel);
+                        AddExplorerShellExtensions(raw, usersRoot, scope, prefix, viewLabel, true);
+                        AddInternetExplorerAddons(raw, usersRoot, scope, prefix, viewLabel, true);
+                        AuditActiveSetup(raw, usersRoot, scope, prefix + @"SOFTWARE\Microsoft\Active Setup\Installed Components", viewLabel);
+                    }
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent loaded-user registry", "Other users", Registry.Users.Name, ex)); }
+        }
+
+        private sealed class PackageManifestLocation
+        {
+            public string ManifestPath;
+            public string PackageFullName;
+            public string PackageFamilyName;
+            public string Scope;
+        }
+
+        // StartupApproved\StartupTasks contains only Explorer's state metadata.  A real
+        // packaged startup registration exists only when an installed package manifest
+        // declares an Extension Category="windows.startupTask" with a StartupTask child.
+        private static void AuditPackagedStartupTasks(List<StartupItem> raw)
+        {
+            foreach (var location in EnumeratePackageManifestLocations(raw, true))
+            {
+                try
+                {
+                    string xml = File.ReadAllText(location.ManifestPath);
+                    raw.AddRange(ParsePackagedStartupManifest(xml, location));
+                }
+                catch (Exception ex)
+                {
+                    raw.Add(ErrorItem("Independent Packaged Startup Task", location.Scope, location.ManifestPath, ex));
+                }
+            }
+        }
+
+        private static List<PackageManifestLocation> EnumeratePackageManifestLocations(List<StartupItem> errors, bool independent)
+        {
+            var result = new List<PackageManifestLocation>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Action<RegistryKey, string, string> scanRepository = (root, repositoryPath, scope) =>
+            {
+                try
+                {
+                    using (var packages = root.OpenSubKey(repositoryPath, false))
+                    {
+                        if (packages == null) return;
+                        foreach (string packageFullName in packages.GetSubKeyNames())
+                        using (var package = packages.OpenSubKey(packageFullName, false))
+                        {
+                            if (package == null) continue;
+                            string packageRoot = Convert.ToString(package.GetValue("PackageRootFolder", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            if (string.IsNullOrWhiteSpace(packageRoot)) packageRoot = Convert.ToString(package.GetValue("Path", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            packageRoot = Environment.ExpandEnvironmentVariables(packageRoot ?? "");
+                            if (string.IsNullOrWhiteSpace(packageRoot))
+                            {
+                                packageRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WindowsApps", packageFullName);
+                            }
+                            string manifest = Path.Combine(packageRoot, "AppxManifest.xml");
+                            if (!File.Exists(manifest)) continue;
+                            string family = Convert.ToString(package.GetValue("PackageFamilyName", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            if (string.IsNullOrWhiteSpace(family)) family = PackageFamilyFromFullName(packageFullName);
+                            string identity = scope + "|" + manifest;
+                            if (seen.Add(identity)) result.Add(new PackageManifestLocation { ManifestPath = manifest, PackageFullName = packageFullName, PackageFamilyName = family, Scope = scope });
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (errors != null) errors.Add(ErrorItem((independent ? "Independent " : "") + "Packaged Startup Task", scope, root.Name + @"\" + repositoryPath, ex));
+                }
+            };
+
+            const string currentRepository = @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+            scanRepository(Registry.CurrentUser, currentRepository, "User");
+            scanRepository(Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages", "Machine");
+            try
+            {
+                foreach (var hive in LoadedUserHives()) scanRepository(Registry.Users, hive.Item1 + @"\" + currentRepository, hive.Item2);
+            }
+            catch (Exception ex)
+            {
+                if (errors != null) errors.Add(ErrorItem((independent ? "Independent " : "") + "Packaged Startup Task", "Other users", Registry.Users.Name + @"\" + currentRepository, ex));
+            }
+            return result;
+        }
+
+        private static string PackageFamilyFromFullName(string packageFullName)
+        {
+            string value = packageFullName ?? "";
+            int first = value.IndexOf('_');
+            int last = value.LastIndexOf('_');
+            if (first <= 0 || last <= first) return value;
+            string publisherId = value.Substring(last + 1);
+            return string.IsNullOrWhiteSpace(publisherId) ? value : value.Substring(0, first) + "_" + publisherId;
+        }
+
+        private static List<StartupItem> ParsePackagedStartupManifest(string xml, PackageManifestLocation location)
+        {
+            var items = new List<StartupItem>();
+            var document = new System.Xml.XmlDocument { XmlResolver = null };
+            document.LoadXml(xml ?? "");
+            System.Xml.XmlElement package = document.DocumentElement;
+            if (package == null || !string.Equals(package.LocalName, "Package", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Package manifest root is missing");
+            string packageName = "";
+            System.Xml.XmlNode identity = package.SelectSingleNode("./*[local-name()='Identity']");
+            if (identity != null && identity.Attributes != null && identity.Attributes["Name"] != null) packageName = identity.Attributes["Name"].Value;
+            string displayName = "";
+            System.Xml.XmlNode display = package.SelectSingleNode("./*[local-name()='Properties']/*[local-name()='DisplayName']");
+            if (display != null) displayName = (display.InnerText ?? "").Trim();
+            string family = string.IsNullOrWhiteSpace(location.PackageFamilyName) ? PackageFamilyFromFullName(location.PackageFullName) : location.PackageFamilyName;
+            foreach (System.Xml.XmlNode extension in package.SelectNodes(".//*[local-name()='Extension']"))
+            {
+                string category = extension.Attributes == null || extension.Attributes["Category"] == null ? "" : extension.Attributes["Category"].Value;
+                if (!category.EndsWith(".startupTask", StringComparison.OrdinalIgnoreCase) && !string.Equals(category, "windows.startupTask", StringComparison.OrdinalIgnoreCase)) continue;
+                string executable = extension.Attributes == null || extension.Attributes["Executable"] == null ? "" : extension.Attributes["Executable"].Value;
+                string entryPoint = extension.Attributes == null || extension.Attributes["EntryPoint"] == null ? "" : extension.Attributes["EntryPoint"].Value;
+                foreach (System.Xml.XmlNode task in extension.SelectNodes(".//*[local-name()='StartupTask']"))
+                {
+                    string taskId = task.Attributes == null || task.Attributes["TaskId"] == null ? "" : task.Attributes["TaskId"].Value;
+                    if (string.IsNullOrWhiteSpace(taskId)) continue;
+                    string taskDisplay = task.Attributes == null || task.Attributes["DisplayName"] == null ? "" : task.Attributes["DisplayName"].Value;
+                    bool manifestEnabled = false;
+                    if (task.Attributes != null && task.Attributes["Enabled"] != null) bool.TryParse(task.Attributes["Enabled"].Value, out manifestEnabled);
+                    string registrationName = string.IsNullOrWhiteSpace(family) ? taskId : family + "!" + taskId;
+                    string command = executable;
+                    if (!string.IsNullOrWhiteSpace(command) && !Path.IsPathRooted(command)) command = Path.Combine(Path.GetDirectoryName(location.ManifestPath) ?? "", command);
+                    if (string.IsNullOrWhiteSpace(command)) command = "Package activation " + registrationName + (string.IsNullOrWhiteSpace(entryPoint) ? "" : " (" + entryPoint + ")");
+                    string humanName = !string.IsNullOrWhiteSpace(taskDisplay) && !taskDisplay.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase) ? taskDisplay : displayName;
+                    if (string.IsNullOrWhiteSpace(humanName) || humanName.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase)) humanName = string.IsNullOrWhiteSpace(packageName) ? taskId : packageName;
+                    items.Add(new StartupItem
+                    {
+                        Id = "packaged|" + B64(location.Scope) + "|" + B64(location.ManifestPath) + "|" + B64(registrationName),
+                        Name = registrationName,
+                        AppName = CleanName(humanName),
+                        Source = "Packaged Startup Task",
+                        Scope = location.Scope,
+                        Command = command,
+                        Location = location.ManifestPath + " :: " + taskId,
+                        Enabled = manifestEnabled,
+                        CanDisable = false,
+                        IsManaged = false,
+                        Status = "Declared by package manifest; taskId=" + taskId + "; manifestEnabled=" + manifestEnabled.ToString().ToLowerInvariant() + "; awaiting exact OS authority metadata",
+                        MutationCapability = "ExternalAuthority",
+                        MutationReason = "No exact StartupApproved state was found; use Windows Settings or the packaged app instead of inventing metadata",
+                        ExternalAuthority = "Windows packaged startup authority"
+                    });
+                }
+            }
+            return items;
+        }
+
+        private static void AuditStartupFolders(List<StartupItem> raw)
+        {
+            var folders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            Action<string, string> remember = (path, scope) => { if (!string.IsNullOrWhiteSpace(path)) { try { path = Path.GetFullPath(Environment.ExpandEnvironmentVariables(path)).TrimEnd('\\'); } catch { } folders[path] = scope; } };
+            remember(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "User");
+            remember(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), "Machine");
+            try
+            {
+                using (var profiles = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList", false))
+                {
+                    if (profiles != null) foreach (string sid in profiles.GetSubKeyNames()) using (var profile = profiles.OpenSubKey(sid, false))
+                    {
+                        string root = Environment.ExpandEnvironmentVariables(Convert.ToString(profile == null ? null : profile.GetValue("ProfileImagePath", "", RegistryValueOptions.DoNotExpandEnvironmentNames)));
+                        string user = Path.GetFileName((root ?? "").TrimEnd('\\'));
+                        if (string.IsNullOrWhiteSpace(root) || new[] { "Default", "Public", "Default User", "All Users" }.Any(x => string.Equals(x, user, StringComparison.OrdinalIgnoreCase))) continue;
+                        remember(Path.Combine(root, @"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"), string.Equals(user, Environment.UserName, StringComparison.OrdinalIgnoreCase) ? "User" : "User:" + user);
+                    }
+                }
+                foreach (var pair in folders)
+                {
+                    if (!Directory.Exists(pair.Key)) continue;
+                    foreach (string file in Directory.GetFiles(pair.Key).Where(f => !string.Equals(Path.GetFileName(f), "desktop.ini", StringComparison.OrdinalIgnoreCase))) raw.Add(new StartupItem { Id = "folder|" + pair.Value + "|" + file, Name = Path.GetFileName(file), Source = "Startup Folder", Scope = pair.Value, Command = file, Location = pair.Key, Enabled = true });
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent Startup Folder", "Machine/User", "Profile startup folders", ex)); }
+        }
+
+        private const int MaximumTaskFolders = 2048;
+        private const int MaximumScheduledTasks = 16384;
+        private const int MaximumTaskFolderDepth = 64;
+
+        private sealed class ScheduledTaskInventorySnapshot
+        {
+            public string Path = "";
+            public bool TaskEnabled = true;
+            public string StateLabel = "Unknown";
+            public bool ActionsComplete = true;
+            public readonly List<ScheduledTaskTriggerSnapshot> Triggers = new List<ScheduledTaskTriggerSnapshot>();
+            public readonly List<ScheduledTaskActionSnapshot> Actions = new List<ScheduledTaskActionSnapshot>();
+        }
+
+        private sealed class ScheduledTaskTriggerSnapshot
+        {
+            public int Index;
+            public int Type;
+            public string Id = "";
+            public bool Enabled = true;
+            public string Delay = "";
+            public string UserId = "";
+        }
+
+        private sealed class ScheduledTaskActionSnapshot
+        {
+            public int Index;
+            public int Type;
+            public string Kind = "";
+            public string Path = "";
+            public string Arguments = "";
+            public string WorkingDirectory = "";
+            public string ClassId = "";
+            public string Data = "";
+        }
+
+        private static void EnumerateScheduledTasksCom(List<StartupItem> rows)
+        {
+            object service = null;
+            object rootFolder = null;
+            try
+            {
+                Type type = Type.GetTypeFromProgID("Schedule.Service");
+                if (type == null) throw new InvalidOperationException("Task Scheduler COM service is unavailable");
+                service = Activator.CreateInstance(type);
+                dynamic scheduler = service;
+                scheduler.Connect();
+                rootFolder = scheduler.GetFolder(@"\");
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                int folderCount = 0, taskCount = 0;
+                EnumerateTaskFolderCom(rows, rootFolder, @"\", seen, 0, ref folderCount, ref taskCount);
+            }
+            catch (Exception ex) { rows.Add(ErrorItem("Scheduled Task", "System", "Task Scheduler COM", ex)); }
+            finally
+            {
+                ReleaseComObject(rootFolder);
+                ReleaseComObject(service);
+            }
+        }
+
+        private static void EnumerateTaskFolderCom(List<StartupItem> rows, object folderObject, string fallbackPath,
+            HashSet<string> seen, int depth, ref int folderCount, ref int taskCount)
+        {
+            string folderPath = NormalizeScheduledTaskPath(fallbackPath);
+            try { folderPath = NormalizeScheduledTaskPath(Convert.ToString(((dynamic)folderObject).Path ?? folderPath)); } catch { }
+            folderCount++;
+            if (depth > MaximumTaskFolderDepth || folderCount > MaximumTaskFolders)
+            {
+                rows.Add(ScheduledTaskReadWarning(folderPath, "Folder traversal budget", new InvalidOperationException("Task Scheduler folder traversal exceeded its safety budget")));
+                return;
+            }
+
+            object tasksObject = null;
+            try
+            {
+                tasksObject = ((dynamic)folderObject).GetTasks(1); // TASK_ENUM_HIDDEN
+                dynamic tasks = tasksObject;
+                int count = Convert.ToInt32(tasks.Count);
+                for (int i = 1; i <= count; i++)
+                {
+                    taskCount++;
+                    if (taskCount > MaximumScheduledTasks)
+                    {
+                        rows.Add(ScheduledTaskReadWarning(folderPath, "Task traversal budget", new InvalidOperationException("Task Scheduler task traversal exceeded its safety budget")));
+                        break;
+                    }
+                    object taskObject = null;
+                    try
+                    {
+                        taskObject = tasks.Item(i);
+                        ScheduledTaskInventorySnapshot snapshot = ReadScheduledTaskCom(rows, taskObject, folderPath + @"\#" + i);
+                        if (snapshot != null) TryAppendScheduledTaskSnapshot(rows, seen, snapshot);
+                    }
+                    catch (Exception ex) { rows.Add(ScheduledTaskReadWarning(folderPath + @"\#" + i, "Registered task", ex)); }
+                    finally { ReleaseComObject(taskObject); }
+                }
+            }
+            catch (Exception ex) { rows.Add(ScheduledTaskReadWarning(folderPath, "Registered task collection", ex)); }
+            finally { ReleaseComObject(tasksObject); }
+
+            object foldersObject = null;
+            try
+            {
+                foldersObject = ((dynamic)folderObject).GetFolders(0);
+                dynamic folders = foldersObject;
+                int count = Convert.ToInt32(folders.Count);
+                for (int i = 1; i <= count; i++)
+                {
+                    object childObject = null;
+                    try
+                    {
+                        childObject = folders.Item(i);
+                        string childPath = folderPath + @"\#folder" + i;
+                        try { childPath = NormalizeScheduledTaskPath(Convert.ToString(((dynamic)childObject).Path ?? childPath)); } catch { }
+                        EnumerateTaskFolderCom(rows, childObject, childPath, seen, depth + 1, ref folderCount, ref taskCount);
+                    }
+                    catch (Exception ex) { rows.Add(ScheduledTaskReadWarning(folderPath + @"\#folder" + i, "Child folder", ex)); }
+                    finally { ReleaseComObject(childObject); }
+                }
+            }
+            catch (Exception ex) { rows.Add(ScheduledTaskReadWarning(folderPath, "Child folder collection", ex)); }
+            finally { ReleaseComObject(foldersObject); }
+        }
+
+        private static ScheduledTaskInventorySnapshot ReadScheduledTaskCom(List<StartupItem> rows, object taskObject, string fallbackPath)
+        {
+            string taskPath;
+            try
+            {
+                string reportedPath = Convert.ToString(((dynamic)taskObject).Path ?? "");
+                if (string.IsNullOrWhiteSpace(reportedPath))
+                {
+                    rows.Add(ScheduledTaskReadWarning(fallbackPath, "Path", new InvalidDataException("Registered task returned an empty path")));
+                    return null;
+                }
+                taskPath = NormalizeScheduledTaskPath(reportedPath);
+            }
+            catch (Exception ex) { rows.Add(ScheduledTaskReadWarning(fallbackPath, "Path", ex)); return null; }
+            object definitionObject = null;
+            object triggersObject = null;
+            var triggerErrors = new List<Tuple<string, Exception>>();
+            var snapshot = new ScheduledTaskInventorySnapshot { Path = taskPath };
+            try
+            {
+                try { definitionObject = ((dynamic)taskObject).Definition; }
+                catch (Exception ex) { rows.Add(ScheduledTaskReadWarning(taskPath, "Definition", ex)); return null; }
+                try
+                {
+                    triggersObject = ((dynamic)definitionObject).Triggers;
+                    dynamic triggers = triggersObject;
+                    int triggerCount = Convert.ToInt32(triggers.Count);
+                    for (int i = 1; i <= triggerCount; i++)
+                    {
+                        object triggerObject = null;
+                        try
+                        {
+                            triggerObject = triggers.Item(i);
+                            dynamic trigger = triggerObject;
+                            int triggerType = Convert.ToInt32(trigger.Type);
+                            string triggerId = "";
+                            try { triggerId = Convert.ToString(trigger.Id ?? ""); }
+                            catch (Exception ex) { if (IsStartupTaskTriggerType(triggerType)) triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Id", ex)); }
+                            bool enabled = false;
+                            try { enabled = Convert.ToBoolean(trigger.Enabled); }
+                            catch (Exception ex) { if (IsStartupTaskTriggerType(triggerType)) triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Enabled", ex)); }
+                            string delay = "";
+                            try { delay = Convert.ToString(trigger.Delay ?? ""); }
+                            catch (Exception ex) { if (IsStartupTaskTriggerType(triggerType)) triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Delay", ex)); }
+                            string userId = "";
+                            if (triggerType == 9) try { userId = Convert.ToString(trigger.UserId ?? ""); } catch (Exception ex) { triggerErrors.Add(Tuple.Create("Trigger[" + i + "].UserId", ex)); }
+                            snapshot.Triggers.Add(new ScheduledTaskTriggerSnapshot { Index = i, Type = triggerType, Id = triggerId, Enabled = enabled, Delay = delay, UserId = userId });
+                        }
+                        catch (Exception ex) { triggerErrors.Add(Tuple.Create("Trigger[" + i + "]", ex)); }
+                        finally { ReleaseComObject(triggerObject); }
+                    }
+                }
+                catch (Exception ex) { rows.Add(ScheduledTaskReadWarning(taskPath, "Trigger collection", ex)); return null; }
+                finally { ReleaseComObject(triggersObject); triggersObject = null; }
+
+                bool startup = snapshot.Triggers.Any(trigger => IsStartupTaskTriggerType(trigger.Type));
+                foreach (var error in triggerErrors) rows.Add(ScheduledTaskReadWarning(taskPath, error.Item1, error.Item2));
+                if (!startup) return null;
+
+                try { snapshot.TaskEnabled = Convert.ToBoolean(((dynamic)taskObject).Enabled); }
+                catch (Exception ex) { snapshot.TaskEnabled = false; rows.Add(ScheduledTaskReadWarning(taskPath, "Enabled state", ex)); }
+                try
+                {
+                    int state = Convert.ToInt32(((dynamic)taskObject).State);
+                    snapshot.StateLabel = TaskStateName(state) + "(" + state + ")";
+                }
+                catch (Exception ex) { snapshot.StateLabel = "Unknown"; rows.Add(ScheduledTaskReadWarning(taskPath, "Runtime state", ex)); }
+
+                object actionsObject = null;
+                try
+                {
+                    actionsObject = ((dynamic)definitionObject).Actions;
+                    dynamic actions = actionsObject;
+                    int actionCount = Convert.ToInt32(actions.Count);
+                    for (int i = 1; i <= actionCount; i++)
+                    {
+                        object actionObject = null;
+                        try
+                        {
+                            actionObject = actions.Item(i);
+                            dynamic action = actionObject;
+                            int actionType = Convert.ToInt32(action.Type);
+                            var actionSnapshot = new ScheduledTaskActionSnapshot { Index = i, Type = actionType };
+                            if (actionType == 0)
+                            {
+                                actionSnapshot.Kind = "Exec";
+                                actionSnapshot.Path = NormalizeScheduledTaskExecutable(Convert.ToString(action.Path ?? ""));
+                                actionSnapshot.Arguments = Convert.ToString(action.Arguments ?? "");
+                                actionSnapshot.WorkingDirectory = Convert.ToString(action.WorkingDirectory ?? "");
+                            }
+                            else if (actionType == 5)
+                            {
+                                actionSnapshot.Kind = "ComHandler";
+                                actionSnapshot.ClassId = Convert.ToString(action.ClassId ?? "");
+                                try { actionSnapshot.Data = Convert.ToString(action.Data ?? ""); } catch { }
+                            }
+                            else actionSnapshot.Kind = "Type" + actionType;
+                            snapshot.Actions.Add(actionSnapshot);
+                        }
+                        catch (Exception ex) { snapshot.ActionsComplete = false; rows.Add(ScheduledTaskReadWarning(taskPath, "Action[" + i + "]", ex)); }
+                        finally { ReleaseComObject(actionObject); }
+                    }
+                }
+                catch (Exception ex) { snapshot.ActionsComplete = false; rows.Add(ScheduledTaskReadWarning(taskPath, "Action collection", ex)); }
+                finally { ReleaseComObject(actionsObject); }
+                return snapshot;
+            }
+            finally
+            {
+                ReleaseComObject(triggersObject);
+                ReleaseComObject(definitionObject);
+            }
+        }
+
+        private static void AuditScheduledTaskFiles(List<StartupItem> rows)
+        {
+            string root = Path.Combine(Environment.SystemDirectory, "Tasks");
+            if (!Directory.Exists(root))
+            {
+                rows.Add(ErrorItem("Independent Scheduled Task", "System", root, new DirectoryNotFoundException("Task definition catalog was not found")));
+                return;
+            }
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int folderCount = 0, fileCount = 0;
+            AuditScheduledTaskFileFolder(rows, root, root, @"\", seen, 0, ref folderCount, ref fileCount);
+        }
+
+        private static void AuditScheduledTaskFileFolder(List<StartupItem> rows, string root, string folder, string relativeFolder,
+            HashSet<string> seen, int depth, ref int folderCount, ref int fileCount)
+        {
+            folderCount++;
+            if (depth > MaximumTaskFolderDepth || folderCount > MaximumTaskFolders)
+            {
+                rows.Add(ErrorItem("Independent Scheduled Task", "System", NormalizeScheduledTaskPath(relativeFolder), new InvalidOperationException("Task definition folder traversal exceeded its safety budget")));
+                return;
+            }
+
+            string[] files = new string[0];
+            try { files = Directory.GetFiles(folder); }
+            catch (Exception ex) { rows.Add(TaskCatalogReadNotice(NormalizeScheduledTaskPath(relativeFolder), "Directory files", ex)); }
+            foreach (string file in files)
+            {
+                fileCount++;
+                string taskPath = TaskPathFromDefinitionFile(root, file);
+                if (fileCount > MaximumScheduledTasks)
+                {
+                    rows.Add(ErrorItem("Independent Scheduled Task", "System", taskPath, new InvalidOperationException("Task definition file traversal exceeded its safety budget")));
+                    return;
+                }
+                try
+                {
+                    var info = new FileInfo(file);
+                    if (info.Length > 16 * 1024 * 1024) throw new InvalidDataException("Task definition exceeds the 16 MiB safety limit");
+                    ScheduledTaskInventorySnapshot snapshot;
+                    using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    using (var reader = System.Xml.XmlReader.Create(stream, SecureTaskXmlSettings()))
+                    {
+                        var document = new System.Xml.XmlDocument { XmlResolver = null };
+                        document.Load(reader);
+                        snapshot = ParseScheduledTaskDocument(taskPath, document);
+                    }
+                    TryAppendScheduledTaskSnapshot(rows, seen, snapshot);
+                }
+                catch (Exception ex) { rows.Add(TaskCatalogReadNotice(taskPath, "Definition file", ex)); }
+            }
+
+            string[] folders = new string[0];
+            try { folders = Directory.GetDirectories(folder); }
+            catch (Exception ex) { rows.Add(TaskCatalogReadNotice(NormalizeScheduledTaskPath(relativeFolder), "Child directories", ex)); }
+            foreach (string child in folders)
+            {
+                string relative = NormalizeScheduledTaskPath(Path.GetRelativePath(root, child).Replace('/', '\\'));
+                try
+                {
+                    FileAttributes attributes = File.GetAttributes(child);
+                    if ((attributes & FileAttributes.ReparsePoint) != 0) continue;
+                    AuditScheduledTaskFileFolder(rows, root, child, relative, seen, depth + 1, ref folderCount, ref fileCount);
+                }
+                catch (Exception ex) { rows.Add(TaskCatalogReadNotice(relative, "Child directory", ex)); }
+            }
+        }
+
+        private static ScheduledTaskInventorySnapshot ParseScheduledTaskXml(string taskPath, string xml)
+        {
+            using (var text = new StringReader(xml ?? ""))
+            using (var reader = System.Xml.XmlReader.Create(text, SecureTaskXmlSettings()))
+            {
+                var document = new System.Xml.XmlDocument { XmlResolver = null };
+                document.Load(reader);
+                return ParseScheduledTaskDocument(taskPath, document);
+            }
+        }
+
+        private static System.Xml.XmlReaderSettings SecureTaskXmlSettings()
+        {
+            return new System.Xml.XmlReaderSettings
+            {
+                DtdProcessing = System.Xml.DtdProcessing.Prohibit,
+                XmlResolver = null,
+                MaxCharactersInDocument = 16 * 1024 * 1024,
+                MaxCharactersFromEntities = 0,
+                IgnoreComments = true,
+                IgnoreProcessingInstructions = true
+            };
+        }
+
+        private static ScheduledTaskInventorySnapshot ParseScheduledTaskDocument(string taskPath, System.Xml.XmlDocument document)
+        {
+            var snapshot = new ScheduledTaskInventorySnapshot { Path = NormalizeScheduledTaskPath(taskPath), TaskEnabled = true, StateLabel = "Definition" };
+            System.Xml.XmlNode settingsEnabled = document.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']");
+            snapshot.TaskEnabled = ReadTaskXmlBool(settingsEnabled, true);
+            int triggerIndex = 0;
+            foreach (System.Xml.XmlNode node in document.SelectNodes("/*[local-name()='Task']/*[local-name()='Triggers']/*"))
+            {
+                triggerIndex++;
+                int type = TaskTriggerTypeFromXmlName(node.LocalName);
+                snapshot.Triggers.Add(new ScheduledTaskTriggerSnapshot
+                {
+                    Index = triggerIndex,
+                    Type = type,
+                    Id = node.Attributes == null || node.Attributes["id"] == null ? "" : node.Attributes["id"].Value,
+                    Enabled = ReadTaskXmlBool(node.SelectSingleNode("./*[local-name()='Enabled']"), true),
+                    Delay = TaskXmlChildText(node, "Delay"),
+                    UserId = TaskXmlChildText(node, "UserId")
+                });
+            }
+            int actionIndex = 0;
+            foreach (System.Xml.XmlNode node in document.SelectNodes("/*[local-name()='Task']/*[local-name()='Actions']/*"))
+            {
+                actionIndex++;
+                if (string.Equals(node.LocalName, "Exec", StringComparison.OrdinalIgnoreCase))
+                {
+                    snapshot.Actions.Add(new ScheduledTaskActionSnapshot
+                    {
+                        Index = actionIndex,
+                        Type = 0,
+                        Kind = "Exec",
+                        Path = NormalizeScheduledTaskExecutable(TaskXmlChildText(node, "Command")),
+                        Arguments = TaskXmlChildText(node, "Arguments"),
+                        WorkingDirectory = TaskXmlChildText(node, "WorkingDirectory")
+                    });
+                }
+                else if (string.Equals(node.LocalName, "ComHandler", StringComparison.OrdinalIgnoreCase))
+                {
+                    snapshot.Actions.Add(new ScheduledTaskActionSnapshot
+                    {
+                        Index = actionIndex,
+                        Type = 5,
+                        Kind = "ComHandler",
+                        ClassId = TaskXmlChildText(node, "ClassId"),
+                        Data = TaskXmlChildText(node, "Data")
+                    });
+                }
+                else snapshot.Actions.Add(new ScheduledTaskActionSnapshot { Index = actionIndex, Type = -1, Kind = node.LocalName ?? "Unknown" });
+            }
+            return snapshot;
+        }
+
+        private static bool TryAppendScheduledTaskSnapshot(List<StartupItem> rows, HashSet<string> seen, ScheduledTaskInventorySnapshot snapshot)
+        {
+            if (rows == null || seen == null || snapshot == null) return false;
+            string taskPath = NormalizeScheduledTaskPath(snapshot.Path);
+            var startupTriggers = snapshot.Triggers.Where(trigger => IsStartupTaskTriggerType(trigger.Type)).ToList();
+            if (string.IsNullOrWhiteSpace(taskPath) || startupTriggers.Count == 0 || !seen.Add(taskPath)) return false;
+            bool enabledStartupTrigger = startupTriggers.Any(trigger => trigger.Enabled);
+            bool enabled = snapshot.TaskEnabled && enabledStartupTrigger;
+            string kinds = string.Join("+", snapshot.Triggers.Select(trigger => TaskTriggerName(trigger.Type)).Distinct(StringComparer.OrdinalIgnoreCase));
+            string triggerDetails = string.Join(" || ", snapshot.Triggers.Select(trigger => TaskTriggerName(trigger.Type)
+                + "(index=" + trigger.Index + ";enabled=" + trigger.Enabled.ToString().ToLowerInvariant()
+                + (string.IsNullOrWhiteSpace(trigger.Id) ? "" : ";id=" + TaskDetailValue(trigger.Id))
+                + ";delay=" + TaskDetailValue(trigger.Delay)
+                + (string.IsNullOrWhiteSpace(trigger.UserId) ? "" : ";userId=" + TaskDetailValue(trigger.UserId)) + ")"));
+            string command = string.Join(" || ", snapshot.Actions.Select(TaskActionCommand).Where(value => !string.IsNullOrWhiteSpace(value)));
+            string actionDetails = string.Join(" || ", snapshot.Actions.Select(TaskActionDetails));
+            bool modeEditable = snapshot.ActionsComplete && snapshot.Actions.Count == 1 && snapshot.Actions[0].Type == 0 && !string.IsNullOrWhiteSpace(snapshot.Actions[0].Path);
+            string status = (enabled ? "Enabled " : "Disabled ") + kinds + " startup task"
+                + (snapshot.TaskEnabled && !enabledStartupTrigger ? " (startup trigger disabled)" : "")
+                + "; state=" + (string.IsNullOrWhiteSpace(snapshot.StateLabel) ? "Unknown" : snapshot.StateLabel)
+                + "; taskEnabled=" + snapshot.TaskEnabled.ToString().ToLowerInvariant()
+                + "; modeEditable=" + modeEditable.ToString().ToLowerInvariant()
+                + "; triggers=" + triggerDetails
+                + "; actions=" + actionDetails;
+            rows.Add(new StartupItem
+            {
+                Id = "task|" + taskPath,
+                Name = taskPath.TrimStart('\\'),
+                Source = "Scheduled Task",
+                Scope = "User/System",
+                Command = command,
+                Location = taskPath,
+                Enabled = enabled,
+                CanDisable = true,
+                IsManaged = IsManagedScheduledTaskPath(taskPath),
+                Status = status
+            });
+            return true;
+        }
+
+        private static string TaskActionCommand(ScheduledTaskActionSnapshot action)
+        {
+            if (action == null) return "";
+            if (action.Type == 0) return (WinArg(NormalizeScheduledTaskExecutable(action.Path)) + (string.IsNullOrWhiteSpace(action.Arguments) ? "" : " " + action.Arguments)).Trim();
+            if (action.Type == 5) return "COM handler " + action.ClassId;
+            return "Task action " + (string.IsNullOrWhiteSpace(action.Kind) ? "type " + action.Type : action.Kind);
+        }
+
+        // Task Scheduler allows authors to store the Exec Command with one or more outer quote
+        // pairs.  It is still the same executable path.  Normalize that storage detail before
+        // generating the list, filtering it, or comparing a live scheduler readback; otherwise
+        // a valid task such as GCC can look drifted or produce an unsearchable malformed command.
+        internal static string NormalizeScheduledTaskExecutable(string value)
+        {
+            string normalized = (value ?? "").Trim();
+            while (normalized.Length >= 2 && normalized[0] == '"' && normalized[normalized.Length - 1] == '"')
+                normalized = normalized.Substring(1, normalized.Length - 2).Trim();
+            return normalized;
+        }
+
+        private static bool TaskExecutablePathsEqual(string left, string right)
+        {
+            left = NormalizeScheduledTaskExecutable(left);
+            right = NormalizeScheduledTaskExecutable(right);
+            try
+            {
+                left = Environment.ExpandEnvironmentVariables(left).Replace('/', '\\');
+                right = Environment.ExpandEnvironmentVariables(right).Replace('/', '\\');
+                if (Path.IsPathRooted(left)) left = Path.GetFullPath(left);
+                if (Path.IsPathRooted(right)) right = Path.GetFullPath(right);
+            }
+            catch { }
+            return string.Equals(left.TrimEnd('\\'), right.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string TaskActionDetails(ScheduledTaskActionSnapshot action)
+        {
+            if (action == null) return "Unknown";
+            if (action.Type == 0) return "Exec(index=" + action.Index + ";path=" + TaskDetailValue(action.Path) + ";arguments=" + TaskDetailValue(action.Arguments) + ";workingDirectory=" + TaskDetailValue(action.WorkingDirectory) + ")";
+            if (action.Type == 5) return "ComHandler(index=" + action.Index + ";classId=" + TaskDetailValue(action.ClassId) + ";data=" + TaskDetailValue(action.Data) + ")";
+            return "Action(index=" + action.Index + ";kind=" + TaskDetailValue(action.Kind) + ";type=" + action.Type + ")";
+        }
+
+        private static string TaskDetailValue(string value)
+        {
+            return (value ?? "").Replace("\r", @"\r").Replace("\n", @"\n").Replace(";", @"\;").Replace("|", @"\|");
+        }
+
+        private static int TaskTriggerTypeFromXmlName(string name)
+        {
+            if (string.Equals(name, "BootTrigger", StringComparison.OrdinalIgnoreCase)) return 8;
+            if (string.Equals(name, "LogonTrigger", StringComparison.OrdinalIgnoreCase)) return 9;
+            if (string.Equals(name, "EventTrigger", StringComparison.OrdinalIgnoreCase)) return 0;
+            if (string.Equals(name, "TimeTrigger", StringComparison.OrdinalIgnoreCase)) return 1;
+            if (string.Equals(name, "IdleTrigger", StringComparison.OrdinalIgnoreCase)) return 6;
+            if (string.Equals(name, "RegistrationTrigger", StringComparison.OrdinalIgnoreCase)) return 7;
+            if (string.Equals(name, "SessionStateChangeTrigger", StringComparison.OrdinalIgnoreCase)) return 11;
+            return -1;
+        }
+
+        private static string TaskStateName(int state)
+        {
+            switch (state) { case 0: return "Unknown"; case 1: return "Disabled"; case 2: return "Queued"; case 3: return "Ready"; case 4: return "Running"; default: return "State" + state; }
+        }
+
+        private static string TaskXmlChildText(System.Xml.XmlNode node, string localName)
+        {
+            System.Xml.XmlNode child = node == null ? null : node.SelectSingleNode("./*[local-name()='" + localName + "']");
+            return child == null ? "" : (child.InnerText ?? "");
+        }
+
+        private static bool ReadTaskXmlBool(System.Xml.XmlNode node, bool defaultValue)
+        {
+            bool parsed;
+            return node == null || !bool.TryParse((node.InnerText ?? "").Trim(), out parsed) ? defaultValue : parsed;
+        }
+
+        private static string NormalizeScheduledTaskPath(string value)
+        {
+            string text = (value ?? "").Trim().Replace('/', '\\');
+            string[] parts = text.Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            return parts.Length == 0 ? @"\" : @"\" + string.Join(@"\", parts);
+        }
+
+        private static string TaskPathFromDefinitionFile(string root, string file)
+        {
+            return NormalizeScheduledTaskPath(Path.GetRelativePath(root, file).Replace('/', '\\'));
+        }
+
+        private static bool IsManagedScheduledTaskPath(string taskPath)
+        {
+            string normalized = NormalizeScheduledTaskPath(taskPath);
+            return normalized.StartsWith(Program.ManagedTaskRoot, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(normalized.TrimEnd('\\'), Program.ManagedTaskRoot.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static StartupItem ScheduledTaskReadWarning(string taskPath, string stage, Exception ex)
+        {
+            return ErrorItem("Scheduled Task", "System", NormalizeScheduledTaskPath(taskPath) + " :: " + stage, TaskReadException(ex));
+        }
+
+        private static StartupItem TaskCatalogReadNotice(string taskPath, string stage, Exception ex)
+        {
+            string path = NormalizeScheduledTaskPath(taskPath);
+            return ErrorItem("Independent Scheduled Task", "System", path + " :: " + stage, TaskReadException(ex));
+        }
+
+        private static Exception TaskReadException(Exception ex)
+        {
+            Exception actual = ex == null ? new InvalidOperationException("Task object could not be inspected") : ex.GetBaseException();
+            return new InvalidOperationException(actual.GetType().Name + " HRESULT=0x" + actual.HResult.ToString("X8") + ": " + actual.Message, actual);
+        }
+
+        private static void ReleaseComObject(object value)
+        {
+            if (value == null || !Marshal.IsComObject(value)) return;
+            try { Marshal.FinalReleaseComObject(value); } catch { }
+        }
+
+        private static string TaskTriggerName(int value)
+        {
+            switch (value) { case 0: return "Event"; case 1: return "Time"; case 2: return "Daily"; case 3: return "Weekly"; case 4: return "Monthly"; case 5: return "MonthlyDOW"; case 6: return "Idle"; case 7: return "Registration"; case 8: return "Boot"; case 9: return "Logon"; case 11: return "SessionState"; default: return "Type" + value; }
+        }
+
+        private static bool IsStartupTaskTriggerType(int value) { return value == 8 || value == 9; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ServiceStatusProcess
+        {
+            public uint ServiceType, CurrentState, ControlsAccepted, Win32ExitCode, ServiceSpecificExitCode, CheckPoint, WaitHint, ProcessId, ServiceFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct EnumServiceStatusProcess
+        {
+            public IntPtr ServiceName;
+            public IntPtr DisplayName;
+            public ServiceStatusProcess Status;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct QueryServiceConfigData
+        {
+            public uint ServiceType, StartType, ErrorControl;
+            public IntPtr BinaryPathName, LoadOrderGroup;
+            public uint TagId;
+            public IntPtr Dependencies, ServiceStartName, DisplayName;
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr OpenSCManager(string machineName, string databaseName, uint desiredAccess);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool EnumServicesStatusEx(IntPtr manager, int infoLevel, uint serviceType, uint serviceState, IntPtr buffer, uint bufferSize, out uint bytesNeeded, out uint servicesReturned, ref uint resumeHandle, string groupName);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr OpenService(IntPtr manager, string serviceName, uint desiredAccess);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool QueryServiceConfig(IntPtr service, IntPtr config, uint configSize, out uint bytesNeeded);
+        [DllImport("advapi32.dll")]
+        private static extern bool CloseServiceHandle(IntPtr handle);
+
+        private static void AuditServicesNative(List<StartupItem> raw, bool drivers)
+        {
+            const uint ScManagerEnumerateService = 0x0004;
+            const uint ServiceQueryConfig = 0x0001;
+            const uint ServiceStateAll = 0x00000003;
+            const uint ServiceWin32 = 0x00000030;
+            const uint ServiceDriver = 0x0000000B;
+            const int ErrorMoreData = 234;
+            string source = drivers ? "System Driver" : "Windows Service";
+            IntPtr manager = IntPtr.Zero;
+            IntPtr buffer = IntPtr.Zero;
+            try
+            {
+                manager = OpenSCManager(null, null, ScManagerEnumerateService);
+                if (manager == IntPtr.Zero) throw new InvalidOperationException("OpenSCManager failed: " + Marshal.GetLastWin32Error());
+                uint needed, returned, resume = 0;
+                EnumServicesStatusEx(manager, 0, drivers ? ServiceDriver : ServiceWin32, ServiceStateAll, IntPtr.Zero, 0, out needed, out returned, ref resume, null);
+                int firstError = Marshal.GetLastWin32Error();
+                if (needed == 0 && firstError != ErrorMoreData) throw new InvalidOperationException("EnumServicesStatusEx sizing failed: " + firstError);
+                if (needed == 0 || needed > 32 * 1024 * 1024) throw new InvalidOperationException("Service catalog size is invalid: " + needed);
+                buffer = Marshal.AllocHGlobal((int)needed);
+                resume = 0;
+                if (!EnumServicesStatusEx(manager, 0, drivers ? ServiceDriver : ServiceWin32, ServiceStateAll, buffer, needed, out needed, out returned, ref resume, null))
+                    throw new InvalidOperationException("EnumServicesStatusEx failed: " + Marshal.GetLastWin32Error());
+                int recordSize = Marshal.SizeOf(typeof(EnumServiceStatusProcess));
+                for (int index = 0; index < returned; index++)
+                {
+                    EnumServiceStatusProcess status = (EnumServiceStatusProcess)Marshal.PtrToStructure(IntPtr.Add(buffer, index * recordSize), typeof(EnumServiceStatusProcess));
+                    string name = Marshal.PtrToStringUni(status.ServiceName) ?? "";
+                    if (string.IsNullOrWhiteSpace(name)) continue;
+                    IntPtr service = IntPtr.Zero;
+                    IntPtr configBuffer = IntPtr.Zero;
+                    try
+                    {
+                        service = OpenService(manager, name, ServiceQueryConfig);
+                        if (service == IntPtr.Zero) throw new InvalidOperationException("OpenService failed for " + name + ": " + Marshal.GetLastWin32Error());
+                        uint configNeeded;
+                        QueryServiceConfig(service, IntPtr.Zero, 0, out configNeeded);
+                        if (configNeeded == 0 || configNeeded > 1024 * 1024) throw new InvalidOperationException("QueryServiceConfig sizing failed for " + name);
+                        configBuffer = Marshal.AllocHGlobal((int)configNeeded);
+                        if (!QueryServiceConfig(service, configBuffer, configNeeded, out configNeeded)) throw new InvalidOperationException("QueryServiceConfig failed for " + name + ": " + Marshal.GetLastWin32Error());
+                        QueryServiceConfigData config = (QueryServiceConfigData)Marshal.PtrToStructure(configBuffer, typeof(QueryServiceConfigData));
+                        if (config.StartType > 2) continue;
+                        string display = Marshal.PtrToStringUni(status.DisplayName) ?? name;
+                        string command = Marshal.PtrToStringUni(config.BinaryPathName) ?? "";
+                        raw.Add(new StartupItem
+                        {
+                            Id = (drivers ? "driver|" : "service|") + B64(name), Name = display, Source = source,
+                            Scope = "Machine", Command = command, Location = @"HKLM\SYSTEM\CurrentControlSet\Services\" + name,
+                            Enabled = true, CanDisable = IsElevated(), Status = "SCM start=" + config.StartType + " state=" + status.Status.CurrentState
+                        });
+                    }
+                    catch (Exception ex) { raw.Add(ErrorItem("Independent " + source, "Machine", name, ex)); }
+                    finally
+                    {
+                        if (configBuffer != IntPtr.Zero) Marshal.FreeHGlobal(configBuffer);
+                        if (service != IntPtr.Zero) CloseServiceHandle(service);
+                    }
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent " + source, "Machine", "Service Control Manager", ex)); }
+            finally
+            {
+                if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                if (manager != IntPtr.Zero) CloseServiceHandle(manager);
+            }
+        }
+
+        private static void AuditAdvancedRegistrySources(List<StartupItem> raw)
+        {
+            Action<string, string, string> add = (path, valueName, source) =>
+            {
+                try
+                {
+                    using (var key = Registry.LocalMachine.OpenSubKey(path, false))
+                    {
+                        if (key == null) return;
+                        object value = key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                        string[] values = value as string[] ?? (value == null ? null : new[] { Convert.ToString(value) });
+                        if (values == null) return;
+                        for (int i = 0; i < values.Length; i++) if (!string.IsNullOrWhiteSpace(values[i])) raw.Add(new StartupItem { Id = "advanced|" + B64(Registry.LocalMachine.Name) + "|" + B64(path) + "|" + B64(valueName) + "|" + i, Name = valueName + (values.Length > 1 ? " #" + (i + 1) : ""), Source = source, Scope = "Machine", Command = values[i], Location = Registry.LocalMachine.Name + @"\" + path + @"\" + valueName, Enabled = true });
+                    }
+                }
+                catch (Exception ex) { raw.Add(ErrorItem("Independent " + source, "Machine", path + @"\" + valueName, ex)); }
+            };
+            foreach (string value in new[] { "BootExecute", "SetupExecute", "Execute", "S0InitialCommand" }) add(@"SYSTEM\CurrentControlSet\Control\Session Manager", value, "Boot Execute");
+            foreach (string value in new[] { "Authentication Packages", "Notification Packages", "Security Packages" }) add(@"SYSTEM\CurrentControlSet\Control\Lsa", value, "LSA Startup Package");
+            add(@"SYSTEM\CurrentControlSet\Control\Lsa\OSConfig", "Security Packages", "LSA Startup Package");
+        }
+
+        // Keep this audit walk separate from the primary collector.  A new source must be
+        // observable through two independent registry traversals or it remains a visible audit
+        // gap instead of being silently assumed covered.
+        private static void AuditExtendedAutorunSources(List<StartupItem> raw)
+        {
+            AuditWinlogonNotificationDlls(raw);
+            AuditImageHijackEntries(raw);
+            AuditKnownDllEntries(raw);
+            AuditNetworkProviderEntries(raw);
+            AuditWinsockProviderEntries(raw);
+            AuditPrintMonitorEntries(raw);
+            AuditMediaCodecEntries(raw);
+        }
+
+        private static void AuditWinlogonNotificationDlls(List<StartupItem> raw)
+        {
+            const string notify = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Notify";
+            foreach (RegistryView view in StartupRegistryViews())
+            using (var root = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+                AuditRegistryExtensionSubkeyValue(raw, root, notify, "Machine", "Winlogon Notification", "winlogon-notify", "DllName", "Winlogon loads this notification DLL during logon events", RegistryViewLabel(view), true);
+        }
+
+        private static void AuditImageHijackEntries(List<StartupItem> raw)
+        {
+            const string ifeo = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
+            const string silentExit = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit";
+            foreach (RegistryView view in StartupRegistryViews())
+            using (var root = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+            {
+                string label = RegistryViewLabel(view);
+                AuditRegistryExtensionSubkeyValue(raw, root, ifeo, "Machine", "Image Hijack", "image-hijack", "Debugger", "Launches the configured debugger whenever the named image starts", label, false);
+                AuditRegistryExtensionSubkeyValue(raw, root, ifeo, "Machine", "Image Hijack", "image-hijack", "VerifierDlls", "Loads the configured verifier DLLs whenever the named image starts", label, false);
+                AuditRegistryExtensionSubkeyValue(raw, root, silentExit, "Machine", "Image Hijack", "image-hijack", "MonitorProcess", "Launches the configured monitor when the named image exits silently", label, false);
+            }
+        }
+
+        private static void AuditKnownDllEntries(List<StartupItem> raw)
+        {
+            const string sessionManager = @"SYSTEM\CurrentControlSet\Control\Session Manager";
+            AuditRegistryExtensionValues(raw, Registry.LocalMachine, sessionManager + @"\KnownDLLs", "Machine", "Known DLL", "known-dll", "Known DLL loaded into processes that import it", NativeRegistryViewLabel(), new[] { "DllDirectory" }, true);
+            AuditRegistryExtensionValues(raw, Registry.LocalMachine, sessionManager + @"\KnownDLLs32", "Machine", "Known DLL", "known-dll", "Known DLL loaded into 32-bit processes that import it", NativeRegistryViewLabel(), new[] { "DllDirectory" }, true);
+        }
+
+        private static void AuditNetworkProviderEntries(List<StartupItem> raw)
+        {
+            const string orderPath = @"SYSTEM\CurrentControlSet\Control\NetworkProvider\Order";
+            try
+            {
+                using (var key = Registry.LocalMachine.OpenSubKey(orderPath, false))
+                {
+                    string order = RegistryValueText(key == null ? null : key.GetValue("ProviderOrder", null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    foreach (string provider in ParseNetworkProviderOrder(order))
+                    {
+                        string path = @"SYSTEM\CurrentControlSet\Services\" + provider + @"\NetworkProvider";
+                        AuditRegistryExtensionValue(raw, Registry.LocalMachine, path, "Machine", "Network Provider", "network-provider", "ProviderPath", "Network provider loaded during interactive logon", NativeRegistryViewLabel(), true);
+                    }
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent Network Provider", "Machine", Registry.LocalMachine.Name + @"\" + orderPath, ex)); }
+        }
+
+        // This is a deliberately fresh OS catalog query, performed after ScanAll rather than
+        // reusing its rows. The separate native and 32-bit catalog calls make a provider that
+        // is absent from the primary dashboard a visible audit gap instead of an invisible
+        // startup path.
+        private static void AuditWinsockProviderEntries(List<StartupItem> raw)
+        {
+            AuditWinsockProviderCatalog(raw, false);
+            if (Environment.Is64BitOperatingSystem) AuditWinsockProviderCatalog(raw, true);
+        }
+
+        private static void AuditWinsockProviderCatalog(List<StartupItem> raw, bool catalog32)
+        {
+            string catalog = WinsockCatalogLabel(catalog32);
+            try
+            {
+                foreach (WinsockProtocolInfo info in EnumerateWinsockProtocolInfos(catalog32))
+                    raw.Add(ReadOnlyWinsockProviderItem(info, catalog32, GetWinsockProviderPath(info.ProviderId, catalog32)));
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent Winsock Provider", "Machine", catalog, ex)); }
+        }
+
+        private static void AuditPrintMonitorEntries(List<StartupItem> raw)
+        {
+            const string monitors = @"SYSTEM\CurrentControlSet\Control\Print\Monitors";
+            AuditRegistryExtensionSubkeyValue(raw, Registry.LocalMachine, monitors, "Machine", "Print Monitor", "print-monitor", "Driver", "Print Spooler loads this monitor DLL when the spooler service starts", NativeRegistryViewLabel(), true);
+        }
+
+        private static void AuditMediaCodecEntries(List<StartupItem> raw)
+        {
+            const string codecs = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Drivers32";
+            foreach (RegistryView view in StartupRegistryViews())
+            using (var root = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+                AuditRegistryExtensionValues(raw, root, codecs, "Machine", "Media Codec", "media-codec", "Media codec loaded when its media class is used", RegistryViewLabel(view), null, true);
+        }
+
+        private static void AuditRegistryExtensionValue(List<StartupItem> raw, RegistryKey root, string subKey, string scope, string source, string kind, string valueName, string status, string viewLabel, bool expandSystemModule)
+        {
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    string value = RegistryValueText(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    if (string.IsNullOrWhiteSpace(value)) return;
+                    raw.Add(ReadOnlyExtensionItem(kind, root, subKey, valueName, scope, source, expandSystemModule ? ExpandSystemModulePath(value) : value, status, viewLabel));
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent " + source, scope, root.Name + @"\" + subKey + @"\" + valueName, ex)); }
+        }
+
+        private static void AuditRegistryExtensionSubkeyValue(List<StartupItem> raw, RegistryKey root, string parentPath, string scope, string source, string kind, string valueName, string status, string viewLabel, bool expandSystemModule)
+        {
+            try
+            {
+                using (var parent = root.OpenSubKey(parentPath, false))
+                {
+                    if (parent == null) return;
+                    foreach (string child in parent.GetSubKeyNames().OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
+                        AuditRegistryExtensionValue(raw, root, parentPath + @"\" + child, scope, source, kind, valueName, status, viewLabel, expandSystemModule);
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent " + source, scope, root.Name + @"\" + parentPath, ex)); }
+        }
+
+        private static void AuditRegistryExtensionValues(List<StartupItem> raw, RegistryKey root, string subKey, string scope, string source, string kind, string status, string viewLabel, string[] excludedValues, bool expandSystemModule)
+        {
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    foreach (string valueName in key.GetValueNames().OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (excludedValues != null && excludedValues.Any(excluded => string.Equals(excluded, valueName, StringComparison.OrdinalIgnoreCase))) continue;
+                        string value = RegistryValueText(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                        if (string.IsNullOrWhiteSpace(value)) continue;
+                        raw.Add(ReadOnlyExtensionItem(kind, root, subKey, valueName, scope, source, expandSystemModule ? ExpandSystemModulePath(value) : value, status, viewLabel));
+                    }
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent " + source, scope, root.Name + @"\" + subKey, ex)); }
+        }
+
+        private static void AuditGroupPolicyScripts(List<StartupItem> raw)
+        {
+            foreach (var spec in new[]
+            {
+                Tuple.Create(Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Startup", "Machine"),
+                Tuple.Create(Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\Machine\Scripts\Startup", "Machine"),
+                Tuple.Create(Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Logon", "User"),
+                Tuple.Create(Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\User\Scripts\Logon", "User")
+            })
+            {
+                try { AuditGroupPolicyTree(raw, spec.Item1, spec.Item2, spec.Item3, 0); }
+                catch (Exception ex) { raw.Add(ErrorItem("Independent Group Policy Script", spec.Item3, spec.Item1.Name + @"\" + spec.Item2, ex)); }
+            }
+        }
+
+        private static void AuditGroupPolicyTree(List<StartupItem> raw, RegistryKey root, string subKey, string scope, int depth)
+        {
+            if (depth > 8) return;
+            using (var key = root.OpenSubKey(subKey, false))
+            {
+                if (key == null) return;
+                string script = Convert.ToString(key.GetValue("Script", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                if (!string.IsNullOrWhiteSpace(script))
+                {
+                    string args = Convert.ToString(key.GetValue("Parameters", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    raw.Add(new StartupItem { Id = "gpscript|" + B64(root.Name) + "|" + B64(subKey), Name = Path.GetFileName(script), Source = "Group Policy Script", Scope = scope, Command = script + (string.IsNullOrWhiteSpace(args) ? "" : " " + args), Location = root.Name + @"\" + subKey, Enabled = true });
+                }
+                foreach (string child in key.GetSubKeyNames()) AuditGroupPolicyTree(raw, root, subKey + @"\" + child, scope, depth + 1);
+            }
+        }
+
+        private static void AuditWmiConsumers(List<StartupItem> raw)
+        {
+            try
+            {
+                var scope = new ManagementScope(@"\\.\root\subscription");
+                scope.Connect();
+                using (var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT Filter, Consumer FROM __FilterToConsumerBinding")))
+                foreach (ManagementObject binding in searcher.Get())
+                {
+                    string consumerRef = Convert.ToString(binding["Consumer"] ?? "");
+                    if (string.IsNullOrWhiteSpace(consumerRef)) continue;
+                    try
+                    {
+                        using (var consumer = new ManagementObject(scope, new ManagementPath(consumerRef), null))
+                        {
+                            consumer.Get();
+                            string cls = consumer.ClassPath.ClassName ?? "";
+                            if (cls != "CommandLineEventConsumer" && cls != "ActiveScriptEventConsumer") continue;
+                            string name = Convert.ToString(consumer["Name"] ?? consumerRef);
+                            string command = cls == "CommandLineEventConsumer" ? Convert.ToString(consumer["CommandLineTemplate"] ?? consumer["ExecutablePath"] ?? "") : Convert.ToString(consumer["ScriptText"] ?? "");
+                            string location = binding.Path.Path;
+                            raw.Add(new StartupItem { Id = "wmisub|" + B64(location), Name = name, Source = "WMI Event Consumer", Scope = "Machine", Command = command, Location = location, Enabled = true });
+                        }
+                    }
+                    catch (Exception ex) { raw.Add(ErrorItem("Independent WMI Event Consumer", "Machine", consumerRef, ex)); }
+                }
+            }
+            catch (Exception ex) { raw.Add(ErrorItem("Independent WMI Event Consumer", "Machine", @"root\subscription", ex)); }
+        }
+
+        public static string InventorySelfTest()
+        {
+            int checks = 0;
+            Action<bool, string> require = (condition, message) => { checks++; if (!condition) throw new InvalidOperationException("INVENTORY_SELF_TEST failed: " + message); };
+
+            var native = new StartupItem { Id = "reg|User|fixture", Name = "Fixture", Source = "Registry Run", Scope = "User", Command = "\"C:\\Fixture App\\fixture.exe\" --ready", Location = @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run", Enabled = true };
+            var mirror = new StartupItem { Id = "wmi|fixture", Name = "Fixture", Source = "Startup Command", Scope = "User", Command = @"C:\Fixture App\fixture.exe --ready", Location = "HKU", Enabled = true };
+            var mirrored = Dedupe(new List<StartupItem> { mirror, native });
+            require(mirrored.Count == 1 && mirrored[0].Source == "Registry Run", "Win32_StartupCommand mirror must collapse into its native registration");
+
+            var task = new StartupItem { Id = @"task|\Fixture", Name = "Fixture", Source = "Scheduled Task", Scope = "User/System", Command = native.Command, Location = @"\Fixture", Enabled = true };
+            var independent = Dedupe(new List<StartupItem> { native, task });
+            require(independent.Count == 2, "independent active Run and task registrations must remain independently controllable");
+
+            var disabledTask = new StartupItem { Id = @"task|\Fixture.Disabled", Name = "Fixture disabled", Source = "Scheduled Task", Scope = "User/System", Command = native.Command, Location = @"\Fixture.Disabled", Enabled = false };
+            require(Dedupe(new List<StartupItem> { native, disabledTask }).Count == 2, "a disabled scheduled route must remain visible even when another route launches the same command");
+            require(!CanMutateStartupMode(new StartupItem { Id = @"task|\Fixture.Disabled.Managed", Source = "Scheduled Task", IsManaged = true, Enabled = false }), "disabled managed task edit/mode mutations must fail closed without implicit enable or duplication");
+            require(!CanUpsertManagedTaskState("disabled") && CanUpsertManagedTaskState("enabled") && CanUpsertManagedTaskState("missing"), "add/update must fail closed on a disabled matching managed task before task/store mutation");
+
+            string scheduledTaskXmlFixture = "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><BootTrigger><Enabled>true</Enabled><Delay>PT5S</Delay></BootTrigger><LogonTrigger><Enabled>false</Enabled><UserId>FIXTURE\\User</UserId></LogonTrigger></Triggers><Actions Context='Author'><Exec><Command>C:\\Fixture App\\fixture.exe</Command><Arguments>--profile alpha</Arguments><WorkingDirectory>C:\\Fixture App</WorkingDirectory></Exec></Actions><Settings><Enabled>true</Enabled></Settings></Task>";
+            ScheduledTaskInventorySnapshot scheduledSnapshot = ParseScheduledTaskXml(@"\Fixture\BootAndLogon", scheduledTaskXmlFixture);
+            var scheduledRows = new List<StartupItem>();
+            var scheduledSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, scheduledSnapshot), "boot/logon task XML must produce a startup route");
+            require(scheduledRows.Count == 1 && scheduledRows[0].Id == @"task|\Fixture\BootAndLogon" && scheduledRows[0].Enabled, "scheduled task route must preserve its exact path and effective enabled state");
+            require(scheduledRows[0].Command.Contains(@"C:\Fixture App\fixture.exe", StringComparison.Ordinal) && scheduledRows[0].Command.Contains("--profile alpha", StringComparison.Ordinal), "scheduled task command must preserve exact executable and arguments");
+            require(scheduledRows[0].Status.Contains(@"workingDirectory=C:\Fixture App", StringComparison.Ordinal) && scheduledRows[0].Status.Contains("state=Definition", StringComparison.Ordinal) && scheduledRows[0].Status.Contains("Exec(index=1", StringComparison.Ordinal), "scheduled task status must preserve working directory, action index, and provider state");
+            string quotedTaskXmlFixture = "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Actions><Exec><Command>&quot;C:\\Fixture App\\fixture.exe&quot;</Command><Arguments>-b</Arguments></Exec></Actions><Settings><Enabled>true</Enabled></Settings></Task>";
+            ScheduledTaskInventorySnapshot quotedTaskSnapshot = ParseScheduledTaskXml(@"\Fixture\QuotedCommand", quotedTaskXmlFixture);
+            var quotedTaskRows = new List<StartupItem>();
+            require(TryAppendScheduledTaskSnapshot(quotedTaskRows, new HashSet<string>(StringComparer.OrdinalIgnoreCase), quotedTaskSnapshot) && quotedTaskRows.Count == 1, "quoted logon task command must remain a visible startup route");
+            string quotedTaskExe, quotedTaskArgs;
+            require(TrySplitCommand(quotedTaskRows[0].Command, out quotedTaskExe, out quotedTaskArgs) && string.Equals(quotedTaskExe, @"C:\Fixture App\fixture.exe", StringComparison.OrdinalIgnoreCase) && quotedTaskArgs == "-b", "quoted Task Scheduler executable must normalize before search, launch, and readback comparison");
+            require(TaskExecutablePathsEqual("\"\"C:\\Fixture App\\fixture.exe\"\"", @"C:\Fixture App\fixture.exe"), "nested Task Scheduler quote pairs must compare as one executable path");
+            require(!TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, scheduledSnapshot) && scheduledRows.Count == 1, "duplicate task paths from a provider must be emitted once");
+            ScheduledTaskInventorySnapshot nonStartupSnapshot = ParseScheduledTaskXml(@"\Fixture\Hourly", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><TimeTrigger><Enabled>true</Enabled></TimeTrigger></Triggers><Actions><Exec><Command>C:\\Fixture\\hourly.exe</Command></Exec></Actions><Settings><Enabled>true</Enabled></Settings></Task>");
+            require(!TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, nonStartupSnapshot), "tasks without boot/logon triggers must stay outside startup inventory");
+            ScheduledTaskInventorySnapshot unknownEnabledSnapshot = ParseScheduledTaskXml(@"\Fixture\UnknownEnabled", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><LogonTrigger><Enabled>false</Enabled></LogonTrigger></Triggers><Actions><Exec><Command>C:\\Fixture\\disabled.exe</Command></Exec></Actions></Task>");
+            require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, unknownEnabledSnapshot) && !scheduledRows.Last().Enabled, "an unreadable/false startup-trigger Enabled state must fail closed rather than be guessed enabled");
+            ScheduledTaskInventorySnapshot multiActionSnapshot = ParseScheduledTaskXml(@"\Fixture\MultiAction", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><BootTrigger/></Triggers><Actions><Exec><Command>C:\\Fixture\\one.exe</Command></Exec><ComHandler><ClassId>{00000000-0000-0000-0000-000000000001}</ClassId></ComHandler></Actions></Task>");
+            require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, multiActionSnapshot) && scheduledRows.Last().CanDisable && !CanMutateStartupMode(scheduledRows.Last()), "multi-action/COM-handler tasks must remain enable-disable capable but fail closed for launch-mode editing");
+            StartupItem taskWarningFixture = ScheduledTaskReadWarning(@"\Fixture\Broken", "Definition", new InvalidOperationException("fixture read failure"));
+            require(taskWarningFixture.Id == @"error|Scheduled Task|\Fixture\Broken :: Definition" && taskWarningFixture.Command.Contains("HRESULT=0x", StringComparison.Ordinal) && taskWarningFixture.Command.Contains("fixture read failure", StringComparison.Ordinal), "unreadable scheduled objects must produce precise stable warnings with HRESULT evidence");
+            StartupItem omittedCatalogWarning = TaskCatalogReadNotice(@"\Fixture\OmittedStartup", "Definition file", new UnauthorizedAccessException("fixture denied"));
+            require(omittedCatalogWarning.Id.StartsWith("error|Independent Scheduled Task|", StringComparison.Ordinal) && omittedCatalogWarning.Location.Contains(@"\Fixture\OmittedStartup", StringComparison.Ordinal), "an unreadable independent candidate omitted by the primary provider must remain a fail-closed audit error");
+            require(!BootSourceCovered(scheduledRows[0], new List<StartupItem>()), "an independently observed task omitted by the primary provider must become an audit gap");
+            require(MaximumTaskFolders >= 512 && MaximumScheduledTasks >= 4096 && ScheduledTaskReadWarning(@"\", "Task traversal budget", new InvalidOperationException("budget")).Id.StartsWith("error|Scheduled Task|", StringComparison.Ordinal), "task traversal caps must fail visible instead of silently truncating coverage");
+            bool taskDtdRejected = false;
+            try { ParseScheduledTaskXml(@"\Fixture\Dtd", "<!DOCTYPE Task [<!ENTITY xxe SYSTEM 'file:///C:/Windows/win.ini'>]><Task>&xxe;</Task>"); }
+            catch (System.Xml.XmlException) { taskDtdRejected = true; }
+            require(taskDtdRejected, "task definition XML must prohibit DTD/entity expansion");
+            StartupItem corruptProviderRow;
+            require(!TryParseProviderRow("R\tcorrupt", out corruptProviderRow), "corrupt isolated-provider protocol rows must be rejected rather than partially accepted");
+
+            var gpoA = new StartupItem { Id = "gpo|one", Name = "Fixture GPO A", Source = "Group Policy Script", Scope = "Machine", Command = native.Command, Location = @"C:\Windows\System32\GroupPolicy\Machine\Scripts\Startup\one.ini", Enabled = true };
+            var gpoB = new StartupItem { Id = "gpo|two", Name = "Fixture GPO B", Source = "Group Policy Script", Scope = "Machine", Command = native.Command, Location = @"C:\Windows\System32\GroupPolicy\Machine\Scripts\Startup\two.ini", Enabled = true };
+            require(Dedupe(new List<StartupItem> { gpoA, gpoB }).Count == 2, "distinct Group Policy registrations must not collapse merely because their commands match");
+
+            // Expert-route mutation fixtures are deliberately pure. They exercise the exact
+            // registry-value plans and codecs used by live mutation without opening or writing a
+            // real registry hive.
+            var currentUserCapability = DecideRegistryMutationCapability("User", Registry.CurrentUser.Name, true, false, "");
+            require(currentUserCapability.CanMutate && !currentUserCapability.RequiresElevation, "a writable current-user startup value must remain mutable without elevation");
+            string capabilityCurrentSid = CurrentUserSid();
+            string capabilityOtherSid = string.Equals(capabilityCurrentSid, "S-1-5-18", StringComparison.OrdinalIgnoreCase) ? "S-1-5-19" : "S-1-5-18";
+            var currentUserHkuCapability = DecideRegistryMutationCapability("User", Registry.Users.Name, true, false, "", capabilityCurrentSid + @"\SOFTWARE\Fixture");
+            require(currentUserHkuCapability.CanMutate && !currentUserHkuCapability.RequiresElevation, "the current user's HKU startup value may remain mutable without elevation when its write preflight succeeds");
+            var misleadingOtherUserHkuCapability = DecideRegistryMutationCapability("User", Registry.Users.Name, true, true, "", capabilityOtherSid + @"\SOFTWARE\Fixture");
+            require(misleadingOtherUserHkuCapability.CanMutate && misleadingOtherUserHkuCapability.RequiresElevation, "an HKU row cannot become current-user scoped merely because its display scope says User");
+            var machineHiveUserLabelCapability = DecideRegistryMutationCapability("User", Registry.LocalMachine.Name, true, true, "");
+            require(machineHiveUserLabelCapability.CanMutate && machineHiveUserLabelCapability.RequiresElevation, "an HKLM value must require elevation even when a provider row carries a user label");
+            var otherUserCapability = DecideRegistryMutationCapability("User:Fixture", Registry.Users.Name, true, true, "");
+            require(otherUserCapability.CanMutate && otherUserCapability.RequiresElevation, "another user's HKU value must retain its elevation requirement after a successful elevated preflight");
+            var machineDeniedCapability = DecideRegistryMutationCapability("Machine", Registry.LocalMachine.Name, false, false, "");
+            require(!machineDeniedCapability.CanMutate && machineDeniedCapability.RequiresElevation && machineDeniedCapability.Reason.Contains("elevat", StringComparison.OrdinalIgnoreCase), "an inaccessible machine value must expose its elevation requirement instead of a false-success action");
+            var machineWritableButUnelevatedCapability = DecideRegistryMutationCapability("Machine", Registry.LocalMachine.Name, true, false, "");
+            require(!machineWritableButUnelevatedCapability.CanMutate && machineWritableButUnelevatedCapability.RequiresElevation, "a machine startup value must remain unavailable until the trusted process is elevated even if an unusual ACL permits opening a write handle");
+            var machineAllowedCapability = DecideRegistryMutationCapability("Machine", Registry.LocalMachine.Name, true, true, "");
+            require(machineAllowedCapability.CanMutate && machineAllowedCapability.RequiresElevation, "an elevated writable machine value must expose a real transactional capability");
+            var domainPolicyCapability = DecideRegistryMutationCapability("Machine", Registry.LocalMachine.Name, false, true, "Domain Group Policy");
+            require(!domainPolicyCapability.CanMutate && domainPolicyCapability.ExternalAuthority == "Domain Group Policy", "domain policy must remain externally authoritative even in an elevated process");
+
+            string winlogonRaw = " explorer.exe , \"C:\\Third,Party\\tray.exe\" --boot ,";
+            List<string> winlogonParts;
+            require(TrySplitWinlogonComponents(winlogonRaw, out winlogonParts) && winlogonParts.Count == 3 && winlogonParts[1].Trim() == @"""C:\Third,Party\tray.exe"" --boot", "Winlogon component parsing must preserve quoted commas and exact segment order");
+            RegistryValueState winlogonBefore = BuildRegistryValueState(true, RegistryValueKind.ExpandString, winlogonRaw);
+            AdvancedMutationPlan winlogonPlan = BuildWinlogonRemovalPlan(winlogonBefore, 1, winlogonParts[1].Trim());
+            require(winlogonPlan.After.Exists && winlogonPlan.After.Kind == RegistryValueKind.ExpandString.ToString() && winlogonPlan.After.Payload == " explorer.exe ,", "row-level Winlogon removal must preserve the Windows shell and untouched delimiter order");
+            require(IsProtectedWindowsWinlogonComponent("Shell", " explorer.exe ") && IsProtectedWindowsWinlogonComponent("Userinit", @"C:\Windows\System32\userinit.exe") && !IsProtectedWindowsWinlogonComponent("Shell", @"C:\ThirdParty\shell-helper.exe"), "known Windows Winlogon defaults must be protected while a third-party component remains expert-mutable");
+
+            RegistryValueState bootBefore = BuildRegistryValueState(true, RegistryValueKind.MultiString, new[] { "autocheck autochk *", "Fixture boot component", "tail component" });
+            AdvancedMutationPlan bootPlan = BuildIndexedMultiStringRemovalPlan(bootBefore, 1, "Fixture boot component");
+            require(bootPlan.After.Exists && bootPlan.After.Kind == RegistryValueKind.MultiString.ToString() && bootPlan.After.Payload == "[\"autocheck autochk *\",\"tail component\"]", "BootExecute/LSA removal must remove only the exact indexed REG_MULTI_SZ element and preserve order");
+            require(RegistryValueStateEquals(bootBefore, BuildRegistryValueState(true, RegistryValueKind.MultiString, new[] { "autocheck autochk *", "Fixture boot component", "tail component" })) && !RegistryValueStateEquals(bootBefore, BuildRegistryValueState(true, RegistryValueKind.MultiString, new[] { "changed" })), "advanced mutation preconditions must bind existence, kind, raw content, and order");
+
+            RegistryValueState appInitDlls = BuildRegistryValueState(true, RegistryValueKind.ExpandString, @" C:\One.dll   ""C:\Two With Space.dll"" ");
+            RegistryValueState appInitLoad = BuildRegistryValueState(true, RegistryValueKind.DWord, 1);
+            AdvancedMutationPlan appInitPlan = BuildAppInitTogglePlan(appInitDlls, appInitLoad);
+            require(appInitPlan.GuardBefore.Hash == appInitDlls.Hash && appInitPlan.After.Payload == "0" && appInitPlan.After.Kind == RegistryValueKind.DWord.ToString(), "AppInit disable must toggle only LoadAppInit_DLLs while hash-binding the exact DLL list");
+
+            var advancedRecord = new AdvancedDisabledState
+            {
+                Version = 1, RouteType = "advanced", Source = "Boot Execute", RootName = Registry.LocalMachine.Name,
+                SubKey = @"SYSTEM\CurrentControlSet\Control\Session Manager", ValueName = "BootExecute", RegistryView = "Registry32",
+                OriginalIndex = 1, Component = "Fixture boot component", Before = bootBefore, After = bootPlan.After,
+                RequiresExpertConfirmation = true, RequiresReboot = true
+            };
+            AdvancedDisabledState advancedRoundTrip = DecodeAdvancedDisabledState(EncodeAdvancedDisabledState(advancedRecord));
+            require(advancedRoundTrip.RegistryView == "Registry32" && advancedRoundTrip.OriginalIndex == 1 && advancedRoundTrip.Component == "Fixture boot component" && RegistryValueStateEquals(advancedRoundTrip.Before, bootBefore) && RegistryValueStateEquals(advancedRoundTrip.After, bootPlan.After), "disabled-route metadata must round-trip exact indexed state and registry view");
+            bool unsafeAdvancedRecordRejected = false;
+            try
+            {
+                EncodeAdvancedDisabledState(new AdvancedDisabledState
+                {
+                    Version = 1, RouteType = "advanced", Source = "Boot Execute", RootName = Registry.LocalMachine.Name,
+                    SubKey = @"SOFTWARE\Fixture", ValueName = "BootExecute", RegistryView = "Registry32", OriginalIndex = 1,
+                    Component = "Fixture boot component", Before = bootBefore, After = bootPlan.After,
+                    RequiresExpertConfirmation = false, RequiresReboot = true
+                });
+            }
+            catch (InvalidOperationException) { unsafeAdvancedRecordRejected = true; }
+            require(unsafeAdvancedRecordRejected, "stored advanced metadata must reject unapproved registry paths and any attempt to clear expert confirmation");
+            require(!ShouldApplyExactRegistryRollback(bootBefore, bootPlan.After, bootBefore), "rollback must be a no-op when the original exact state is already present");
+            require(ShouldApplyExactRegistryRollback(bootBefore, bootPlan.After, bootPlan.After), "rollback may restore only from the exact mutation result");
+            bool driftedRollbackRejected = false;
+            try { ShouldApplyExactRegistryRollback(bootBefore, bootPlan.After, BuildRegistryValueState(true, RegistryValueKind.MultiString, new[] { "external change" })); }
+            catch (InvalidOperationException) { driftedRollbackRejected = true; }
+            require(driftedRollbackRejected, "rollback must refuse to overwrite an unexpected concurrent registry change");
+            require(AdvancedProtectionKey(Registry.LocalMachine.Name, advancedRecord.SubKey, advancedRecord.ValueName, 1, "Registry32") != AdvancedProtectionKey(Registry.LocalMachine.Name, advancedRecord.SubKey, advancedRecord.ValueName, 1, "Registry64")
+                && AdvancedProtectionKey(Registry.LocalMachine.Name, advancedRecord.SubKey, advancedRecord.ValueName, 1, "Registry32") != AdvancedProtectionKey(Registry.LocalMachine.Name, advancedRecord.SubKey, advancedRecord.ValueName, 2, "Registry32"), "advanced disabled-store keys must distinguish registry views and exact indexed components");
+
+            require(ClassifyGroupPolicyAuthority(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Startup\0\0", @"C:\Windows\System32\GroupPolicy\Machine", "", "") == "Local Group Policy", "local policy scripts must identify their owning authority");
+            require(ClassifyGroupPolicyAuthority(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\Machine\Scripts\Startup\0\0", @"\\contoso.test\SYSVOL\contoso.test\Policies\{FIXTURE}", "LDAP://CN=Policies,CN=System,DC=contoso,DC=test", "{FIXTURE}") == "Domain Group Policy", "domain policy scripts must identify their external authority");
+            var expertFixture = new StartupItem { Id = "advanced|fixture", CanDisable = true, MutationCapability = "TransactionalRegistryValue", RequiresExpertConfirmation = true };
+            bool missingExpertConfirmationRejected = false;
+            try { EnsureMutationAuthorized(expertFixture, false); } catch (InvalidOperationException) { missingExpertConfirmationRejected = true; }
+            require(missingExpertConfirmationRejected, "expert-risk routes must reject mutation without the explicit trusted confirmation path");
+            EnsureMutationAuthorized(expertFixture, true);
+
+            var physicalDuplicate = Dedupe(new List<StartupItem> { native, new StartupItem { Id = native.Id, Name = native.Name, Source = native.Source, Scope = native.Scope, Command = native.Command, Location = native.Location, Enabled = true } });
+            require(physicalDuplicate.Count == 1, "same physical registration must appear once");
+
+            var approvalItems = new List<StartupItem> { new StartupItem { Id = "reg|User|approval", Name = "Fixture", Source = "Registry Run", Scope = "User", Command = native.Command, Location = @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run", Enabled = true, CanDisable = true } };
+            ApplyStartupApproved(approvalItems, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", Scope = "User", Kind = "Run", Name = "Fixture", Data = new byte[] { 3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 } } });
+            require(approvalItems.Count == 1 && !approvalItems[0].Enabled && !string.IsNullOrWhiteSpace(approvalItems[0].ApprovalPath), "StartupApproved must overlay the real row without a duplicate");
+
+            var staleApproval = new List<StartupItem>();
+            ApplyStartupApproved(staleApproval, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "Run", Name = "Removed", Data = new byte[] { 3 } } });
+            require(staleApproval.Count == 1 && staleApproval[0].Source == "Stale Startup Metadata" && staleApproval[0].PopupLabel() == "N/A", "orphaned Run approval metadata must be a non-actionable warning, not an installed startup app");
+            var stalePackaged = new List<StartupItem>();
+            ApplyStartupApproved(stalePackaged, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "StartupTasks", Name = "Packaged.Task", Data = new byte[] { 7 } } });
+            require(stalePackaged.Count == 1 && stalePackaged[0].Source == "Stale Startup Metadata" && !stalePackaged[0].Enabled, "orphaned packaged approval bytes must not create a phantom app row");
+
+            string manifestFixture = "<Package xmlns='http://schemas.microsoft.com/appx/manifest/foundation/windows10' xmlns:desktop='http://schemas.microsoft.com/appx/manifest/desktop/windows10'><Identity Name='Fixture.Package' Publisher='CN=Fixture' Version='1.0.0.0'/><Properties><DisplayName>Fixture package</DisplayName></Properties><Applications><Application Id='App' Executable='Fixture.exe' EntryPoint='Windows.FullTrustApplication'><Extensions><desktop:Extension Category='windows.startupTask' Executable='Fixture.exe' EntryPoint='Windows.FullTrustApplication'><desktop:StartupTask TaskId='FixtureBoot' Enabled='true' DisplayName='Fixture boot'/></desktop:Extension></Extensions></Application></Applications></Package>";
+            var packagedFixture = ParsePackagedStartupManifest(manifestFixture, new PackageManifestLocation { ManifestPath = @"C:\FixturePackage\AppxManifest.xml", PackageFullName = "Fixture.Package_1.0.0.0_x64__publisher", PackageFamilyName = "Fixture.Package_publisher", Scope = "User" });
+            require(packagedFixture.Count == 1 && packagedFixture[0].Source == "Packaged Startup Task" && packagedFixture[0].Name == "Fixture.Package_publisher!FixtureBoot", "actual package manifest declaration must create the packaged startup row");
+            ApplyStartupApproved(packagedFixture, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "StartupTasks", Name = "Fixture.Package_publisher!FixtureBoot", Data = new byte[] { 3, 4, 5 } } });
+            require(packagedFixture.Count == 1 && !packagedFixture[0].Enabled && !string.IsNullOrWhiteSpace(packagedFixture[0].ApprovalPath), "packaged approval state must overlay the manifest declaration without adding a row");
+
+            var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Program.ManagedTaskRoot + "StartupApp" };
+            Func<string, bool> exists = value => existing.Contains(value);
+            string allocatedA = ChooseManagedTaskName("StartupApp", "日本語", @"C:\Fixture\one.exe", "", false, exists);
+            require(allocatedA != "StartupApp", "sanitized-name collision must not overwrite the base task");
+            existing.Add(Program.ManagedTaskRoot + allocatedA);
+            string allocatedB = ChooseManagedTaskName("StartupApp", "日本語", @"C:\Fixture\two.exe", "", false, exists);
+            require(allocatedB != allocatedA && allocatedB != "StartupApp", "two colliding non-Latin names must receive distinct task identities");
+            existing.Add(Program.ManagedTaskRoot + allocatedB);
+            var fixtureRoute = new EnabledStartupService.Row { Kind = "managed-task", Target = @"C:\Fixture\one.exe", Arguments = "", Mode = "normal", TaskLocation = Program.ManagedTaskRoot + allocatedA };
+            var reused = FindEquivalentManagedRoute(new[] { fixtureRoute }, @"C:\Fixture\one.exe", "", @"C:\Fixture\one.exe", "");
+            require(object.ReferenceEquals(reused, fixtureRoute), "repeated identical add must reuse its existing managed route");
+            var modeChanged = FindEquivalentManagedRoute(new[] { fixtureRoute }, @"C:\Fixture\one.exe", "", @"C:\Fixture\one.exe", "");
+            require(object.ReferenceEquals(modeChanged, fixtureRoute), "mode change must update the existing route rather than add a parallel launcher");
+            require(StripKnownQuietArguments(@"C:\Fixture\Speedy.exe", "--ready --minimize-to-tray --keep") == "--ready --keep", "Window mode must strip OpenSpeedy's native quiet flag");
+            require(StripKnownQuietArguments(@"C:\Fixture\MichStartupMaster.exe", "--start-in-tray") == "", "Window mode must strip the app's native start-hidden flag");
+            require(IsQuietLaunch(@"C:\Fixture\Speedy.exe --minimize-to-tray"), "direct native quiet flags must be recognized without a wrapper");
+
+            byte[] approvalFixture = { 7, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67 };
+            byte[] approvalEnabled = ApplyStartupApprovalState(approvalFixture, true);
+            byte[] approvalDisabled = ApplyStartupApprovalState(approvalEnabled, false);
+            require((approvalEnabled[0] & 1) == 0 && (approvalDisabled[0] & 1) == 1, "StartupApproved state must toggle only its enable bit");
+            require(approvalEnabled.Skip(1).SequenceEqual(approvalFixture.Skip(1)) && approvalDisabled.Skip(1).SequenceEqual(approvalFixture.Skip(1)), "StartupApproved timestamps and unknown metadata must remain byte-for-byte intact");
+            for (byte startupApprovalState = 0; startupApprovalState <= 7; startupApprovalState++)
+            {
+                byte[] stateFixture = { startupApprovalState, 0x11, 0x23, 0x45, 0x67, 0x7F };
+                byte[] stateEnabled = ApplyStartupApprovalState(stateFixture, true);
+                byte[] stateDisabled = ApplyStartupApprovalState(stateFixture, false);
+                require(!IsStartupApprovalDisabled(stateEnabled) && IsStartupApprovalDisabled(stateDisabled), "StartupApproved decoder/writer must agree for state 0x" + startupApprovalState.ToString("X2"));
+                require((stateEnabled[0] & 0xFE) == (stateFixture[0] & 0xFE) && (stateDisabled[0] & 0xFE) == (stateFixture[0] & 0xFE), "StartupApproved state 0x" + startupApprovalState.ToString("X2") + " must preserve every non-enable flag in the state byte");
+                require(stateEnabled.Skip(1).SequenceEqual(stateFixture.Skip(1)) && stateDisabled.Skip(1).SequenceEqual(stateFixture.Skip(1)), "StartupApproved state 0x" + startupApprovalState.ToString("X2") + " must preserve every metadata byte after the state byte");
+            }
+
+            require(IsStartupTaskTriggerType(8) && IsStartupTaskTriggerType(9) && !IsStartupTaskTriggerType(0) && !IsStartupTaskTriggerType(2) && !IsStartupTaskTriggerType(6), "only boot/logon triggers belong in startup inventory");
+            require(!QuietRouteHasAuditableTarget(new EnabledStartupService.Row { Kind = "managed-task", Mode = "tray", Name = "Malformed" }), "malformed quiet rows must be classified as audit findings, never skipped");
+            require(EnabledStartupService.CommandLineOwnsPath(@"powershell.exe -File ""C:\Fixture App\boot.ps1""", @"C:\Fixture App\boot.ps1"), "script ownership must match the exact command-line path");
+            require(!EnabledStartupService.CommandLineOwnsPath(@"powershell.exe -File ""D:\Other\boot.ps1""", @"C:\Fixture App\boot.ps1"), "same-name scripts at another path must not suppress the intended route");
+            string serviceFixtureName; int serviceFixtureStart;
+            require(EnabledStartupService.TryParseExactServiceIntent("FixtureSvc\t1", out serviceFixtureName, out serviceFixtureStart) && serviceFixtureName == "FixtureSvc" && serviceFixtureStart == 1, "service enabled intent must preserve exact Start metadata");
+            require(!EnabledStartupService.TryParseExactServiceIntent("FixtureSvc", out serviceFixtureName, out serviceFixtureStart), "service guard must reject incomplete Start metadata rather than guess Automatic");
+            int[] serviceStartModes = { 0, 1, 2, 3 };
+            foreach (int mode in serviceStartModes)
+            {
+                require(EnabledStartupService.TryParseExactServiceIntent("FixtureMode" + mode + "\t" + mode, out serviceFixtureName, out serviceFixtureStart)
+                    && serviceFixtureStart == mode, "service/driver restore intent must preserve exact Start=" + mode);
+            }
+            string[] supportedExtensions = { ".exe", ".com", ".lnk", ".cmd", ".bat", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".py", ".pyw" };
+            require(supportedExtensions.All(extension => IsSupportedStartupTarget(@"C:\Fixture\boot" + extension)), "all Add dialog startup formats must be accepted by the backend resolver contract");
+            require(new[] { ".txt", ".pdf", ".ahk", ".url", ".custom", "" }.All(ext => IsSupportedStartupTarget(@"C:\Fixture\boot" + ext)), "arbitrary file extensions and extensionless files are accepted");
+            string fixtureExecute, fixtureArguments;
+            BuildDirectAction(@"C:\Fixture\boot.vbs", "alpha", out fixtureExecute, out fixtureArguments);
+            require(string.Equals(Path.GetFileName(fixtureExecute), "wscript.exe", StringComparison.OrdinalIgnoreCase) && fixtureArguments.Contains("//B") && fixtureArguments.Contains(@"C:\Fixture\boot.vbs"), "WSH scripts must resolve to an exact Windows script host with the script path preserved");
+            BuildDirectAction(@"C:\Fixture\boot.com", "alpha", out fixtureExecute, out fixtureArguments);
+            require(string.Equals(fixtureExecute, @"C:\Fixture\boot.com", StringComparison.OrdinalIgnoreCase) && fixtureArguments == "alpha", ".com targets must execute directly without a guessed host");
+            string transactionFixtureRoot = Path.Combine(Path.GetTempPath(), "MichStartupMaster-transaction-fixture-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(transactionFixtureRoot);
+                string transactionFixture = Path.Combine(transactionFixtureRoot, "intent.tsv");
+                byte[] exactIntent = { 0xEF, 0xBB, 0xBF, 0x61, 0x09, 0x62, 0x0D, 0x0A };
+                File.WriteAllBytes(transactionFixture, exactIntent);
+                StoreSnapshot intentBefore = StoreSnapshot.Capture(transactionFixture);
+                File.WriteAllBytes(transactionFixture, new byte[] { 1, 2, 3, 4 });
+                intentBefore.Restore();
+                require(File.ReadAllBytes(transactionFixture).SequenceEqual(exactIntent), "managed mutation rollback must restore intent stores byte-for-byte");
+            }
+            finally { try { if (Directory.Exists(transactionFixtureRoot)) Directory.Delete(transactionFixtureRoot, true); } catch { } }
+
+            string regKey = RegistryProtectionKey("User", Registry.CurrentUser.Name, @"Software\Microsoft\Windows\CurrentVersion\Run", "Fixture");
+            require(regKey == "reg|User|" + B64(Registry.CurrentUser.Name) + "|" + B64(@"Software\Microsoft\Windows\CurrentVersion\Run") + "|" + B64("Fixture"), "registry protection identity must round-trip the live encoded ID");
+            string regKey32 = RegistryProtectionKey("User", Registry.CurrentUser.Name, @"Software\Microsoft\Active Setup\Installed Components", "Fixture", "Registry32");
+            string regKey64 = RegistryProtectionKey("User", Registry.CurrentUser.Name, @"Software\Microsoft\Active Setup\Installed Components", "Fixture", "Registry64");
+            require(!string.Equals(regKey32, regKey64, StringComparison.OrdinalIgnoreCase) && regKey32.EndsWith("|Registry32", StringComparison.Ordinal), "Registry32 and Registry64 registrations must have distinct stable identities");
+            RegistryView[] providerViews = StartupRegistryViews();
+            require(providerViews.Contains(RegistryView.Registry32) && (!Environment.Is64BitOperatingSystem || providerViews.Contains(RegistryView.Registry64)), "view-sensitive providers must explicitly enumerate every supported registry view");
+            var userLogonFixture = new StartupItem { Id = RegistryProtectionKey("User", Registry.CurrentUser.Name, @"Environment", "UserInitMprLogonScript", "Registry64"), Name = "UserInitMprLogonScript", Source = "User Logon Script", Scope = "User", Command = @"C:\Fixture\logon.cmd", Location = @"HKEY_CURRENT_USER\Environment [Registry64]", Enabled = true, RegistryView = "Registry64" };
+            require(userLogonFixture.Source == "User Logon Script" && userLogonFixture.Id.EndsWith("|Registry64", StringComparison.Ordinal), "UserInitMprLogonScript must be represented as a view-specific provider row");
+            StartupItem providerProtocolFixture;
+            require(TryParseProviderRow(SerializeProviderRow(userLogonFixture), out providerProtocolFixture)
+                && providerProtocolFixture.Id == userLogonFixture.Id && providerProtocolFixture.RegistryView == "Registry64", "isolated provider protocol must preserve stable ids and registry-view identity exactly");
+            require(ServiceProtectionKey("driver", "FixtureDrv") == "driver|" + B64("FixtureDrv"), "driver protection identity must round-trip the live encoded ID");
+            require(ActiveSetupProtectionKey("Machine", Registry.LocalMachine.Name, @"SOFTWARE\Microsoft\Active Setup\Installed Components\{X}").StartsWith("active|Machine|", StringComparison.Ordinal), "Active Setup protection identity must be canonical");
+            require(RootFromName("HKU") == Registry.Users, "loaded-user registry identities must restore through HKEY_USERS");
+
+            var coveredFixture = new StartupItem { Id = "reg|User|two", Name = native.Name, Source = native.Source, Scope = native.Scope, Command = native.Command, Location = native.Location };
+            require(!BootSourceCovered(coveredFixture, new List<StartupItem> { native }), "same-name registration with a different stable id must not mask an audit gap");
+
+            var extensionFixture = ReadOnlyExtensionItem("image-hijack", Registry.LocalMachine, @"SOFTWARE\Fixture\Image File Execution Options\fixture.exe", "Debugger", "Machine", "Image Hijack", @"C:\Fixture\debugger.exe -g", "Runs when fixture.exe starts", "Registry64");
+            require(extensionFixture.Id.StartsWith("extension|image-hijack|", StringComparison.Ordinal) && !extensionFixture.CanDisable && extensionFixture.MutationCapability == "ReadOnly" && extensionFixture.RequiresExpertConfirmation && extensionFixture.RequiresReboot, "extended auto-load routes must have a stable identity and fail closed for unsafe mutations");
+            require(BootSourceCovered(extensionFixture, new List<StartupItem> { ReadOnlyExtensionItem("image-hijack", Registry.LocalMachine, @"SOFTWARE\Fixture\Image File Execution Options\fixture.exe", "Debugger", "Machine", "Image Hijack", @"C:\Fixture\debugger.exe -g", "Runs when fixture.exe starts", "Registry64") }), "independently observed extended auto-load route must match its exact primary registration");
+            require(ParseNetworkProviderOrder("LanmanWorkstation, WebClient, lanmanworkstation").SequenceEqual(new[] { "LanmanWorkstation", "WebClient" }, StringComparer.OrdinalIgnoreCase), "network provider order must be trimmed and deduplicated without changing registration order");
+            string expandedFixtureDll = ExpandSystemModulePath("fixture.dll");
+            require(Path.IsPathRooted(expandedFixtureDll) && expandedFixtureDll.EndsWith(@"\fixture.dll", StringComparison.OrdinalIgnoreCase) && ExpandSystemModulePath(@"C:\Fixture\custom.dll") == @"C:\Fixture\custom.dll", "bare system module names must be rendered as full paths without rewriting absolute targets");
+            require(IsSafeSystemVolumeFileProbe(Path.Combine(Environment.SystemDirectory, "fixture.exe")) && !IsSafeSystemVolumeFileProbe(@"\\server\share\fixture.exe"), "inventory must never synchronously probe a network or removable startup target for friendly metadata");
+            var winsockFixture = ReadOnlyWinsockProviderItem(new WinsockProtocolInfo { ProviderId = new Guid("00112233-4455-6677-8899-aabbccddeeff"), CatalogEntryId = 42, ProtocolName = "Fixture TCP", ProtocolChain = new WinsockProtocolChain { ChainLength = 1, ChainEntries = new uint[7] } }, true, @"C:\Windows\SysWOW64\fixture-provider.dll");
+            require(Marshal.SizeOf<WinsockProtocolInfo>() == 628 && winsockFixture.Id == "winsock|32|42|00112233-4455-6677-8899-aabbccddeeff" && winsockFixture.Source == "Winsock Provider" && winsockFixture.MutationCapability == "ReadOnly", "Winsock catalog rows must preserve an exact catalog identity and use the documented native layout");
+            require(BootSourceCovered(winsockFixture, new List<StartupItem> { ReadOnlyWinsockProviderItem(new WinsockProtocolInfo { ProviderId = new Guid("00112233-4455-6677-8899-aabbccddeeff"), CatalogEntryId = 42, ProtocolName = "Fixture TCP", ProtocolChain = new WinsockProtocolChain { ChainLength = 1, ChainEntries = new uint[7] } }, true, @"C:\Windows\SysWOW64\fixture-provider.dll") }), "independently observed Winsock provider must match its exact primary catalog registration");
+            var comExtensionFixture = ReadOnlyExtensionItem("explorer-shell-hook", Registry.CurrentUser, @"SOFTWARE\Fixture\Explorer\ShellExecuteHooks", "{00112233-4455-6677-8899-AABBCCDDEEFF}", "User", "Explorer Shell Extension", @"C:\Fixture\shell-hook.dll", "Explorer invokes fixture hook", "Registry64");
+            comExtensionFixture.RequiresReboot = false;
+            require(NormalizeComClassId("{00112233-4455-6677-8899-AABBCCDDEEFF}") == "{00112233-4455-6677-8899-aabbccddeeff}" && comExtensionFixture.Source == "Explorer Shell Extension" && comExtensionFixture.MutationCapability == "ReadOnly" && !comExtensionFixture.RequiresReboot, "COM auto-load extensions must retain their CLSID identity and stay read-only without falsely claiming a machine reboot");
+
+            string[] requiredSources = { "Registry Run", "Registry RunOnce", "Registry RunOnceEx", "Registry RunServices", "Policy Run", "Legacy Windows Run", "User Logon Script", "Startup Folder", "Scheduled Task", "Windows Service", "System Driver", "Winlogon Autostart", "Winlogon Notification", "Explorer Startup Extension", "Explorer Shell Extension", "Internet Explorer Add-on", "AppInit DLLs", "AppCert DLLs", "Active Setup", "Boot Execute", "LSA Startup Package", "Image Hijack", "Known DLL", "Network Provider", "Winsock Provider", "Print Monitor", "Media Codec", "Group Policy Script", "WMI Event Consumer", "Packaged Startup Task" };
+            require(requiredSources.Distinct(StringComparer.OrdinalIgnoreCase).Count() == requiredSources.Length, "startup surface contract contains duplicate provider names");
+            string fixtureJson = ToJson(new List<StartupItem> { native, task, userLogonFixture });
+            require(fixtureJson.Contains("\"id\":\"", StringComparison.Ordinal) && new[] { native, task, userLogonFixture }.All(x => !string.IsNullOrWhiteSpace(x.Id)), "list JSON must expose a nonempty stable id for every row");
+            string surfaceNames = string.Join(",", requiredSources.Select(source => source.Replace(' ', '_')));
+            return "INVENTORY_SELF_TEST kind=fixtures checks=" + checks + " passed=" + checks + " surface_contracts=" + requiredSources.Length
+                + " surface_names=" + surfaceNames + " service_start_modes=" + string.Join(",", serviceStartModes);
+        }
+
+        // ---- Tray audit: every managed quiet route must expose exactly one usable icon ----
+        // A generic --tray-run controller is allowed to expose one fallback NotifyIcon only while
+        // the target has no definite native tray host.  A native icon plus fallback, multiple
+        // fallbacks, a missing icon/process, or ambiguous WinForms-only evidence can never pass.
         [StructLayout(LayoutKind.Sequential)]
         private struct WinInfo { public int Pid; public string Class; }
 
@@ -441,10 +3455,9 @@ namespace MichStartupMaster
             return list;
         }
 
-        private static bool IsTrayIconClass(string cls)
+        private static bool IsDefiniteTrayIconClass(string cls)
         {
             if (string.IsNullOrEmpty(cls)) return false;
-            if (cls.StartsWith("WindowsForms10.Window", StringComparison.Ordinal)) return true; // WinForms NotifyIcon (+ main form)
             if (cls.IndexOf("SystemTrayIcon", StringComparison.Ordinal) >= 0) return true;      // pystray (icon + menu windows)
             if (cls.IndexOf("TrayIcon", StringComparison.Ordinal) >= 0) return true;            // Qt tray icon message window
             if (cls.IndexOf("NotifyIcon", StringComparison.Ordinal) >= 0) return true;          // Electron / generic
@@ -452,54 +3465,62 @@ namespace MichStartupMaster
             return false;
         }
 
-        private static bool ProcessHasTrayIcon(List<WinInfo> wins, int pid)
+        private static bool ProcessHasDefiniteTrayIcon(List<WinInfo> wins, int pid)
         {
-            foreach (var w in wins) if (w.Pid == pid && IsTrayIconClass(w.Class)) return true;
+            foreach (var w in wins) if (w.Pid == pid && IsDefiniteTrayIconClass(w.Class)) return true;
             return false;
         }
 
-        // Every enabled managed tray app must be running exactly once, and every wrapper process
-        // must stay invisible. Returns a TRAY_AUDIT line plus one line per finding.
+        private static bool ProcessHasWinFormsHost(List<WinInfo> wins, int pid)
+        {
+            foreach (var w in wins) if (w.Pid == pid && (w.Class ?? "").StartsWith("WindowsForms10.Window", StringComparison.Ordinal)) return true;
+            return false;
+        }
+
+        private static bool ProcessHasControllerIcon(List<WinInfo> wins, int pid)
+        {
+            // tray-run owns no Form; its WinForms window is therefore the NotifyIcon message sink.
+            return ProcessHasWinFormsHost(wins, pid) || ProcessHasDefiniteTrayIcon(wins, pid);
+        }
+
+        internal static bool AuditProcessMatchesCandidates(string executablePath, string commandLine, IEnumerable<string> candidates)
+        {
+            string image = (executablePath ?? "").Trim().Trim('"');
+            string command = commandLine ?? "";
+            return (candidates ?? Enumerable.Empty<string>()).Any(candidate =>
+            {
+                string expected = (candidate ?? "").Trim().Trim('"');
+                return expected.Length > 0
+                    && (string.Equals(image, expected, StringComparison.OrdinalIgnoreCase)
+                        || command.IndexOf(expected, StringComparison.OrdinalIgnoreCase) >= 0);
+            });
+        }
+
+        // Returns anchored counts plus one line per hard finding/uncertain native WinForms route.
         public static string AuditTrayCoverage()
         {
             try
             {
-                var rows = EnabledStartupService.Load().Where(r => r.Kind == "managed-task" && r.Mode == "tray").ToList();
-                var procs = new List<Tuple<int, string, string>>(); // pid, exe, commandline(lower)
-                try
-                {
-                    using (var searcher = new System.Management.ManagementObjectSearcher("SELECT ProcessId,ExecutablePath,CommandLine FROM Win32_Process"))
-                    {
-                        foreach (System.Management.ManagementObject mo in searcher.Get())
-                        {
-                            int pid = Convert.ToInt32(mo["ProcessId"]);
-                            string cmd = Convert.ToString(mo["CommandLine"] ?? "").ToLowerInvariant();
-                            string exe = Convert.ToString(mo["ExecutablePath"] ?? "");
-                            procs.Add(Tuple.Create(pid, exe, cmd));
-                        }
-                    }
-                }
-                catch { }
+                var rows = QuietAuditRows();
+                var procs = NativeProcessCatalog.Snapshot().Select(p => Tuple.Create(p.ProcessId, p.ExecutablePath ?? "", p.CommandLine ?? "")).ToList(); // pid, exe, commandline
                 var wins = SnapshotTopLevelWindows();
                 var findings = new List<string>();
+                var uncertain = new List<string>();
                 int running = 0;
-
-                // 1. No wrapper process may ever draw a tray icon (the wrapper stays invisible).
-                foreach (var p in procs)
-                {
-                    string cmd = p.Item3;
-                    if (cmd.IndexOf("--tray-run", StringComparison.Ordinal) < 0) continue;
-                    if (cmd.IndexOf("--agent", StringComparison.Ordinal) >= 0) continue; // the agent itself owns its one icon
-                    if (ProcessHasTrayIcon(wins, p.Item1))
-                        findings.Add("WRAPPER_ICON pid=" + p.Item1 + " (a quiet wrapper is showing a tray icon; wrappers must stay invisible)");
-                }
-
-                // 2. Each managed tray app runs exactly one visible instance.
                 foreach (var row in rows)
                 {
                     var candidates = new List<string>();
                     string target = (row.Target ?? "").Trim().ToLowerInvariant();
                     if (target.Length > 0) candidates.Add(target);
+                    // A FooLauncher.exe process may have already completed after handing off to
+                    // the application's Foo.exe payload. Include only the deterministic sibling
+                    // payload candidates derived from that exact launcher path; no filesystem
+                    // probe or broad basename matching is used in this read-only audit.
+                    foreach (string payload in LauncherPayloadCandidates(row.Target))
+                    {
+                        string normalizedPayload = (payload ?? "").Trim().ToLowerInvariant();
+                        if (normalizedPayload.Length > 0 && !candidates.Contains(normalizedPayload, StringComparer.OrdinalIgnoreCase)) candidates.Add(normalizedPayload);
+                    }
                     // Indirection targets (powershell.exe -File script.ps1 / wscript x.vbs / pythonw x.pyw)
                     // never stay running; match on the script's directory so the real worker is found.
                     foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(row.Arguments ?? "", @"[""']?([A-Za-z]:[^""'\s]+?\.(?:ps1|pyw|py|vbs|bat|cmd|exe|lnk))[""']?", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
@@ -508,20 +3529,89 @@ namespace MichStartupMaster
                         try { string dir = System.IO.Path.GetDirectoryName(script); if (!string.IsNullOrWhiteSpace(dir)) candidates.Add(dir.ToLowerInvariant()); }
                         catch { }
                     }
-                    if (candidates.Count == 0) continue;
-                    var matches = procs.Where(p =>
-                        p.Item3.IndexOf("--type=", StringComparison.Ordinal) < 0 && // exclude Electron/Chromium children
-                        candidates.Any(c => c.Length > 0 && p.Item3.IndexOf(c, StringComparison.Ordinal) >= 0)).ToList();
-                    var visible = matches.Where(p => ProcessHasTrayIcon(wins, p.Item1)).ToList();
-                    if (visible.Count > 0) running++;
-                    if (visible.Count > 1)
-                        findings.Add("DUP " + row.Name + " | " + visible.Count + " visible instances (pids " + string.Join(",", visible.Select(v => v.Item1.ToString())) + ")");
+                    if (!QuietRouteHasAuditableTarget(row) || candidates.Count == 0)
+                    {
+                        findings.Add("MALFORMED_ROUTE " + (string.IsNullOrWhiteSpace(row.Name) ? "(unnamed quiet route)" : row.Name) + " | no auditable target path");
+                        continue;
+                    }
+                    var wrappers = procs.Where(p =>
+                    {
+                        if (p.Item3.IndexOf("--tray-run", StringComparison.OrdinalIgnoreCase) < 0 || p.Item3.IndexOf("--agent", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+                        string wrapperTarget, wrapperArgs;
+                        if (!TryDecodeTrayPayload(p.Item3, out wrapperTarget, out wrapperArgs)) return false;
+                        return string.Equals(NormalizeManagedCommand(wrapperTarget, wrapperArgs), NormalizeManagedCommand(row.Target, row.Arguments), StringComparison.OrdinalIgnoreCase);
+                    }).GroupBy(p => p.Item1).Select(g => g.First()).ToList();
+                    var native = procs.Where(p =>
+                        p.Item3.IndexOf("--tray-run", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        p.Item3.IndexOf("--type=", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        AuditProcessMatchesCandidates(p.Item2, p.Item3, candidates)).GroupBy(p => p.Item1).Select(g => g.First()).ToList();
+                    var nativeIcons = native.Where(p => ProcessHasDefiniteTrayIcon(wins, p.Item1)).ToList();
+                    var nativeWinFormsOnly = native.Where(p => !ProcessHasDefiniteTrayIcon(wins, p.Item1) && ProcessHasWinFormsHost(wins, p.Item1)).ToList();
+                    var proxyIcons = wrappers.Where(p => ProcessHasControllerIcon(wins, p.Item1)).ToList();
+                    bool declaredNativeWinFormsIcon = nativeIcons.Count == 0 && nativeWinFormsOnly.Count > 0
+                        && QuietLaunchPlanner.DeclaresNativeTrayCapability(row.Target);
+                    bool routeRunning = native.Count > 0 || wrappers.Count > 0;
+                    if (routeRunning) running++;
+                    else findings.Add("MISSING_PROCESS " + row.Name + " | no target or fallback controller process is running");
+                    if (proxyIcons.Count > 1) findings.Add("DUP_PROXY " + row.Name + " | fallback icons=" + proxyIcons.Count + " pids=" + string.Join(",", proxyIcons.Select(p => p.Item1)));
+                    if (nativeIcons.Count > 1) findings.Add("DUP_NATIVE " + row.Name + " | native icons=" + nativeIcons.Count + " pids=" + string.Join(",", nativeIcons.Select(p => p.Item1)));
+                    if ((nativeIcons.Count > 0 || declaredNativeWinFormsIcon) && proxyIcons.Count > 0) findings.Add("NATIVE_PLUS_PROXY " + row.Name + " | native and fallback icons coexist");
+                    int definiteIcons = nativeIcons.Count + proxyIcons.Count + (declaredNativeWinFormsIcon ? 1 : 0);
+                    if (definiteIcons == 0)
+                    {
+                        if (nativeWinFormsOnly.Count > 0) uncertain.Add("UNCERTAIN " + row.Name + " | WinForms windows cannot prove a native NotifyIcon");
+                        else if (routeRunning) findings.Add("MISSING_ICON " + row.Name + " | route is running but no tray icon host was found");
+                    }
                 }
 
-                if (findings.Count == 0) return "TRAY_AUDIT apps=" + rows.Count + " running=" + running + " findings=0";
-                return "TRAY_AUDIT apps=" + rows.Count + " running=" + running + " findings=" + findings.Count + Environment.NewLine + string.Join(Environment.NewLine, findings);
+                string head = "TRAY_AUDIT apps=" + rows.Count + " running=" + running + " findings=" + findings.Count + " uncertain=" + uncertain.Count;
+                var details = findings.Concat(uncertain).ToList();
+                return details.Count == 0 ? head : head + Environment.NewLine + string.Join(Environment.NewLine, details);
             }
             catch (Exception ex) { return "TRAY_AUDIT error: " + ex.GetBaseException().Message; }
+        }
+
+        private static List<EnabledStartupService.Row> QuietAuditRows()
+        {
+            var byTask = new Dictionary<string, EnabledStartupService.Row>(StringComparer.OrdinalIgnoreCase);
+            int malformed = 0;
+            foreach (var row in EnabledStartupService.Load().Where(r => r != null && string.Equals(r.Kind, "managed-task", StringComparison.OrdinalIgnoreCase) && string.Equals(r.Mode, "tray", StringComparison.OrdinalIgnoreCase)))
+            {
+                string taskLocation = string.IsNullOrWhiteSpace(row.TaskLocation) ? row.Location : row.TaskLocation;
+                byTask[string.IsNullOrWhiteSpace(taskLocation) ? "#malformed-store-" + (++malformed) : taskLocation] = row;
+            }
+
+            // The persisted manifest is intent, not proof of the current scheduler state. Union it
+            // with the live managed-task inventory so a missing/stale manifest can never make this
+            // audit falsely report that every quiet app has a process and icon.
+            foreach (StartupItem item in ScanAll().Where(i => i != null && i.Enabled && i.IsManaged && string.Equals(i.Source, "Scheduled Task", StringComparison.OrdinalIgnoreCase) && IsQuietLaunch(i.Command ?? "", i.Location)))
+            {
+                if (string.IsNullOrWhiteSpace(item.Location)) continue;
+                string target = "", arguments = "";
+                try { ResolveLaunchTarget(item, out target, out arguments); }
+                catch { TrySplitCommand(item.Command ?? "", out target, out arguments); }
+                byTask[item.Location] = new EnabledStartupService.Row
+                {
+                    Kind = "managed-task",
+                    Name = string.IsNullOrWhiteSpace(item.Name) ? item.Location.TrimStart('\\') : item.Name,
+                    Scope = item.Scope ?? "User/System",
+                    Command = item.Command ?? "",
+                    Location = item.Location,
+                    Status = item.Status ?? "Live managed quiet task",
+                    Target = target ?? "",
+                    Arguments = arguments ?? "",
+                    Mode = "tray",
+                    TaskLocation = item.Location
+                };
+            }
+            return byTask.Values.OrderBy(r => r.TaskLocation ?? r.Location, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static bool QuietRouteHasAuditableTarget(EnabledStartupService.Row row)
+        {
+            if (row == null) return false;
+            if (!string.IsNullOrWhiteSpace(row.Target)) return true;
+            return Regex.IsMatch(row.Arguments ?? "", "[A-Za-z]:[^\\\"'\\s]+?\\.(?:ps1|pyw|py|vbs|bat|cmd|exe|lnk)", RegexOptions.IgnoreCase);
         }
 
         private static void HydrateHumanNames(List<StartupItem> items)
@@ -569,6 +3659,7 @@ namespace MichStartupMaster
             try
             {
                 string expanded = ExpandPathTokens(path);
+                if (!IsSafeSystemVolumeFileProbe(expanded)) return "";
                 if (!File.Exists(expanded)) return "";
                 FileVersionInfo info = FileVersionInfo.GetVersionInfo(expanded);
                 string[] candidates = { info.ProductName, info.FileDescription, info.InternalName, Path.GetFileNameWithoutExtension(expanded) };
@@ -592,6 +3683,26 @@ namespace MichStartupMaster
         {
             if (string.IsNullOrWhiteSpace(value)) return "";
             return Environment.ExpandEnvironmentVariables(value.Trim('"'));
+        }
+
+        // The app's primary job is to make every configured route visible. A removable or
+        // network volume can take arbitrarily long to answer a simple existence/version query,
+        // so only the always-local Windows system volume is touched during synchronous inventory
+        // and readback. Other absolute targets keep their full command and exact registration;
+        // callers receive Unknown rather than a frozen UI or a fabricated missing state.
+        private static bool IsSafeSystemVolumeFileProbe(string value)
+        {
+            try
+            {
+                string candidate = ExpandPathTokens(value);
+                if (!Path.IsPathRooted(candidate) || candidate.StartsWith(@"\\", StringComparison.Ordinal)) return false;
+                string candidateRoot = Path.GetPathRoot(candidate);
+                string systemRoot = Path.GetPathRoot(Environment.SystemDirectory);
+                return !string.IsNullOrWhiteSpace(candidateRoot)
+                    && !string.IsNullOrWhiteSpace(systemRoot)
+                    && string.Equals(candidateRoot, systemRoot, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         private static string CleanName(string value)
@@ -619,29 +3730,23 @@ namespace MichStartupMaster
             {
                 if ((item.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase)) continue;
                 if (item.Source == "Registry Run" || item.Source == "Registry RunOnce" || item.Source == "Registry RunServices" || item.Source == "Policy Run" || item.Source == "Startup Folder")
-                    nativeCommands.Add(NormalizeManagedCommand(item.Command, ""));
+                    nativeCommands.Add(CanonicalLaunchKey(item));
             }
-            // Commands a managed item already launches: any other registration that launches the
-            // exact same app is a retired/redundant duplicate and is not shown again.
-            var managedCommands = new HashSet<string>(EnabledStartupService.Load()
-                .Where(r => r.Kind == "managed-task" && !string.IsNullOrWhiteSpace(r.Target))
-                .Select(r => NormalizeManagedCommand(r.Target, r.Arguments)), StringComparer.OrdinalIgnoreCase);
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var wmiSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var result = new List<StartupItem>();
             // Live registrations first: they always win over informational/legacy records.
             foreach (var item in all.Where(i => !(i.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase)))
             {
-                // A disabled task that launches the same app as a managed item is the retired
-                // duplicate launcher; the managed row is the single source of truth.
-                if (item.Source == "Scheduled Task" && !item.Enabled && managedCommands.Contains(NormalizeManagedCommand(item.Command, ""))) continue;
                 if (item.Source == "Startup Command")
                 {
-                    string nc = NormalizeManagedCommand(item.Command, "");
+                    string nc = CanonicalLaunchKey(item);
                     if (nativeCommands.Contains(nc)) continue;
-                    if (!wmiSeen.Add(nc)) continue;
                 }
-                string key = (item.Source + "|" + item.Location + "|" + item.Name + "|" + item.Command).ToLowerInvariant();
+                // Only collapse the exact same physical registration (or proven metadata mirrors
+                // above).  Two active task/Run/folder sources that launch the same executable are
+                // operationally independent and must remain visible so disabling one cannot leave
+                // a hidden alias that still starts the app.
+                string key = !string.IsNullOrWhiteSpace(item.Id) ? item.Id.ToLowerInvariant() : (item.Source + "|" + item.Location + "|" + item.Name).ToLowerInvariant();
                 if (seen.Add(key)) result.Add(item);
             }
             // Legacy disabled-store records are informational only: drop them when a live
@@ -649,19 +3754,86 @@ namespace MichStartupMaster
             foreach (var item in all.Where(i => (i.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase)))
             {
                 string baseKey = (item.Source + "|" + item.Location + "|" + item.Name).ToLowerInvariant();
-                bool covered = result.Any(live => string.Equals((live.Source + "|" + live.Location + "|" + live.Name).ToLowerInvariant(), baseKey, StringComparison.OrdinalIgnoreCase));
+                StartupItem coveredLive = result.FirstOrDefault(live => string.Equals((live.Source + "|" + live.Location + "|" + live.Name).ToLowerInvariant(), baseKey, StringComparison.OrdinalIgnoreCase));
+                bool exactRemovedComponent = (item.Id ?? "").StartsWith("disabled|advanced|", StringComparison.OrdinalIgnoreCase)
+                    || (item.Id ?? "").StartsWith("disabled|winlogon|", StringComparison.OrdinalIgnoreCase);
+                // Indexed REG_MULTI_SZ/Winlogon rows must never disappear merely because a later
+                // element shifted into the same display index (or has identical text).
+                bool covered = coveredLive != null && !exactRemovedComponent;
+                // AppInit remains visible after its loader bit is toggled. Prefer the manager's
+                // exact disabled snapshot while the live surface is genuinely disabled, so Enable
+                // has the authenticated restore state instead of an unsupported aggregate row.
+                if (covered && (item.Id ?? "").StartsWith("disabled|appinit|", StringComparison.OrdinalIgnoreCase) && !coveredLive.Enabled)
+                {
+                    result.Remove(coveredLive);
+                    seen.Remove((coveredLive.Id ?? "").ToLowerInvariant());
+                    covered = false;
+                }
                 if (covered) continue;
-                string key = (item.Source + "|" + item.Location + "|" + item.Name + "|" + item.Command).ToLowerInvariant();
+                string key = !string.IsNullOrWhiteSpace(item.Id) ? item.Id.ToLowerInvariant() : (item.Source + "|" + item.Location + "|" + item.Name).ToLowerInvariant();
                 if (seen.Add(key)) result.Add(item);
             }
             return result;
         }
 
         // Normalize a launch command to its lower-cased, collapsed form for duplicate detection.
-        private static string NormalizeManagedCommand(string target, string args)
+        internal static string NormalizeManagedCommand(string target, string args)
         {
-            try { return Regex.Replace((target + " " + (args ?? "")).ToLowerInvariant(), @"\s+", " ").Trim().Trim('"'); }
-            catch { return (target + " " + (args ?? "")).ToLowerInvariant(); }
+            try
+            {
+                string path = Environment.ExpandEnvironmentVariables((target ?? "").Trim().Trim('"')).Replace('/', '\\');
+                try { if (Path.IsPathRooted(path)) path = Path.GetFullPath(path); } catch { }
+                path = path.TrimEnd('\\').ToLowerInvariant();
+                string arguments = Regex.Replace(args ?? "", @"\s+", " ").Trim();
+                return path + (arguments.Length == 0 ? "" : " " + arguments.ToLowerInvariant());
+            }
+            catch { return Regex.Replace(((target ?? "") + " " + (args ?? "")).ToLowerInvariant(), @"\s+", " ").Trim().Trim('"'); }
+        }
+
+        // Some portable desktop apps expose a short-lived FooLauncher.exe while their real,
+        // long-lived UI lives in Foo.exe (often under CustomRuntime). This is a syntactic,
+        // conservative candidate list only: it never probes the path or launches anything. It
+        // lets the quiet controller/audit follow the application that the user actually started
+        // without treating arbitrary same-name executables as equivalent.
+        internal static IEnumerable<string> LauncherPayloadCandidates(string targetPath)
+        {
+            var candidates = new List<string>();
+            try
+            {
+                string target = Environment.ExpandEnvironmentVariables((targetPath ?? "").Trim().Trim('"'));
+                if (string.IsNullOrWhiteSpace(target) || !string.Equals(Path.GetExtension(target), ".exe", StringComparison.OrdinalIgnoreCase)) return candidates;
+                string full = Path.GetFullPath(target);
+                string leaf = Path.GetFileNameWithoutExtension(full);
+                const string suffix = "Launcher";
+                if (string.IsNullOrWhiteSpace(leaf) || !leaf.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return candidates;
+                string payloadStem = leaf.Substring(0, leaf.Length - suffix.Length).TrimEnd(' ', '.', '_', '-');
+                string directory = Path.GetDirectoryName(full) ?? "";
+                if (string.IsNullOrWhiteSpace(payloadStem) || string.IsNullOrWhiteSpace(directory)) return candidates;
+                foreach (string payloadDirectory in new[] { Path.Combine(directory, "CustomRuntime"), directory })
+                {
+                    string candidate = Path.Combine(payloadDirectory, payloadStem + ".exe");
+                    if (!candidates.Contains(candidate, StringComparer.OrdinalIgnoreCase)) candidates.Add(candidate);
+                }
+            }
+            catch { }
+            return candidates;
+        }
+
+        private static string CanonicalLaunchKey(StartupItem item)
+        {
+            if (item == null) return "";
+            string command = item.Command ?? "";
+            string target = "", args = "";
+            try
+            {
+                if (item.Source == "Startup Folder" && command.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) ResolveShortcut(command, out target, out args);
+                if (string.IsNullOrWhiteSpace(target) && TryDecodeTrayPayload(command, out target, out args)) return NormalizeManagedCommand(target, args);
+                // Multiple task actions are intentionally never reduced to one launch identity.
+                if (command.IndexOf(" || ", StringComparison.Ordinal) >= 0) return "multi:" + NormBootKey(command);
+                if (string.IsNullOrWhiteSpace(target) && TrySplitCommand(command, out target, out args)) return NormalizeManagedCommand(target, args);
+            }
+            catch { }
+            return "raw:" + NormBootKey(command);
         }
 
         private static void AddWmiStartupCommands(List<StartupItem> items)
@@ -693,31 +3865,171 @@ namespace MichStartupMaster
                 @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
                 @"Software\Microsoft\Windows\CurrentVersion\RunServices",
                 @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce",
-                @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
-                @"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run",
-                @"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\RunOnce"
+                @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
             };
-            foreach (string subKey in runKeys)
+            foreach (RegistryView view in StartupRegistryViews())
+            using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
+            using (var machineRoot = OpenRegistryRoot(RegistryHive.LocalMachine, view))
             {
-                AddRegistryValues(items, Registry.CurrentUser, subKey, "User", SourceForRegistryPath(subKey), true, "Runs from " + subKey);
-                AddRegistryValues(items, Registry.LocalMachine, subKey, "Machine", SourceForRegistryPath(subKey), true, "Runs from " + subKey);
+                string viewLabel = RegistryViewLabel(view);
+                foreach (string subKey in runKeys)
+                {
+                    AddRegistryValues(items, userRoot, subKey, "User", SourceForRegistryPath(subKey), true, "Runs from " + subKey, null, viewLabel);
+                    AddRegistryValues(items, machineRoot, subKey, "Machine", SourceForRegistryPath(subKey), true, "Runs from " + subKey, null, viewLabel);
+                }
+                AddWinlogonValues(items, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Machine", new[] { "Shell", "Userinit", "Taskman", "AppSetup", "System" }, viewLabel);
+                AddWinlogonValues(items, userRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "User", new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
+                AddRegistryValues(items, userRoot, @"Environment", "User", "User Logon Script", true, "UserInitMprLogonScript runs during interactive logon", new[] { "UserInitMprLogonScript" }, viewLabel);
+                AddAppInit(items, machineRoot, viewLabel);
+                AddActiveSetup(items, machineRoot, "Machine", null, viewLabel);
+                AddActiveSetup(items, userRoot, "User", null, viewLabel);
             }
-            AddRegistryValues(items, Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Machine", "Winlogon Autostart", false, "Critical logon autostart value", new[] { "Shell", "Userinit", "VMApplet", "Taskman" });
-            AddRegistryValues(items, Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "User", "Winlogon Autostart", false, "Per-user logon autostart value", new[] { "Shell", "Userinit" });
-            AddRegistryValues(items, Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", "Machine", "AppInit DLLs", false, "DLL injection autostart. Disable from Windows security policy or registry with care.", new[] { "AppInit_DLLs", "LoadAppInit_DLLs" });
-            AddActiveSetup(items, Registry.LocalMachine, "Machine");
-            AddActiveSetup(items, Registry.CurrentUser, "User");
+        }
+
+        private static void AddRegistryStartupExtensions(List<StartupItem> items)
+        {
+            foreach (RegistryView view in StartupRegistryViews())
+            using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
+            using (var machineRoot = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+            {
+                string viewLabel = RegistryViewLabel(view);
+                foreach (var pair in new[] { Tuple.Create(userRoot, "User"), Tuple.Create(machineRoot, "Machine") })
+                {
+                    RegistryKey root = pair.Item1;
+                    string scope = pair.Item2;
+                    AddRegistryValues(items, root, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", scope, "Legacy Windows Run", true, "Legacy Windows Load/Run logon value", new[] { "Load", "Run" }, viewLabel);
+                    AddRunOnceEx(items, root, scope, null, viewLabel);
+                    foreach (string path in new[]
+                    {
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
+                    }) AddRegistryValues(items, root, path, scope, "Explorer Startup Extension", true, "Explorer loads this COM extension during desktop startup", null, viewLabel);
+                    AddExplorerShellExtensions(items, root, scope, null, viewLabel, false);
+                    AddInternetExplorerAddons(items, root, scope, null, viewLabel, false);
+                }
+            }
+            AddRegistryValues(items, Registry.LocalMachine, @"SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls", "Machine", "AppCert DLLs", true, "DLL injected when applications create a process");
+        }
+
+        private static void AddLoadedUserRegistryStartup(List<StartupItem> items)
+        {
+            try
+            {
+                string[] runKeys =
+                {
+                    @"Software\Microsoft\Windows\CurrentVersion\Run",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunServices",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce",
+                    @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
+                };
+                foreach (RegistryView view in StartupRegistryViews())
+                using (var usersRoot = OpenRegistryRoot(RegistryHive.Users, view))
+                {
+                    string viewLabel = RegistryViewLabel(view);
+                    foreach (var hive in LoadedUserHives())
+                    {
+                        string prefix = hive.Item1 + @"\";
+                        string scope = hive.Item2;
+                        foreach (string path in runKeys) AddRegistryValues(items, usersRoot, prefix + path, scope, SourceForRegistryPath(path), true, "Runs for loaded profile " + scope, null, viewLabel);
+                        AddRegistryValues(items, usersRoot, prefix + @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", scope, "Legacy Windows Run", true, "Legacy Windows Load/Run value for " + scope, new[] { "Load", "Run" }, viewLabel);
+                        AddWinlogonValues(items, usersRoot, prefix + @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", scope, new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
+                        AddRegistryValues(items, usersRoot, prefix + @"Environment", scope, "User Logon Script", true, "UserInitMprLogonScript for " + scope, new[] { "UserInitMprLogonScript" }, viewLabel);
+                        AddRunOnceEx(items, usersRoot, scope, prefix + @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx", viewLabel);
+                        foreach (string path in new[]
+                        {
+                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
+                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
+                        }) AddRegistryValues(items, usersRoot, prefix + path, scope, "Explorer Startup Extension", true, "Explorer startup extension for " + scope, null, viewLabel);
+                        AddExplorerShellExtensions(items, usersRoot, scope, prefix, viewLabel, false);
+                        AddInternetExplorerAddons(items, usersRoot, scope, prefix, viewLabel, false);
+                        AddActiveSetup(items, usersRoot, scope, prefix + @"SOFTWARE\Microsoft\Active Setup\Installed Components", viewLabel);
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem("Loaded-user registry", "Other users", Registry.Users.Name, ex)); }
+        }
+
+        private static void AddRunOnceEx(List<StartupItem> items, RegistryKey root, string scope, string basePath = null, string viewLabel = null)
+        {
+            if (string.IsNullOrWhiteSpace(basePath)) basePath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx";
+            try
+            {
+                using (var parent = root.OpenSubKey(basePath, false))
+                {
+                    if (parent == null) return;
+                    foreach (string childName in parent.GetSubKeyNames())
+                    {
+                        string childPath = basePath + @"\" + childName;
+                        using (var child = root.OpenSubKey(childPath, false))
+                        {
+                            if (child == null) continue;
+                            foreach (string valueName in child.GetValueNames())
+                            {
+                                if (string.Equals(valueName, "Title", StringComparison.OrdinalIgnoreCase) || string.Equals(valueName, "Flags", StringComparison.OrdinalIgnoreCase) || string.Equals(valueName, "Depend", StringComparison.OrdinalIgnoreCase)) continue;
+                                object value = child.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                                string command = Convert.ToString(value ?? "");
+                                if (string.IsNullOrWhiteSpace(command)) continue;
+                                string id = "reg|" + scope + "|" + B64(root.Name) + "|" + B64(childPath) + "|" + B64(valueName ?? "") + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "|" + viewLabel);
+                                items.Add(new StartupItem { Id = id, Name = string.IsNullOrWhiteSpace(valueName) ? childName : valueName, Source = "Registry RunOnceEx", Scope = scope, Command = command, Location = root.Name + @"\" + childPath + (string.IsNullOrWhiteSpace(viewLabel) ? "" : " [" + viewLabel + "]"), Enabled = true, CanDisable = scope.StartsWith("User", StringComparison.OrdinalIgnoreCase) || IsElevated(), IsManaged = false, Status = "One-time Explorer RunOnceEx command" + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "; " + viewLabel), RegistryView = viewLabel });
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem("Registry RunOnceEx", scope, root.Name + @"\" + basePath, ex)); }
+        }
+
+        private static void AddAppInit(List<StartupItem> items, RegistryKey machineRoot, string viewLabel)
+        {
+            const string subKey = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows";
+            try
+            {
+                using (var key = machineRoot.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    if (!key.GetValueNames().Any(name => string.Equals(name, "AppInit_DLLs", StringComparison.OrdinalIgnoreCase))) return;
+                    object dllValue = key.GetValue("AppInit_DLLs", null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                    RegistryValueKind dllKind = key.GetValueKind("AppInit_DLLs");
+                    string dlls = Convert.ToString(dllValue ?? "").Trim();
+                    if (string.IsNullOrWhiteSpace(dlls)) return;
+                    int load = 0;
+                    RegistryValueKind loadKind = RegistryValueKind.Unknown;
+                    bool loadExists = key.GetValueNames().Any(name => string.Equals(name, "LoadAppInit_DLLs", StringComparison.OrdinalIgnoreCase));
+                    try { if (loadExists) { loadKind = key.GetValueKind("LoadAppInit_DLLs"); load = Convert.ToInt32(key.GetValue("LoadAppInit_DLLs", 0)); } } catch { loadExists = false; }
+                    string dllAccessReason, loadAccessReason;
+                    bool writable = CanOpenRegistryValueForWrite(machineRoot, subKey, "AppInit_DLLs", out dllAccessReason)
+                        && CanOpenRegistryValueForWrite(machineRoot, subKey, "LoadAppInit_DLLs", out loadAccessReason);
+                    var capability = DecideRegistryMutationCapability("Machine", machineRoot.Name, writable, IsElevated(), "", subKey);
+                    bool exactShape = (dllKind == RegistryValueKind.String || dllKind == RegistryValueKind.ExpandString) && loadExists && loadKind == RegistryValueKind.DWord;
+                    bool canDisable = load != 0 && exactShape && capability.CanMutate;
+                    string reason = !exactShape
+                        ? "AppInit registry kinds are ambiguous; refusing to rewrite or invent per-DLL state"
+                        : (load == 0 ? "LoadAppInit_DLLs is already disabled; only a manager-owned exact snapshot may restore it" : (canDisable ? "Disable the complete AppInit surface by toggling LoadAppInit_DLLs only; AppInit_DLLs bytes remain unchanged" : capability.Reason));
+                    items.Add(new StartupItem
+                    {
+                        Id = "appinit|" + B64(subKey) + "|" + viewLabel, Name = "AppInit DLLs", Source = "AppInit DLLs", Scope = "Machine",
+                        Command = Convert.ToString(dllValue ?? ""), Location = machineRoot.Name + @"\" + subKey + " [" + viewLabel + "]",
+                        Enabled = load != 0, CanDisable = canDisable, IsManaged = false,
+                        Status = "LoadAppInit_DLLs=" + load + "; exact DLL list retained as one surface; per-DLL rewrite is intentionally unavailable; " + viewLabel,
+                        RegistryView = viewLabel, MutationCapability = canDisable ? "AppInitLoadToggle" : "ReadOnly", MutationReason = reason,
+                        RequiresExpertConfirmation = true, RequiresElevation = capability.RequiresElevation, RequiresReboot = true
+                    });
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem("AppInit DLLs", "Machine", machineRoot.Name + @"\" + subKey + " [" + viewLabel + "]", ex)); }
         }
 
         private static string SourceForRegistryPath(string subKey)
         {
+            if (subKey.IndexOf("RunOnceEx", StringComparison.OrdinalIgnoreCase) >= 0) return "Registry RunOnceEx";
             if (subKey.IndexOf("RunOnce", StringComparison.OrdinalIgnoreCase) >= 0) return "Registry RunOnce";
             if (subKey.IndexOf("RunServices", StringComparison.OrdinalIgnoreCase) >= 0) return "Registry RunServices";
             if (subKey.IndexOf(@"Policies\Explorer\Run", StringComparison.OrdinalIgnoreCase) >= 0) return "Policy Run";
             return "Registry Run";
         }
 
-        private static void AddRegistryValues(List<StartupItem> items, RegistryKey root, string subKey, string scope, string source, bool canEditValue, string status, string[] valueFilter = null)
+        private static void AddRegistryValues(List<StartupItem> items, RegistryKey root, string subKey, string scope, string source, bool canEditValue, string status, string[] valueFilter = null, string viewLabel = null)
         {
             try
             {
@@ -727,21 +4039,91 @@ namespace MichStartupMaster
                     foreach (var name in key.GetValueNames())
                     {
                         if (valueFilter != null && !valueFilter.Any(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase))) continue;
-                        var value = key.GetValue(name);
-                        string cmd = value == null ? "" : value.ToString();
+                        var value = key.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                        string cmd = value is string[] ? string.Join(" ; ", (string[])value) : (value == null ? "" : value.ToString());
                         if (string.IsNullOrWhiteSpace(cmd)) continue;
                         string encodedName = Convert.ToBase64String(Encoding.UTF8.GetBytes(name ?? ""));
-                        string id = "reg|" + scope + "|" + B64(root.Name) + "|" + B64(subKey) + "|" + encodedName;
-                        items.Add(new StartupItem { Id = id, Name = string.IsNullOrWhiteSpace(name) ? "(Default)" : name, Source = source, Scope = scope, Command = cmd, Location = root.Name + @"\" + subKey, Enabled = true, CanDisable = canEditValue && (scope == "User" || IsElevated()), IsManaged = false, Status = status });
+                        string id = "reg|" + scope + "|" + B64(root.Name) + "|" + B64(subKey) + "|" + encodedName + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "|" + viewLabel);
+                        items.Add(new StartupItem { Id = id, Name = string.IsNullOrWhiteSpace(name) ? "(Default)" : name, Source = source, Scope = scope, Command = cmd, Location = root.Name + @"\" + subKey + (string.IsNullOrWhiteSpace(viewLabel) ? "" : " [" + viewLabel + "]"), Enabled = true, CanDisable = canEditValue && (scope.StartsWith("User", StringComparison.OrdinalIgnoreCase) || IsElevated()), IsManaged = false, Status = status + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "; " + viewLabel), RegistryView = viewLabel });
                     }
                 }
             }
             catch (Exception ex) { items.Add(ErrorItem(source, scope, root.Name + @"\" + subKey, ex)); }
         }
 
-        private static void AddActiveSetup(List<StartupItem> items, RegistryKey root, string scope)
+        private static void AddWinlogonValues(List<StartupItem> items, RegistryKey root, string subKey, string scope, string[] valueFilter, string viewLabel)
         {
-            const string subKey = @"SOFTWARE\Microsoft\Active Setup\Installed Components";
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    foreach (string valueName in key.GetValueNames())
+                    {
+                        if (valueFilter != null && !valueFilter.Any(candidate => string.Equals(candidate, valueName, StringComparison.OrdinalIgnoreCase))) continue;
+                        object value = key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                        RegistryValueKind kind = key.GetValueKind(valueName);
+                        if (kind != RegistryValueKind.String && kind != RegistryValueKind.ExpandString)
+                        {
+                            items.Add(ErrorItem("Winlogon Autostart", scope, root.Name + @"\" + subKey + @"\" + valueName, new InvalidDataException("Expected REG_SZ or REG_EXPAND_SZ, found " + kind)));
+                            continue;
+                        }
+                        List<string> components;
+                        if (!TrySplitWinlogonComponents(Convert.ToString(value ?? ""), out components))
+                        {
+                            items.Add(ErrorItem("Winlogon Autostart", scope, root.Name + @"\" + subKey + @"\" + valueName, new InvalidDataException("Quoted component list is ambiguous; no rewrite is offered")));
+                            continue;
+                        }
+                        string accessReason;
+                        bool writable = CanOpenRegistryValueForWrite(root, subKey, valueName, out accessReason);
+                        var capability = DecideRegistryMutationCapability(scope, root.Name, writable, IsElevated(), "", subKey);
+                        int visibleCount = components.Count(part => !string.IsNullOrWhiteSpace(part));
+                        for (int index = 0; index < components.Count; index++)
+                        {
+                            string component = components[index].Trim();
+                            if (component.Length == 0) continue;
+                            bool protectedDefault = IsProtectedWindowsWinlogonComponent(valueName, component);
+                            string reason = protectedDefault
+                                ? "Protected Windows Winlogon default; removing it could prevent a usable sign-in"
+                                : (capability.CanMutate ? "Exact third-party component can be removed transactionally; reboot/sign-in is required" : capability.Reason + (string.IsNullOrWhiteSpace(accessReason) ? "" : ": " + accessReason));
+                            items.Add(new StartupItem
+                            {
+                                Id = "winlogon|" + scope + "|" + B64(root.Name) + "|" + B64(subKey) + "|" + B64(valueName) + "|" + index + "|" + viewLabel,
+                                Name = valueName + (visibleCount > 1 ? " #" + (index + 1) : ""), Source = "Winlogon Autostart", Scope = scope,
+                                Command = component, Location = root.Name + @"\" + subKey + @"\" + valueName + " [" + viewLabel + "]",
+                                Enabled = true, CanDisable = capability.CanMutate && !protectedDefault, IsManaged = false,
+                                Status = "Winlogon " + valueName + " component index=" + index + "; exact " + kind + "; " + reason,
+                                RegistryView = viewLabel,
+                                MutationCapability = protectedDefault ? "ProtectedWindowsDefault" : (capability.CanMutate ? "TransactionalRegistryValue" : "ReadOnly"),
+                                MutationReason = reason, RequiresExpertConfirmation = !protectedDefault, RequiresElevation = capability.RequiresElevation,
+                                RequiresReboot = true, ExternalAuthority = capability.ExternalAuthority
+                            });
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem("Winlogon Autostart", scope, root.Name + @"\" + subKey, ex)); }
+        }
+
+        private static bool CanOpenRegistryValueForWrite(RegistryKey root, string subKey, string valueName, out string reason)
+        {
+            reason = "";
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, true))
+                {
+                    if (key == null) { reason = "registry key is missing or not writable"; return false; }
+                    if (!key.GetValueNames().Any(name => string.Equals(name, valueName, StringComparison.OrdinalIgnoreCase))) { reason = "registry value is missing"; return false; }
+                    key.GetValueKind(valueName);
+                    return true;
+                }
+            }
+            catch (Exception ex) { reason = ex.GetBaseException().Message; return false; }
+        }
+
+        private static void AddActiveSetup(List<StartupItem> items, RegistryKey root, string scope, string subKey = null, string viewLabel = null)
+        {
+            if (string.IsNullOrWhiteSpace(subKey)) subKey = @"SOFTWARE\Microsoft\Active Setup\Installed Components";
             try
             {
                 using (var key = root.OpenSubKey(subKey, false))
@@ -756,9 +4138,9 @@ namespace MichStartupMaster
                             if (stub == null || string.IsNullOrWhiteSpace(stub.ToString())) continue;
                             object display = componentKey.GetValue(null);
                             string name = string.IsNullOrWhiteSpace(Convert.ToString(display)) ? component : Convert.ToString(display);
-                            string location = root.Name + @"\" + subKey + @"\" + component;
-                            string id = "active|" + scope + "|" + B64(root.Name) + "|" + B64(subKey + @"\" + component);
-                            items.Add(new StartupItem { Id = id, Name = name, Source = "Active Setup", Scope = scope, Command = stub.ToString(), Location = location, Enabled = true, CanDisable = scope == "User" || IsElevated(), IsManaged = false, Status = "Runs once per user profile through Active Setup StubPath" });
+                            string location = root.Name + @"\" + subKey + @"\" + component + (string.IsNullOrWhiteSpace(viewLabel) ? "" : " [" + viewLabel + "]");
+                            string id = "active|" + scope + "|" + B64(root.Name) + "|" + B64(subKey + @"\" + component) + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "|" + viewLabel);
+                            items.Add(new StartupItem { Id = id, Name = name, Source = "Active Setup", Scope = scope, Command = stub.ToString(), Location = location, Enabled = true, CanDisable = scope.StartsWith("User", StringComparison.OrdinalIgnoreCase) || IsElevated(), IsManaged = false, Status = "Runs once per user profile through Active Setup StubPath" + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "; " + viewLabel), RegistryView = viewLabel });
                         }
                     }
                 }
@@ -771,7 +4153,7 @@ namespace MichStartupMaster
             try
             {
                 if (!Directory.Exists(folder)) return;
-                foreach (var file in Directory.GetFiles(folder))
+                foreach (var file in Directory.GetFiles(folder).Where(f => !string.Equals(Path.GetFileName(f), "desktop.ini", StringComparison.OrdinalIgnoreCase)))
                 {
                     items.Add(new StartupItem { Id = "folder|" + scope + "|" + file, Name = Path.GetFileName(file), Source = "Startup Folder", Scope = scope, Command = file, Location = folder, Enabled = true, CanDisable = scope == "User" || IsElevated(), IsManaged = false, Status = "Starts through Startup folder" });
                 }
@@ -779,134 +4161,953 @@ namespace MichStartupMaster
             catch (Exception ex) { items.Add(ErrorItem("Startup Folder", scope, folder, ex)); }
         }
 
-        private static void AddLogonTasks(List<StartupItem> items)
+        private static void AddAllStartupFolders(List<StartupItem> items)
         {
-            try
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Action<string, string> add = (folder, scope) =>
             {
-                string script = @"
-$ErrorActionPreference='Stop'
-foreach($t in Get-ScheduledTask){
-  $hasLogon=$false; $hasBoot=$false; $hasTime=$false; $hasDelay=$false
-  foreach($tr in @($t.Triggers)){
-    if($null -eq $tr){ continue }
-    $cn = if($tr.CimClass){ [string]$tr.CimClass.CimClassName } else { '' }
-    if($cn -like '*LogonTrigger*'){ $hasLogon=$true }
-    if($cn -like '*BootTrigger*'){ $hasBoot=$true }
-    if($cn -like '*TimeTrigger*'){ $hasTime=$true }
-    $delayProp=$tr.PSObject.Properties['Delay']
-    if($delayProp -and $delayProp.Value){ $hasDelay=$true }
-  }
-  $path = $t.TaskPath
-  $isMicrosoft = $path.StartsWith('\Microsoft\') -or $path.StartsWith('\Windows\') -or $path.StartsWith('\GoogleSystem\')
-  if($hasLogon -or $hasBoot -or ($hasTime -and -not $isMicrosoft)){
-    $actions = (@($t.Actions) | ForEach-Object { if($_){ (($_.Execute) + ' ' + ($_.Arguments)).Trim() } }) -join ' || '
-    $enabled = if($t.Settings.Enabled){'true'}else{'false'}
-    $managed = if(($t.TaskPath + $t.TaskName).StartsWith('\MichStartupMaster\')){'true'}else{'false'}
-    $k=@(); if($hasLogon){ $k+='logon' }; if($hasBoot){ $k+='boot' }; if($hasTime){ $k+='time' }; $triggerKind=$k -join '+'
-    ($t.TaskPath + $t.TaskName) + ""`t"" + $enabled + ""`t"" + $t.State + ""`t"" + $hasDelay + ""`t"" + $managed + ""`t"" + $triggerKind + ""`t"" + $actions
-  }
-}
-";
-                string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-                string output = RunCapture(PowerShellExe(), "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded);
-                foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    string[] p = line.Split(new[] { '\t' }, 7);
-                    if (p.Length < 7) continue;
-                    string taskName = p[0];
-                    bool enabled = p[1].Equals("true", StringComparison.OrdinalIgnoreCase);
-                    bool hasDelay = p[3].Equals("true", StringComparison.OrdinalIgnoreCase);
-                    bool managed = p[4].Equals("true", StringComparison.OrdinalIgnoreCase);
-                    string triggerKind = p[5];
-                    string status = (enabled ? "Enabled" : "Disabled") + " " + triggerKind + " startup task" + (hasDelay ? " with delay" : " with no delay");
-                    items.Add(new StartupItem { Id = "task|" + taskName, Name = taskName.TrimStart('\\'), Source = "Scheduled Task", Scope = "User/System", Command = p[6], Location = taskName, Enabled = enabled, CanDisable = true, IsManaged = managed, Status = status });
-                }
-            }
-            catch (Exception ex) { items.Add(ErrorItem("Scheduled Task", "System", "Task Scheduler", ex)); }
-        }
-
-        private static void AddAutoServices(List<StartupItem> items)
-        {
-            try
-            {
-                using (var searcher = new ManagementObjectSearcher("SELECT Name, DisplayName, PathName, StartMode, State FROM Win32_Service"))
-                {
-                    foreach (ManagementObject mo in searcher.Get())
-                    {
-                        string startMode = Convert.ToString(mo["StartMode"] ?? "");
-                        if (!IsServiceStartupMode(startMode)) continue;
-                        string name = Convert.ToString(mo["Name"] ?? "");
-                        string displayName = Convert.ToString(mo["DisplayName"] ?? name);
-                        string path = Convert.ToString(mo["PathName"] ?? "");
-                        string state = Convert.ToString(mo["State"] ?? "");
-                        int startValue = ReadServiceStartValue(name, 2);
-                        bool enabled = startValue != 4;
-                        items.Add(new StartupItem { Id = "service|" + B64(name), Name = string.IsNullOrWhiteSpace(displayName) ? name : displayName, Source = "Windows Service", Scope = "Machine", Command = path, Location = @"HKLM\SYSTEM\CurrentControlSet\Services\" + name, Enabled = enabled, CanDisable = IsElevated(), IsManaged = false, Status = "Service start=" + startMode + " state=" + state + " registryStart=" + startValue });
-                    }
-                }
-            }
-            catch (Exception ex) { items.Add(ErrorItem("Windows Service", "Machine", "Win32_Service", ex)); }
-        }
-
-        private static void AddAutoDrivers(List<StartupItem> items)
-        {
-            try
-            {
-                using (var searcher = new ManagementObjectSearcher("SELECT Name, DisplayName, PathName, StartMode, State FROM Win32_SystemDriver"))
-                {
-                    foreach (ManagementObject mo in searcher.Get())
-                    {
-                        string startMode = Convert.ToString(mo["StartMode"] ?? "");
-                        if (!IsDriverStartupMode(startMode)) continue;
-                        string name = Convert.ToString(mo["Name"] ?? "");
-                        string displayName = Convert.ToString(mo["DisplayName"] ?? name);
-                        string path = Convert.ToString(mo["PathName"] ?? "");
-                        string state = Convert.ToString(mo["State"] ?? "");
-                        int startValue = ReadServiceStartValue(name, StartModeToRegistryValue(startMode));
-                        bool enabled = startValue != 4;
-                        items.Add(new StartupItem { Id = "driver|" + B64(name), Name = string.IsNullOrWhiteSpace(displayName) ? name : displayName, Source = "System Driver", Scope = "Machine", Command = path, Location = @"HKLM\SYSTEM\CurrentControlSet\Services\" + name, Enabled = enabled, CanDisable = IsElevated(), IsManaged = false, Status = "Driver start=" + startMode + " state=" + state + " registryStart=" + startValue });
-                    }
-                }
-            }
-            catch (Exception ex) { items.Add(ErrorItem("System Driver", "Machine", "Win32_SystemDriver", ex)); }
-        }
-
-        private static void AddStartupApproved(List<StartupItem> items)
-        {
-            string[] paths = new[]
-            {
-                @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
-                @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
-                @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
-                @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder32"
+                if (string.IsNullOrWhiteSpace(folder)) return;
+                string full;
+                try { full = Path.GetFullPath(Environment.ExpandEnvironmentVariables(folder)).TrimEnd('\\'); } catch { full = folder.TrimEnd('\\'); }
+                if (seen.Add(full)) AddStartupFolder(items, full, scope);
             };
-            foreach (string path in paths)
+            add(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "User");
+            add(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), "Machine");
+            try
             {
-                AddStartupApprovedValues(items, Registry.CurrentUser, path, "User");
-                AddStartupApprovedValues(items, Registry.LocalMachine, path, "Machine");
+                using (var profiles = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList", false))
+                {
+                    if (profiles == null) return;
+                    foreach (string sid in profiles.GetSubKeyNames())
+                    {
+                        using (var profile = profiles.OpenSubKey(sid, false))
+                        {
+                            string root = Convert.ToString(profile == null ? null : profile.GetValue("ProfileImagePath", null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            root = Environment.ExpandEnvironmentVariables(root ?? "");
+                            if (string.IsNullOrWhiteSpace(root)) continue;
+                            string userName = Path.GetFileName(root.TrimEnd('\\'));
+                            if (string.Equals(userName, "Default", StringComparison.OrdinalIgnoreCase) || string.Equals(userName, "Public", StringComparison.OrdinalIgnoreCase) || string.Equals(userName, "Default User", StringComparison.OrdinalIgnoreCase) || string.Equals(userName, "All Users", StringComparison.OrdinalIgnoreCase)) continue;
+                            add(Path.Combine(root, @"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"), string.Equals(userName, Environment.UserName, StringComparison.OrdinalIgnoreCase) ? "User" : "User:" + userName);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem("Startup Folder", "Machine", @"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList", ex)); }
+        }
+
+        private static void AddSystemBootEntries(List<StartupItem> items)
+        {
+            const string sessionManager = @"SYSTEM\CurrentControlSet\Control\Session Manager";
+            foreach (string valueName in new[] { "BootExecute", "SetupExecute", "Execute", "S0InitialCommand" })
+                AddReadOnlyMultiStringEntries(items, Registry.LocalMachine, sessionManager, valueName, "Machine", "Boot Execute", "System-critical Session Manager boot command");
+            const string lsa = @"SYSTEM\CurrentControlSet\Control\Lsa";
+            foreach (string valueName in new[] { "Authentication Packages", "Notification Packages", "Security Packages" })
+                AddReadOnlyMultiStringEntries(items, Registry.LocalMachine, lsa, valueName, "Machine", "LSA Startup Package", "System-critical Local Security Authority package");
+            AddReadOnlyMultiStringEntries(items, Registry.LocalMachine, lsa + @"\OSConfig", "Security Packages", "Machine", "LSA Startup Package", "System-critical Local Security Authority package");
+        }
+
+        // These are established Windows auto-load points in addition to the conventional
+        // boot/logon registrations above.  They are intentionally inventory-only until an
+        // exact, reversible mutation handler exists for each format: showing a dangerous
+        // registration read-only is safer than either hiding it or guessing how to rewrite it.
+        private const int WinsockSocketError = -1;
+        private const int WinsockNoBuffers = 10055;
+        private const int WinsockInvalidAddress = 10014;
+        private const int WinsockCatalogInitialBytes = 16 * 1024;
+        private const int WinsockCatalogMaximumBytes = 1024 * 1024;
+        private const int WinsockProviderPathMaximumChars = 32768;
+
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        private struct WinsockProtocolChain
+        {
+            public int ChainLength;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 7)] public uint[] ChainEntries;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode, Pack = 4)]
+        private struct WinsockProtocolInfo
+        {
+            public uint ServiceFlags1, ServiceFlags2, ServiceFlags3, ServiceFlags4, ProviderFlags;
+            public Guid ProviderId;
+            public uint CatalogEntryId;
+            public WinsockProtocolChain ProtocolChain;
+            public int Version, AddressFamily, MaximumSocketAddress, MinimumSocketAddress, SocketType, Protocol, ProtocolMaximumOffset, NetworkByteOrder, SecurityScheme;
+            public uint MaximumMessageSize, ProviderReserved;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string ProtocolName;
+        }
+
+        [DllImport("Ws2_32.dll")]
+        private static extern int WSAStartup(ushort versionRequested, IntPtr wsaData);
+        [DllImport("Ws2_32.dll")]
+        private static extern int WSACleanup();
+        [DllImport("Ws2_32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern int WSCEnumProtocols(IntPtr protocols, IntPtr protocolBuffer, ref int bufferLength, out int errorCode);
+        [DllImport("Ws2_32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "WSCEnumProtocols32")]
+        private static extern int WSCEnumProtocols32(IntPtr protocols, IntPtr protocolBuffer, ref int bufferLength, out int errorCode);
+        [DllImport("Ws2_32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern int WSCGetProviderPath(ref Guid providerId, StringBuilder providerPath, ref int providerPathLength, out int errorCode);
+        [DllImport("Ws2_32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, EntryPoint = "WSCGetProviderPath32")]
+        private static extern int WSCGetProviderPath32(ref Guid providerId, StringBuilder providerPath, ref int providerPathLength, out int errorCode);
+
+        private static void AddExtendedAutorunSources(List<StartupItem> items)
+        {
+            AddWinlogonNotificationDlls(items);
+            AddImageHijackEntries(items);
+            AddKnownDllEntries(items);
+            AddNetworkProviderEntries(items);
+            AddWinsockProviderEntries(items);
+            AddPrintMonitorEntries(items);
+            AddMediaCodecEntries(items);
+        }
+
+        private static void AddWinlogonNotificationDlls(List<StartupItem> items)
+        {
+            const string notify = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Notify";
+            foreach (RegistryView view in StartupRegistryViews())
+            using (var root = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+                AddRegistryExtensionSubkeyValue(items, root, notify, "Machine", "Winlogon Notification", "winlogon-notify", "DllName", "Winlogon loads this notification DLL during logon events", RegistryViewLabel(view), true);
+        }
+
+        private static void AddImageHijackEntries(List<StartupItem> items)
+        {
+            const string ifeo = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
+            const string silentExit = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit";
+            foreach (RegistryView view in StartupRegistryViews())
+            using (var root = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+            {
+                string label = RegistryViewLabel(view);
+                AddRegistryExtensionSubkeyValue(items, root, ifeo, "Machine", "Image Hijack", "image-hijack", "Debugger", "Launches the configured debugger whenever the named image starts", label, false);
+                AddRegistryExtensionSubkeyValue(items, root, ifeo, "Machine", "Image Hijack", "image-hijack", "VerifierDlls", "Loads the configured verifier DLLs whenever the named image starts", label, false);
+                AddRegistryExtensionSubkeyValue(items, root, silentExit, "Machine", "Image Hijack", "image-hijack", "MonitorProcess", "Launches the configured monitor when the named image exits silently", label, false);
             }
         }
 
-        private static void AddStartupApprovedValues(List<StartupItem> items, RegistryKey root, string subKey, string scope)
+        private static void AddKnownDllEntries(List<StartupItem> items)
+        {
+            const string sessionManager = @"SYSTEM\CurrentControlSet\Control\Session Manager";
+            AddRegistryExtensionValues(items, Registry.LocalMachine, sessionManager + @"\KnownDLLs", "Machine", "Known DLL", "known-dll", "Known DLL loaded into processes that import it", NativeRegistryViewLabel(), new[] { "DllDirectory" }, true);
+            AddRegistryExtensionValues(items, Registry.LocalMachine, sessionManager + @"\KnownDLLs32", "Machine", "Known DLL", "known-dll", "Known DLL loaded into 32-bit processes that import it", NativeRegistryViewLabel(), new[] { "DllDirectory" }, true);
+        }
+
+        private static void AddNetworkProviderEntries(List<StartupItem> items)
+        {
+            const string orderPath = @"SYSTEM\CurrentControlSet\Control\NetworkProvider\Order";
+            try
+            {
+                using (var key = Registry.LocalMachine.OpenSubKey(orderPath, false))
+                {
+                    string order = RegistryValueText(key == null ? null : key.GetValue("ProviderOrder", null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    foreach (string provider in ParseNetworkProviderOrder(order))
+                    {
+                        string path = @"SYSTEM\CurrentControlSet\Services\" + provider + @"\NetworkProvider";
+                        AddRegistryExtensionValue(items, Registry.LocalMachine, path, "Machine", "Network Provider", "network-provider", "ProviderPath", "Network provider loaded during interactive logon", NativeRegistryViewLabel(), true);
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem("Network Provider", "Machine", Registry.LocalMachine.Name + @"\" + orderPath, ex)); }
+        }
+
+        private static void AddWinsockProviderEntries(List<StartupItem> items)
+        {
+            AddWinsockProviderCatalog(items, false);
+            if (Environment.Is64BitOperatingSystem) AddWinsockProviderCatalog(items, true);
+        }
+
+        private static void AddWinsockProviderCatalog(List<StartupItem> items, bool catalog32)
+        {
+            string catalog = WinsockCatalogLabel(catalog32);
+            try
+            {
+                foreach (WinsockProtocolInfo info in EnumerateWinsockProtocolInfos(catalog32))
+                    items.Add(ReadOnlyWinsockProviderItem(info, catalog32, GetWinsockProviderPath(info.ProviderId, catalog32)));
+            }
+            catch (Exception ex) { items.Add(ErrorItem("Winsock Provider", "Machine", catalog, ex)); }
+        }
+
+        private static void AddPrintMonitorEntries(List<StartupItem> items)
+        {
+            const string monitors = @"SYSTEM\CurrentControlSet\Control\Print\Monitors";
+            AddRegistryExtensionSubkeyValue(items, Registry.LocalMachine, monitors, "Machine", "Print Monitor", "print-monitor", "Driver", "Print Spooler loads this monitor DLL when the spooler service starts", NativeRegistryViewLabel(), true);
+        }
+
+        private static void AddMediaCodecEntries(List<StartupItem> items)
+        {
+            const string codecs = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Drivers32";
+            foreach (RegistryView view in StartupRegistryViews())
+            using (var root = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+                AddRegistryExtensionValues(items, root, codecs, "Machine", "Media Codec", "media-codec", "Media codec loaded when its media class is used", RegistryViewLabel(view), null, true);
+        }
+
+        private static string NativeRegistryViewLabel() { return Environment.Is64BitOperatingSystem ? "Registry64" : "Registry32"; }
+
+        private static string RegistryValueText(object value)
+        {
+            var values = value as string[];
+            if (values != null) return string.Join(" ; ", values.Where(entry => !string.IsNullOrWhiteSpace(entry)));
+            return Convert.ToString(value ?? "");
+        }
+
+        private static string ExpandSystemModulePath(string value)
+        {
+            string candidate = Environment.ExpandEnvironmentVariables((value ?? "").Trim());
+            if (candidate.Length == 0) return "";
+            string unquoted = candidate.Trim().Trim('"');
+            if (!Path.IsPathRooted(unquoted) && unquoted.IndexOf('\\') < 0 && unquoted.IndexOf('/') < 0)
+                return Path.Combine(Environment.SystemDirectory, unquoted);
+            return candidate;
+        }
+
+        private static StartupItem ReadOnlyExtensionItem(string kind, RegistryKey root, string subKey, string valueName, string scope, string source, string command, string status, string viewLabel)
+        {
+            string key = (subKey ?? "").Trim('\\');
+            string value = valueName ?? "";
+            string displayValue = string.IsNullOrWhiteSpace(value) ? "(Default)" : value;
+            string view = viewLabel ?? "";
+            return new StartupItem
+            {
+                Id = "extension|" + kind + "|" + B64(root.Name) + "|" + B64(key) + "|" + B64(value) + "|" + B64(view),
+                Name = Path.GetFileName(key) + " — " + displayValue,
+                Source = source,
+                Scope = scope,
+                Command = command,
+                Location = root.Name + @"\" + key + @"\" + displayValue + (string.IsNullOrWhiteSpace(view) ? "" : " [" + view + "]"),
+                Enabled = true,
+                CanDisable = false,
+                IsManaged = false,
+                Status = status + "; read-only route",
+                RegistryView = view,
+                MutationCapability = "ReadOnly",
+                MutationReason = "This Windows extension point is shown for complete inventory coverage; Startup Master will not guess at a dangerous registry rewrite.",
+                RequiresExpertConfirmation = true,
+                RequiresReboot = true
+            };
+        }
+
+        private static void AddRegistryExtensionValue(List<StartupItem> items, RegistryKey root, string subKey, string scope, string source, string kind, string valueName, string status, string viewLabel, bool expandSystemModule)
         {
             try
             {
                 using (var key = root.OpenSubKey(subKey, false))
                 {
                     if (key == null) return;
-                    foreach (string name in key.GetValueNames())
+                    string raw = RegistryValueText(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    if (string.IsNullOrWhiteSpace(raw)) return;
+                    items.Add(ReadOnlyExtensionItem(kind, root, subKey, valueName, scope, source, expandSystemModule ? ExpandSystemModulePath(raw) : raw, status, viewLabel));
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem(source, scope, root.Name + @"\" + subKey + @"\" + valueName, ex)); }
+        }
+
+        private static void AddRegistryExtensionSubkeyValue(List<StartupItem> items, RegistryKey root, string parentPath, string scope, string source, string kind, string valueName, string status, string viewLabel, bool expandSystemModule)
+        {
+            try
+            {
+                using (var parent = root.OpenSubKey(parentPath, false))
+                {
+                    if (parent == null) return;
+                    foreach (string child in parent.GetSubKeyNames().OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
+                        AddRegistryExtensionValue(items, root, parentPath + @"\" + child, scope, source, kind, valueName, status, viewLabel, expandSystemModule);
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem(source, scope, root.Name + @"\" + parentPath, ex)); }
+        }
+
+        private static void AddRegistryExtensionValues(List<StartupItem> items, RegistryKey root, string subKey, string scope, string source, string kind, string status, string viewLabel, string[] excludedValues, bool expandSystemModule)
+        {
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    foreach (string valueName in key.GetValueNames().OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
                     {
-                        byte[] bytes = key.GetValue(name) as byte[];
-                        if (bytes == null || bytes.Length == 0) continue;
-                        bool disabled = bytes[0] == 0x03 || bytes[0] == 0x05 || bytes[0] == 0x07;
-                        if (!disabled) continue;
-                        string location = root.Name + @"\" + subKey;
-                        string id = "approved|" + scope + "|" + B64(root.Name) + "|" + B64(subKey) + "|" + B64(name);
-                        items.Add(new StartupItem { Id = id, Name = name, Source = "Startup Approval", Scope = scope, Command = BitConverter.ToString(bytes), Location = location, Enabled = false, CanDisable = false, IsManaged = false, Status = "Disabled in Explorer StartupApproved metadata; matching Run/folder/task row may also exist" });
+                        if (excludedValues != null && excludedValues.Any(excluded => string.Equals(excluded, valueName, StringComparison.OrdinalIgnoreCase))) continue;
+                        string raw = RegistryValueText(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                        if (string.IsNullOrWhiteSpace(raw)) continue;
+                        items.Add(ReadOnlyExtensionItem(kind, root, subKey, valueName, scope, source, expandSystemModule ? ExpandSystemModulePath(raw) : raw, status, viewLabel));
                     }
                 }
             }
-            catch (Exception ex) { items.Add(ErrorItem("Startup Approval", scope, root.Name + @"\" + subKey, ex)); }
+            catch (Exception ex) { items.Add(ErrorItem(source, scope, root.Name + @"\" + subKey, ex)); }
+        }
+
+        private static string[] ParseNetworkProviderOrder(string value)
+        {
+            return (value ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(name => name.Trim()).Where(name => name.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        }
+
+        private static string WinsockCatalogLabel(bool catalog32) { return catalog32 ? "Winsock 32-bit Catalog" : "Winsock 64-bit Catalog"; }
+
+        // Enumerate through WSC rather than registry-packed catalog data. WSC returns hidden and
+        // dummy layered-provider entries too, which keeps the dashboard faithful to the actual
+        // Winsock catalogs. The bounded buffer prevents malformed catalog metadata from turning
+        // inventory into an unbounded allocation.
+        private static List<WinsockProtocolInfo> EnumerateWinsockProtocolInfos(bool catalog32)
+        {
+            if (catalog32 && !Environment.Is64BitOperatingSystem) return new List<WinsockProtocolInfo>();
+            IntPtr startupData = IntPtr.Zero;
+            bool started = false;
+            try
+            {
+                startupData = Marshal.AllocHGlobal(512);
+                int startup = WSAStartup(0x0202, startupData);
+                if (startup != 0) throw new InvalidOperationException("WSAStartup failed with " + startup);
+                started = true;
+
+                int capacity = WinsockCatalogInitialBytes;
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    IntPtr buffer = IntPtr.Zero;
+                    try
+                    {
+                        buffer = Marshal.AllocHGlobal(capacity);
+                        int requested = capacity;
+                        int errorCode;
+                        int count = catalog32
+                            ? WSCEnumProtocols32(IntPtr.Zero, buffer, ref requested, out errorCode)
+                            : WSCEnumProtocols(IntPtr.Zero, buffer, ref requested, out errorCode);
+                        if (count != WinsockSocketError)
+                        {
+                            int structSize = Marshal.SizeOf<WinsockProtocolInfo>();
+                            if (count < 0 || (long)count * structSize > capacity)
+                                throw new InvalidOperationException("Winsock catalog returned an invalid entry count");
+                            var result = new List<WinsockProtocolInfo>(count);
+                            for (int index = 0; index < count; index++)
+                                result.Add(Marshal.PtrToStructure<WinsockProtocolInfo>(IntPtr.Add(buffer, checked(index * structSize))));
+                            return result;
+                        }
+                        if (errorCode != WinsockNoBuffers || requested <= capacity || requested > WinsockCatalogMaximumBytes)
+                            throw new InvalidOperationException("WSCEnumProtocols" + (catalog32 ? "32" : "") + " failed with " + errorCode);
+                        capacity = requested;
+                    }
+                    finally { if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer); }
+                }
+                throw new InvalidOperationException("Winsock catalog changed repeatedly while it was being enumerated");
+            }
+            finally
+            {
+                if (started) WSACleanup();
+                if (startupData != IntPtr.Zero) Marshal.FreeHGlobal(startupData);
+            }
+        }
+
+        private static string GetWinsockProviderPath(Guid providerId, bool catalog32)
+        {
+            int capacity = 512;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                var path = new StringBuilder(capacity);
+                int requested = capacity;
+                int errorCode;
+                int result = catalog32
+                    ? WSCGetProviderPath32(ref providerId, path, ref requested, out errorCode)
+                    : WSCGetProviderPath(ref providerId, path, ref requested, out errorCode);
+                if (result != WinsockSocketError)
+                {
+                    string expanded = Environment.ExpandEnvironmentVariables(path.ToString().Trim());
+                    if (expanded.Length == 0) throw new InvalidOperationException("Winsock provider returned an empty DLL path");
+                    return expanded;
+                }
+                if (errorCode != WinsockInvalidAddress || requested <= capacity || requested > WinsockProviderPathMaximumChars)
+                    throw new InvalidOperationException("WSCGetProviderPath" + (catalog32 ? "32" : "") + " failed with " + errorCode);
+                capacity = requested;
+            }
+            throw new InvalidOperationException("Winsock provider path changed repeatedly while it was being queried");
+        }
+
+        private static StartupItem ReadOnlyWinsockProviderItem(WinsockProtocolInfo info, bool catalog32, string providerPath)
+        {
+            string catalog = WinsockCatalogLabel(catalog32);
+            string entry = info.CatalogEntryId.ToString();
+            string provider = info.ProviderId.ToString("D");
+            string protocol = (info.ProtocolName ?? "").Trim();
+            return new StartupItem
+            {
+                Id = "winsock|" + (catalog32 ? "32" : "64") + "|" + entry + "|" + provider,
+                Name = (protocol.Length == 0 ? "Winsock provider" : protocol) + " - catalog " + entry,
+                Source = "Winsock Provider",
+                Scope = "Machine",
+                Command = providerPath ?? "",
+                Location = catalog + @"\Entry " + entry + " [" + provider + "]",
+                Enabled = true,
+                CanDisable = false,
+                IsManaged = false,
+                Status = "Winsock service provider; catalog entry=" + entry + "; chainLength=" + info.ProtocolChain.ChainLength + "; read-only route",
+                RegistryView = catalog32 ? "Winsock32" : "Winsock64",
+                MutationCapability = "ReadOnly",
+                MutationReason = "This Windows network provider is shown for complete inventory coverage; Startup Master will not guess at a potentially connection-breaking catalog rewrite.",
+                RequiresExpertConfirmation = true,
+                RequiresReboot = true
+            };
+        }
+
+        // Explorer and Internet Explorer add-ons are registrations, not ordinary executable
+        // commands: the actual module is normally the COM server behind a CLSID. Resolve that
+        // server when it is registered, but retain an explicitly marked unresolved CLSID when a
+        // stale or broken registration has no server path. Hiding it would make a real autoload
+        // route disappear precisely when it needs investigation.
+        private static void AddExplorerShellExtensions(List<StartupItem> items, RegistryKey root, string scope, string pathPrefix, string viewLabel, bool independent)
+        {
+            const string source = "Explorer Shell Extension";
+            string explorer = (pathPrefix ?? "") + @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer";
+            CollectComExtensionValueNames(items, root, explorer + @"\ShellExecuteHooks", scope, source, "explorer-shell-hook", "Explorer invokes this COM hook when it executes a shell command", viewLabel, independent);
+            CollectComExtensionSubkeys(items, root, explorer + @"\ShellIconOverlayIdentifiers", scope, source, "explorer-icon-overlay", "Explorer loads this COM icon-overlay handler during desktop activity", viewLabel, independent);
+        }
+
+        private static void AddInternetExplorerAddons(List<StartupItem> items, RegistryKey root, string scope, string pathPrefix, string viewLabel, bool independent)
+        {
+            const string source = "Internet Explorer Add-on";
+            string prefix = pathPrefix ?? "";
+            CollectComExtensionSubkeys(items, root, prefix + @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects", scope, source, "ie-bho", "Internet Explorer loads this browser helper object", viewLabel, independent);
+            CollectComExtensionValueNames(items, root, prefix + @"SOFTWARE\Microsoft\Internet Explorer\Toolbar", scope, source, "ie-toolbar", "Internet Explorer loads this registered toolbar COM object", viewLabel, independent);
+            CollectComExtensionValueNames(items, root, prefix + @"SOFTWARE\Microsoft\Internet Explorer\URLSearchHooks", scope, source, "ie-search-hook", "Internet Explorer loads this registered URL search hook", viewLabel, independent);
+            CollectInternetExplorerExtensionSubkeys(items, root, prefix + @"SOFTWARE\Microsoft\Internet Explorer\Extensions", scope, viewLabel, independent);
+        }
+
+        private static void CollectComExtensionValueNames(List<StartupItem> items, RegistryKey root, string subKey, string scope, string source, string kind, string status, string viewLabel, bool independent)
+        {
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    foreach (string valueName in key.GetValueNames().OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
+                    {
+                        string value = RegistryValueText(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                        string clsid = NormalizeComClassId(valueName);
+                        if (string.IsNullOrWhiteSpace(clsid)) clsid = NormalizeComClassId(value);
+                        if (string.IsNullOrWhiteSpace(clsid)) continue;
+                        AppendComExtensionItem(items, root, subKey, valueName, scope, source, kind, clsid, status, viewLabel, independent);
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem((independent ? "Independent " : "") + source, scope, root.Name + @"\" + subKey, ex)); }
+        }
+
+        private static void CollectComExtensionSubkeys(List<StartupItem> items, RegistryKey root, string parentPath, string scope, string source, string kind, string status, string viewLabel, bool independent)
+        {
+            try
+            {
+                using (var parent = root.OpenSubKey(parentPath, false))
+                {
+                    if (parent == null) return;
+                    foreach (string childName in parent.GetSubKeyNames().OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
+                    {
+                        string childPath = parentPath + @"\" + childName;
+                        try
+                        {
+                            using (var child = root.OpenSubKey(childPath, false))
+                            {
+                                if (child == null) continue;
+                                string clsidValue = RegistryValueText(child.GetValue("CLSID", null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                                string defaultValue = RegistryValueText(child.GetValue("", null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                                string clsid = NormalizeComClassId(clsidValue);
+                                string valueName = "CLSID";
+                                if (string.IsNullOrWhiteSpace(clsid))
+                                {
+                                    clsid = NormalizeComClassId(defaultValue);
+                                    valueName = "";
+                                }
+                                if (string.IsNullOrWhiteSpace(clsid))
+                                {
+                                    clsid = NormalizeComClassId(childName);
+                                    valueName = "";
+                                }
+                                if (string.IsNullOrWhiteSpace(clsid)) continue;
+                                AppendComExtensionItem(items, root, childPath, valueName, scope, source, kind, clsid, status, viewLabel, independent);
+                            }
+                        }
+                        catch (Exception ex) { items.Add(ErrorItem((independent ? "Independent " : "") + source, scope, root.Name + @"\" + childPath, ex)); }
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem((independent ? "Independent " : "") + source, scope, root.Name + @"\" + parentPath, ex)); }
+        }
+
+        private static void CollectInternetExplorerExtensionSubkeys(List<StartupItem> items, RegistryKey root, string parentPath, string scope, string viewLabel, bool independent)
+        {
+            const string source = "Internet Explorer Add-on";
+            try
+            {
+                using (var parent = root.OpenSubKey(parentPath, false))
+                {
+                    if (parent == null) return;
+                    foreach (string childName in parent.GetSubKeyNames().OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
+                    {
+                        string childPath = parentPath + @"\" + childName;
+                        try
+                        {
+                            using (var child = root.OpenSubKey(childPath, false))
+                            {
+                                if (child == null) continue;
+                                string clsid = NormalizeComClassId(RegistryValueText(child.GetValue("CLSID", null, RegistryValueOptions.DoNotExpandEnvironmentNames)));
+                                string clsidValueName = "CLSID";
+                                if (string.IsNullOrWhiteSpace(clsid))
+                                {
+                                    clsid = NormalizeComClassId(childName);
+                                    clsidValueName = "";
+                                }
+                                if (!string.IsNullOrWhiteSpace(clsid))
+                                    AppendComExtensionItem(items, root, childPath, clsidValueName, scope, source, "ie-extension", clsid, "Internet Explorer loads this registered extension COM object", viewLabel, independent);
+                                foreach (string valueName in new[] { "Exec", "Script" })
+                                {
+                                    string command = RegistryValueText(child.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                                    if (string.IsNullOrWhiteSpace(command)) continue;
+                                    var item = ReadOnlyExtensionItem("ie-extension", root, childPath, valueName, scope, source, Environment.ExpandEnvironmentVariables(command), "Internet Explorer extension " + valueName + " registration", viewLabel);
+                                    item.RequiresReboot = false;
+                                    items.Add(item);
+                                }
+                            }
+                        }
+                        catch (Exception ex) { items.Add(ErrorItem((independent ? "Independent " : "") + source, scope, root.Name + @"\" + childPath, ex)); }
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem((independent ? "Independent " : "") + source, scope, root.Name + @"\" + parentPath, ex)); }
+        }
+
+        private static void AppendComExtensionItem(List<StartupItem> items, RegistryKey root, string subKey, string valueName, string scope, string source, string kind, string classId, string status, string viewLabel, bool independent)
+        {
+            try
+            {
+                string path = ResolveComServerPath(root, subKey, classId);
+                string command = string.IsNullOrWhiteSpace(path) ? "COM " + classId : path;
+                string itemStatus = status + "; CLSID=" + classId + (string.IsNullOrWhiteSpace(path) ? "; server path unresolved" : "");
+                var item = ReadOnlyExtensionItem(kind, root, subKey, valueName, scope, source, command, itemStatus, viewLabel);
+                item.RequiresReboot = false;
+                items.Add(item);
+            }
+            catch (Exception ex) { items.Add(ErrorItem((independent ? "Independent " : "") + source, scope, root.Name + @"\" + subKey + @"\" + (string.IsNullOrWhiteSpace(valueName) ? "(Default)" : valueName), ex)); }
+        }
+
+        private static string NormalizeComClassId(string value)
+        {
+            Guid parsed;
+            return Guid.TryParse((value ?? "").Trim(), out parsed) ? parsed.ToString("B") : "";
+        }
+
+        private static string ResolveComServerPath(RegistryKey root, string registrationPath, string classId)
+        {
+            string path = registrationPath ?? "";
+            int softwareIndex = path.IndexOf(@"SOFTWARE\", StringComparison.OrdinalIgnoreCase);
+            string profilePrefix = softwareIndex > 0 ? path.Substring(0, softwareIndex) : "";
+            string classesPath = profilePrefix + @"SOFTWARE\Classes\CLSID\" + classId;
+            foreach (string serverKind in new[] { "InprocServer32", "LocalServer32", "InprocHandler32" })
+            {
+                using (var server = root.OpenSubKey(classesPath + @"\" + serverKind, false))
+                {
+                    if (server == null) continue;
+                    string command = RegistryValueText(server.GetValue("", null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    if (!string.IsNullOrWhiteSpace(command)) return Environment.ExpandEnvironmentVariables(command.Trim());
+                }
+            }
+            return "";
+        }
+
+        private static void AddReadOnlyMultiStringEntries(List<StartupItem> items, RegistryKey root, string subKey, string valueName, string scope, string source, string status)
+        {
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    if (!key.GetValueNames().Any(name => string.Equals(name, valueName, StringComparison.OrdinalIgnoreCase))) return;
+                    object value = key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                    RegistryValueKind kind = key.GetValueKind(valueName);
+                    string[] values = value as string[];
+                    if (values == null && value != null) values = new[] { Convert.ToString(value) };
+                    if (values == null) return;
+                    string accessReason;
+                    bool writable = CanOpenRegistryValueForWrite(root, subKey, valueName, out accessReason);
+                    var capability = DecideRegistryMutationCapability(scope, root.Name, writable, IsElevated(), "", subKey);
+                    bool exactShape = kind == RegistryValueKind.MultiString;
+                    string viewLabel = Environment.Is64BitOperatingSystem ? "Registry64" : "Registry32";
+                    int index = 0;
+                    foreach (string entry in values)
+                    {
+                        if (string.IsNullOrWhiteSpace(entry)) { index++; continue; }
+                        bool canDisable = exactShape && capability.CanMutate;
+                        string reason = !exactShape ? "Expected REG_MULTI_SZ, found " + kind + "; refusing an ambiguous rewrite"
+                            : (canDisable ? "Exact indexed component can be removed transactionally; a reboot is required" : capability.Reason + (string.IsNullOrWhiteSpace(accessReason) ? "" : ": " + accessReason));
+                        items.Add(new StartupItem
+                        {
+                            Id = "advanced|" + B64(root.Name) + "|" + B64(subKey) + "|" + B64(valueName) + "|" + index,
+                            Name = valueName + (values.Length > 1 ? " #" + (index + 1) : ""), Source = source, Scope = scope, Command = entry,
+                            Location = root.Name + @"\" + subKey + @"\" + valueName, Enabled = true, CanDisable = canDisable, IsManaged = false,
+                            Status = status + "; exact index=" + index + "; kind=" + kind + "; " + reason,
+                            RegistryView = viewLabel, MutationCapability = canDisable ? "TransactionalRegistryValue" : "ReadOnly",
+                            MutationReason = reason, RequiresExpertConfirmation = true, RequiresElevation = capability.RequiresElevation,
+                            RequiresReboot = true
+                        });
+                        index++;
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem(source, scope, root.Name + @"\" + subKey + @"\" + valueName, ex)); }
+        }
+
+        private static void AddGroupPolicyScripts(List<StartupItem> items)
+        {
+            foreach (var spec in new[]
+            {
+                Tuple.Create(Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Startup", "Machine"),
+                Tuple.Create(Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\Machine\Scripts\Startup", "Machine"),
+                Tuple.Create(Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Logon", "User"),
+                Tuple.Create(Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\User\Scripts\Logon", "User")
+            })
+            {
+                try { AddGroupPolicyScriptTree(items, spec.Item1, spec.Item2, spec.Item3, 0); }
+                catch (Exception ex) { items.Add(ErrorItem("Group Policy Script", spec.Item3, spec.Item1.Name + @"\" + spec.Item2, ex)); }
+            }
+        }
+
+        private static void AddGroupPolicyScriptTree(List<StartupItem> items, RegistryKey root, string subKey, string scope, int depth)
+        {
+            if (depth > 8) return;
+            using (var key = root.OpenSubKey(subKey, false))
+            {
+                if (key == null) return;
+                string script = Convert.ToString(key.GetValue("Script", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                if (!string.IsNullOrWhiteSpace(script))
+                {
+                    string args = Convert.ToString(key.GetValue("Parameters", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    string fileSystemPath, directoryServicePath, gpoId;
+                    ReadGroupPolicyAuthorityEvidence(root, subKey, out fileSystemPath, out directoryServicePath, out gpoId);
+                    string authority = ClassifyGroupPolicyAuthority(subKey, fileSystemPath, directoryServicePath, gpoId);
+                    string reason = authority == "Domain Group Policy"
+                        ? "Domain policy is authoritative; this machine cannot promise a persistent local disable"
+                        : (authority == "Local Group Policy" ? "Local policy is authoritative; disable this script through Local Group Policy" : "The owning Group Policy authority must change this script");
+                    items.Add(new StartupItem
+                    {
+                        Id = "gpscript|" + B64(root.Name) + "|" + B64(subKey), Name = Path.GetFileName(script), Source = "Group Policy Script", Scope = scope,
+                        Command = script + (string.IsNullOrWhiteSpace(args) ? "" : " " + args), Location = root.Name + @"\" + subKey,
+                        Enabled = true, CanDisable = false, IsManaged = false,
+                        Status = authority + " startup/logon script; " + reason,
+                        MutationCapability = "ExternalAuthority", MutationReason = reason, ExternalAuthority = authority,
+                        RequiresElevation = string.Equals(scope, "Machine", StringComparison.OrdinalIgnoreCase), RequiresReboot = false
+                    });
+                }
+                foreach (string child in key.GetSubKeyNames()) AddGroupPolicyScriptTree(items, root, subKey + @"\" + child, scope, depth + 1);
+            }
+        }
+
+        private static void ReadGroupPolicyAuthorityEvidence(RegistryKey root, string leafSubKey, out string fileSystemPath, out string directoryServicePath, out string gpoId)
+        {
+            fileSystemPath = ""; directoryServicePath = ""; gpoId = "";
+            string current = leafSubKey ?? "";
+            for (int depth = 0; depth <= 8 && !string.IsNullOrWhiteSpace(current); depth++)
+            {
+                try
+                {
+                    using (var key = root.OpenSubKey(current, false))
+                    {
+                        if (key != null)
+                        {
+                            if (string.IsNullOrWhiteSpace(fileSystemPath)) fileSystemPath = Convert.ToString(key.GetValue("FileSysPath", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            if (string.IsNullOrWhiteSpace(directoryServicePath)) directoryServicePath = Convert.ToString(key.GetValue("DSPath", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            if (string.IsNullOrWhiteSpace(directoryServicePath)) directoryServicePath = Convert.ToString(key.GetValue("SOM-ID", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            if (string.IsNullOrWhiteSpace(gpoId)) gpoId = Convert.ToString(key.GetValue("GPO-ID", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                        }
+                    }
+                }
+                catch { }
+                int slash = current.LastIndexOf('\\');
+                if (slash <= 0) break;
+                current = current.Substring(0, slash);
+                if (current.IndexOf(@"\Group Policy\", StringComparison.OrdinalIgnoreCase) < 0) break;
+            }
+        }
+
+        private static void AddExecutableWmiConsumers(List<StartupItem> items)
+        {
+            try
+            {
+                var scope = new ManagementScope(@"\\.\root\subscription");
+                scope.Connect();
+                using (var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT Filter, Consumer FROM __FilterToConsumerBinding")))
+                {
+                    foreach (ManagementObject binding in searcher.Get())
+                    {
+                        string filterRef = Convert.ToString(binding["Filter"] ?? "");
+                        string consumerRef = Convert.ToString(binding["Consumer"] ?? "");
+                        if (string.IsNullOrWhiteSpace(consumerRef)) continue;
+                        string name = consumerRef, command = "", consumerClass = "";
+                        try
+                        {
+                            using (var consumer = new ManagementObject(scope, new ManagementPath(consumerRef), null))
+                            {
+                                consumer.Get();
+                                consumerClass = consumer.ClassPath.ClassName ?? "";
+                                if (!string.Equals(consumerClass, "CommandLineEventConsumer", StringComparison.OrdinalIgnoreCase) && !string.Equals(consumerClass, "ActiveScriptEventConsumer", StringComparison.OrdinalIgnoreCase)) continue;
+                                name = Convert.ToString(consumer["Name"] ?? consumerRef);
+                                if (string.Equals(consumerClass, "CommandLineEventConsumer", StringComparison.OrdinalIgnoreCase)) command = Convert.ToString(consumer["CommandLineTemplate"] ?? consumer["ExecutablePath"] ?? "");
+                                else command = Convert.ToString(consumer["ScriptText"] ?? "");
+                            }
+                        }
+                        catch { continue; }
+                        string query = "";
+                        try
+                        {
+                            using (var filter = new ManagementObject(scope, new ManagementPath(filterRef), null)) { filter.Get(); query = Convert.ToString(filter["Query"] ?? ""); }
+                        }
+                        catch { }
+                        string location = binding.Path.Path;
+                        items.Add(new StartupItem { Id = "wmisub|" + B64(location), Name = name, Source = "WMI Event Consumer", Scope = "Machine", Command = command, Location = location, Enabled = true, CanDisable = IsElevated(), IsManaged = false, Status = filterRef + "\t" + consumerRef + "\t" + consumerClass + (string.IsNullOrWhiteSpace(query) ? "" : "\t" + query) });
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem("WMI Event Consumer", "Machine", @"root\subscription", ex)); }
+        }
+
+        private static void AddLogonTasks(List<StartupItem> items)
+        {
+            AddIsolatedProvider(items, "task-main", "Scheduled Task", "Task Scheduler COM", 15000);
+        }
+
+        private static void AddAutoServices(List<StartupItem> items)
+        {
+            AddConfiguredServiceEntries(items, false);
+        }
+
+        private static void AddAutoDrivers(List<StartupItem> items)
+        {
+            AddConfiguredServiceEntries(items, true);
+        }
+
+        private static void AddConfiguredServiceEntries(List<StartupItem> items, bool wantDrivers)
+        {
+            string source = wantDrivers ? "System Driver" : "Windows Service";
+            try
+            {
+                using (var services = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services", false))
+                {
+                    if (services == null) return;
+                    foreach (string name in services.GetSubKeyNames())
+                    {
+                        using (var key = services.OpenSubKey(name, false))
+                        {
+                            if (key == null) continue;
+                            int start, type;
+                            try { start = Convert.ToInt32(key.GetValue("Start", 3)); } catch { continue; }
+                            try { type = Convert.ToInt32(key.GetValue("Type", 0)); } catch { type = 0; }
+                            bool isDriver = (type & 0x0F) != 0;
+                            if (isDriver != wantDrivers || start < 0 || start > 2) continue;
+                            string displayName = Convert.ToString(key.GetValue("DisplayName", name, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            if (string.IsNullOrWhiteSpace(displayName) || displayName.StartsWith("@", StringComparison.Ordinal)) displayName = name;
+                            string path = Convert.ToString(key.GetValue("ImagePath", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            int delayed = 0;
+                            try { delayed = Convert.ToInt32(key.GetValue("DelayedAutoStart", 0)); } catch { }
+                            string overrides = "";
+                            try
+                            {
+                                using (var ov = key.OpenSubKey("StartOverride", false))
+                                {
+                                    if (ov != null) overrides = string.Join(",", ov.GetValueNames().Select(n => n + "=" + Convert.ToString(ov.GetValue(n))));
+                                }
+                            }
+                            catch { }
+                            string startText = start == 0 ? "Boot" : (start == 1 ? "System" : (delayed != 0 ? "Automatic (delayed)" : "Automatic"));
+                            string status = (wantDrivers ? "Driver" : "Service") + " start=" + startText + " registryStart=" + start + (string.IsNullOrWhiteSpace(overrides) ? "" : " startOverride=" + overrides);
+                            items.Add(new StartupItem { Id = (wantDrivers ? "driver|" : "service|") + B64(name), Name = displayName, Source = source, Scope = "Machine", Command = path, Location = @"HKLM\SYSTEM\CurrentControlSet\Services\" + name, Enabled = true, CanDisable = IsElevated(), IsManaged = false, Status = status });
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem(source, "Machine", @"HKLM\SYSTEM\CurrentControlSet\Services", ex)); }
+        }
+
+        private sealed class StartupApproval
+        {
+            public string Root;
+            public string Path;
+            public string Scope;
+            public string Kind;
+            public string Name;
+            public byte[] Data;
+            public string RegistryView;
+        }
+
+        private static void AddPackagedStartupTasks(List<StartupItem> items)
+        {
+            foreach (var location in EnumeratePackageManifestLocations(items, false))
+            {
+                try { items.AddRange(ParsePackagedStartupManifest(File.ReadAllText(location.ManifestPath), location)); }
+                catch (Exception ex) { items.Add(ErrorItem("Packaged Startup Task", location.Scope, location.ManifestPath, ex)); }
+            }
+        }
+
+        private static List<StartupApproval> ReadStartupApproved()
+        {
+            var result = new List<StartupApproval>();
+            RegistryView view = Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Registry32;
+            using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
+            using (var machineRoot = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+            using (var usersRoot = OpenRegistryRoot(RegistryHive.Users, view))
+            {
+                ReadStartupApprovedRoot(result, userRoot, "User", "");
+                ReadStartupApprovedRoot(result, machineRoot, "Machine", "");
+                try { foreach (var hive in LoadedUserHives()) ReadStartupApprovedRoot(result, usersRoot, hive.Item2, hive.Item1 + @"\"); }
+                catch { }
+            }
+            return result;
+        }
+
+        private static string StartupApprovalRegistryViewLabel()
+        {
+            return Environment.Is64BitOperatingSystem ? "Registry64" : "Registry32";
+        }
+
+        private static void ReadStartupApprovedRoot(List<StartupApproval> result, RegistryKey root, string scope, string prefix)
+        {
+            string[] kinds = { "Run", "Run32", "StartupFolder", "StartupFolder32", "StartupTasks" };
+            foreach (string kind in kinds)
+            {
+                string path = (prefix ?? "") + @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\" + kind;
+                try
+                {
+                    using (var key = root.OpenSubKey(path, false))
+                    {
+                        if (key == null) continue;
+                        foreach (string name in key.GetValueNames())
+                        {
+                            byte[] data = key.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as byte[];
+                            if (data == null || data.Length == 0) continue;
+                            result.Add(new StartupApproval { Root = root.Name, Path = path, Scope = scope, Kind = kind, Name = name, Data = (byte[])data.Clone(), RegistryView = StartupApprovalRegistryViewLabel() });
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static void ApplyStartupApproved(List<StartupItem> items, List<StartupApproval> approvals)
+        {
+            foreach (StartupApproval approval in approvals ?? new List<StartupApproval>())
+            {
+                StartupItem match = items.FirstOrDefault(item => StartupApprovalMatches(item, approval));
+                if (match != null)
+                {
+                    match.ApprovalRoot = approval.Root;
+                    match.ApprovalPath = approval.Path;
+                    match.ApprovalName = approval.Name;
+                    match.ApprovalData = approval.Data == null ? null : (byte[])approval.Data.Clone();
+                    match.ApprovalRegistryView = string.IsNullOrWhiteSpace(approval.RegistryView) ? StartupApprovalRegistryViewLabel() : approval.RegistryView;
+                    bool disabled = IsStartupApprovalDisabled(approval.Data);
+                    match.Enabled = !disabled;
+                    string accessReason;
+                    bool writable;
+                    using (RegistryKey approvalRoot = RootFromName(approval.Root, match.ApprovalRegistryView))
+                        writable = CanOpenRegistryValueForWrite(approvalRoot, approval.Path, approval.Name, out accessReason);
+                    var capability = DecideRegistryMutationCapability(approval.Scope, approval.Root, writable, IsElevated(), "", approval.Path);
+                    match.CanDisable = capability.CanMutate;
+                    match.MutationCapability = capability.CanMutate ? "StartupApprovedOverlay" : "ReadOnly";
+                    match.MutationReason = capability.CanMutate ? "Toggle the existing exact StartupApproved low enable bit; preserve every other metadata byte" : capability.Reason + (string.IsNullOrWhiteSpace(accessReason) ? "" : ": " + accessReason);
+                    match.RequiresElevation = capability.RequiresElevation;
+                    match.ExternalAuthority = capability.ExternalAuthority;
+                    string state = disabled ? "disabled" : (approval.Data != null && approval.Data.Length > 0 ? "state 0x" + approval.Data[0].ToString("X2") : "unknown");
+                    match.Status = (match.Status ?? "") + "; Explorer StartupApproved=" + state;
+                    continue;
+                }
+                // Approval values can outlive Run, Startup-folder, and packaged registrations.
+                // Surface the stale metadata as a non-actionable warning, never as a runnable app.
+                items.Add(new StartupItem
+                {
+                    Id = "staleapproval|" + B64(approval.Scope) + "|" + B64(approval.Root) + "|" + B64(approval.Path) + "|" + B64(approval.Name),
+                    Name = "Stale metadata: " + approval.Name,
+                    AppName = "Startup metadata warning",
+                    Source = "Stale Startup Metadata",
+                    Scope = approval.Scope,
+                    Command = "No matching live " + approval.Kind + " registration",
+                    Location = approval.Root + @"\" + approval.Path,
+                    Enabled = false,
+                    CanDisable = false,
+                    IsManaged = false,
+                    Status = "Stale Explorer StartupApproved metadata; state=0x" + approval.Data[0].ToString("X2") + "; no Windows startup source was found"
+                });
+            }
+            foreach (StartupItem packaged in items.Where(item => item.Source == "Packaged Startup Task" && string.IsNullOrWhiteSpace(item.ApprovalRoot)))
+            {
+                packaged.CanDisable = false;
+                packaged.MutationCapability = "ExternalAuthority";
+                packaged.MutationReason = "No existing exact StartupApproved metadata is available; refusing to invent control bytes";
+                packaged.ExternalAuthority = "Windows packaged startup authority";
+            }
+        }
+
+        private static bool StartupApprovalMatches(StartupItem item, StartupApproval approval)
+        {
+            if (item == null || approval == null || !string.Equals(item.Scope, approval.Scope, StringComparison.OrdinalIgnoreCase)) return false;
+            string itemName = item.Name ?? "";
+            if (item.Source == "Startup Folder")
+            {
+                if (!approval.Kind.StartsWith("StartupFolder", StringComparison.OrdinalIgnoreCase)) return false;
+                string fileName = Path.GetFileName(item.Command ?? itemName);
+                return string.Equals(fileName, approval.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(itemName, approval.Name, StringComparison.OrdinalIgnoreCase);
+            }
+            if (item.Source == "Packaged Startup Task")
+            {
+                if (!string.Equals(approval.Kind, "StartupTasks", StringComparison.OrdinalIgnoreCase)) return false;
+                if (string.Equals(itemName, approval.Name, StringComparison.OrdinalIgnoreCase)) return true;
+                int bang = itemName.LastIndexOf('!');
+                return bang >= 0 && string.Equals(itemName.Substring(bang + 1), approval.Name, StringComparison.OrdinalIgnoreCase);
+            }
+            if (item.Source != "Registry Run") return false;
+            bool wow = string.Equals(item.RegistryView, "Registry32", StringComparison.OrdinalIgnoreCase)
+                || (item.Location ?? "").IndexOf("Wow6432Node", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (wow != string.Equals(approval.Kind, "Run32", StringComparison.OrdinalIgnoreCase)) return false;
+            if (!wow && !string.Equals(approval.Kind, "Run", StringComparison.OrdinalIgnoreCase)) return false;
+            return string.Equals(itemName, approval.Name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsStartupApprovalDisabled(byte[] data)
+        {
+            if (data == null || data.Length == 0) return false;
+            // Explorer's state byte is a bit field.  The low bit is the disabled bit for
+            // every currently observed state (00..07), including 01.  Comparing only the
+            // historically common 03/05/07 values made a real 01 entry appear enabled even
+            // though ApplyStartupApprovalState writes that same low-bit representation.
+            return (data[0] & 0x01) != 0;
+        }
+
+        private static void SetStartupApproval(StartupItem item, bool enabled)
+        {
+            if (item == null || string.IsNullOrWhiteSpace(item.ApprovalRoot) || string.IsNullOrWhiteSpace(item.ApprovalPath) || string.IsNullOrWhiteSpace(item.ApprovalName)) throw new InvalidOperationException("Startup approval metadata is incomplete");
+            string approvalView = string.IsNullOrWhiteSpace(item.ApprovalRegistryView) ? StartupApprovalRegistryViewLabel() : item.ApprovalRegistryView;
+            using (RegistryKey root = RootFromName(item.ApprovalRoot, approvalView))
+            {
+                byte[] current;
+                using (var key = root.OpenSubKey(item.ApprovalPath, true))
+                {
+                    if (key == null || !key.GetValueNames().Any(name => string.Equals(name, item.ApprovalName, StringComparison.OrdinalIgnoreCase)))
+                        throw new InvalidOperationException("Startup approval state is missing; refusing to invent metadata");
+                    if (key.GetValueKind(item.ApprovalName) != RegistryValueKind.Binary)
+                        throw new InvalidOperationException("Startup approval state changed kind; refusing to coerce it");
+                    current = key.GetValue(item.ApprovalName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as byte[];
+                    if (current == null || current.Length == 0) throw new InvalidOperationException("Startup approval state is empty; refusing to invent metadata");
+                    if (item.ApprovalData == null || !current.SequenceEqual(item.ApprovalData))
+                        throw new InvalidOperationException("Startup approval state changed after scanning; refresh before changing it");
+                    byte[] data = ApplyStartupApprovalState(current, enabled);
+                    key.SetValue(item.ApprovalName, data, RegistryValueKind.Binary);
+                    byte[] verified = key.GetValue(item.ApprovalName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as byte[];
+                    if (key.GetValueKind(item.ApprovalName) != RegistryValueKind.Binary || verified == null || !verified.SequenceEqual(data))
+                        throw new IOException("Startup approval state did not verify after writing");
+                    item.ApprovalData = data;
+                }
+            }
+            item.Enabled = enabled;
+        }
+
+        private static byte[] ApplyStartupApprovalState(byte[] original, bool enabled)
+        {
+            if (original == null || original.Length == 0) throw new ArgumentException("Startup approval state is empty", "original");
+            byte[] data = (byte[])original.Clone();
+            // Explorer encodes disabled in the low bit (03/05/07) and enabled in the
+            // corresponding even state. Preserve every other flag and every timestamp/unknown
+            // metadata byte exactly; only toggle the documented enable bit.
+            data[0] = enabled ? (byte)(data[0] & 0xFE) : (byte)(data[0] | 0x01);
+            return data;
         }
 
         // Surface startup items that exist only in the legacy v2 state (no live registration
@@ -996,75 +5197,262 @@ foreach($t in Get-ScheduledTask){
 
         public static void Disable(StartupItem item)
         {
+            Disable(item, false);
+        }
+
+        public static void Disable(StartupItem item, bool expertConfirmed)
+        {
             if (item == null) throw new ArgumentNullException("item");
+            if (!string.IsNullOrWhiteSpace(item.MutationCapability) || item.RequiresExpertConfirmation || !string.IsNullOrWhiteSpace(item.ExternalAuthority)) EnsureMutationAuthorized(item, expertConfirmed);
+            ExecuteStartupMutation("Disable", item, () => DisableCore(item));
+        }
+
+        // The Apps view represents several independent Windows registrations as one app.  A
+        // bulk disable is therefore one transaction: authorize every route before touching any
+        // of them, snapshot each route immediately before its mutation, and roll the whole batch
+        // back in reverse order if even one source fails.  Capturing immediately before each
+        // change also makes shared registry-value routes reversible in the correct sequence.
+        public static int DisableAllRoutes(IEnumerable<StartupItem> routes, bool expertConfirmed)
+        {
+            if (routes == null) throw new ArgumentNullException("routes");
+            List<StartupItem> enabled = routes.Where(item => item != null && item.Enabled)
+                .GroupBy(item => item.Id ?? "", StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .OrderBy(BulkMutationSourceKey, StringComparer.OrdinalIgnoreCase)
+                .ThenByDescending(BulkMutationComponentIndex)
+                .ThenBy(item => item.Id ?? "", StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (enabled.Count == 0) return 0;
+
+            // Fail closed before the first write.  This is deliberately stricter than the
+            // legacy single-route entry point because a disabled or externally-owned route in
+            // an app summary must never turn a bulk request into a partial best-effort change.
+            foreach (StartupItem item in enabled) EnsureMutationAuthorized(item, expertConfirmed);
+
+            return StartupMutationCoordinator.Run(() =>
+            {
+                var snapshots = new List<Tuple<StartupItem, StartupMutationSnapshot>>();
+                StartupItem current = null;
+                try
+                {
+                    foreach (StartupItem item in enabled)
+                    {
+                        current = item;
+                        StartupMutationSnapshot before = StartupMutationSnapshot.Capture(item, "Disable");
+                        snapshots.Add(Tuple.Create(item, before));
+                        DisableCore(item);
+                    }
+                    return enabled.Count;
+                }
+                catch (Exception ex)
+                {
+                    var rollbackErrors = new List<string>();
+                    for (int index = snapshots.Count - 1; index >= 0; index--)
+                    {
+                        try { snapshots[index].Item2.Restore(snapshots[index].Item1); }
+                        catch (Exception rollbackEx) { rollbackErrors.Add((snapshots[index].Item1.Location ?? snapshots[index].Item1.Id ?? "route") + "=" + rollbackEx.GetBaseException().Message); }
+                    }
+                    string route = current == null ? "unknown route" : (current.Location ?? current.Id ?? "unknown route");
+                    if (rollbackErrors.Count > 0)
+                        throw new InvalidOperationException("Bulk disable failed at " + route + " and rollback was incomplete: " + string.Join(" | ", rollbackErrors) + ". Cause: " + ex.GetBaseException().Message, ex);
+                    throw new InvalidOperationException("Bulk disable failed at " + route + "; every earlier startup route and intent store was restored. Cause: " + ex.GetBaseException().Message, ex);
+                }
+            });
+        }
+
+        private static string BulkMutationSourceKey(StartupItem item)
+        {
+            if (item == null) return "";
+            string id = item.Id ?? "";
+            string[] parts = id.Split('|');
+            if (id.StartsWith("winlogon|", StringComparison.OrdinalIgnoreCase) && parts.Length >= 5) return "winlogon|" + parts[2] + "|" + parts[3] + "|" + parts[4];
+            if (id.StartsWith("advanced|", StringComparison.OrdinalIgnoreCase) && parts.Length >= 4) return "advanced|" + parts[1] + "|" + parts[2] + "|" + parts[3];
+            return id;
+        }
+
+        private static int BulkMutationComponentIndex(StartupItem item)
+        {
+            string[] parts = (item == null ? "" : (item.Id ?? "")).Split('|');
+            int value;
+            if (parts.Length > 5 && parts[0].Equals("winlogon", StringComparison.OrdinalIgnoreCase) && int.TryParse(parts[5], out value)) return value;
+            if (parts.Length > 4 && parts[0].Equals("advanced", StringComparison.OrdinalIgnoreCase) && int.TryParse(parts[4], out value)) return value;
+            return -1;
+        }
+
+        public static string BulkDisableSelfTest()
+        {
+            string token = Guid.NewGuid().ToString("N");
+            string subKey = @"Software\MichStartupMaster\SelfTests\BulkDisable\" + token;
+            string valueName = "FirstRoute";
+            string command = Q(ProcessExePath()) + " --smoke";
+            string taskLocation = Program.ManagedTaskRoot + "BulkDisableMissing_" + token;
+            RegistryView view = Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Registry32;
+            string viewLabel = RegistryViewLabel(view);
+            string disabledBefore = StoreFingerprint(Program.DisabledStore);
+            string enabledBefore = StoreFingerprint(Program.EnabledStore);
+            string protectedDisabledBefore = StoreFingerprint(Program.ProtectedDisabledStore);
+            string protectedQuietBefore = StoreFingerprint(Program.ProtectedQuietStore);
+            bool failedClosed = false;
+            bool registryRestored = false;
+            bool storesRestored = false;
+            try
+            {
+                using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                using (RegistryKey key = root.CreateSubKey(subKey)) key.SetValue(valueName, command, RegistryValueKind.String);
+
+                var registryRoute = new StartupItem
+                {
+                    Id = "reg|User|" + B64(Registry.CurrentUser.Name) + "|" + B64(subKey) + "|" + B64(valueName) + "|" + viewLabel,
+                    Name = "Bulk rollback registry fixture", Source = "Registry Run", Scope = "User", Command = command,
+                    Location = Registry.CurrentUser.Name + "\\" + subKey + " [" + viewLabel + "]", RegistryView = viewLabel,
+                    Enabled = true, CanDisable = true, MutationCapability = "TransactionalRegistryValue"
+                };
+                var missingTaskRoute = new StartupItem
+                {
+                    Id = "task|" + B64(taskLocation), Name = "Bulk rollback missing task fixture", Source = "Scheduled Task", Scope = "User",
+                    Command = command, Location = taskLocation, Enabled = true, CanDisable = true, MutationCapability = "ScheduledTaskEnabledState"
+                };
+                try { DisableAllRoutes(new[] { registryRoute, missingTaskRoute }, false); }
+                catch (InvalidOperationException ex) { failedClosed = ex.Message.IndexOf("every earlier startup route and intent store was restored", StringComparison.OrdinalIgnoreCase) >= 0; }
+
+                using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                using (RegistryKey key = root.OpenSubKey(subKey, false))
+                    registryRestored = key != null && key.GetValueKind(valueName) == RegistryValueKind.String && string.Equals(Convert.ToString(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames)), command, StringComparison.Ordinal);
+                storesRestored = disabledBefore == StoreFingerprint(Program.DisabledStore)
+                    && enabledBefore == StoreFingerprint(Program.EnabledStore)
+                    && protectedDisabledBefore == StoreFingerprint(Program.ProtectedDisabledStore)
+                    && protectedQuietBefore == StoreFingerprint(Program.ProtectedQuietStore);
+                if (!failedClosed || !registryRestored || !storesRestored) throw new InvalidOperationException("BULK_DISABLE_SELF_TEST failed failedClosed=" + failedClosed.ToString().ToLowerInvariant() + " registryRestored=" + registryRestored.ToString().ToLowerInvariant() + " storesRestored=" + storesRestored.ToString().ToLowerInvariant());
+                return "BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true storesRestored=true";
+            }
+            finally
+            {
+                try
+                {
+                    using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view)) root.DeleteSubKeyTree(subKey, false);
+                }
+                catch { }
+            }
+        }
+
+        private static string StoreFingerprint(string path)
+        {
+            if (!File.Exists(path)) return "missing";
+            using (var sha = SHA256.Create()) return "present:" + BitConverter.ToString(sha.ComputeHash(File.ReadAllBytes(path))).Replace("-", "");
+        }
+
+        private static void DisableCore(StartupItem item)
+        {
             if (item.Id.StartsWith("legacy|", StringComparison.OrdinalIgnoreCase))
             {
                 // A legacy v2 ghost is already not registered; "disabling" it just takes it
                 // over so the migration/view stop surfacing it.
                 EnabledStartupService.Remove(item);
-                try
-                {
-                    string[] parts = item.Id.Split('|');
-                    if (parts.Length > 1 && !string.IsNullOrWhiteSpace(UnB64(parts[1]))) EnabledStartupService.MarkV2Migrated(Program.ManagedTaskRoot + UnB64(parts[1]));
-                }
-                catch { }
+                string[] parts = item.Id.Split('|');
+                if (parts.Length > 1 && !string.IsNullOrWhiteSpace(UnB64(parts[1]))) EnabledStartupService.MarkV2MigratedChecked(Program.ManagedTaskRoot + UnB64(parts[1]));
                 return;
             }
-            // Record intent FIRST: even if the direct disable call fails or times out, the guard
-            // will keep enforcing the disabled state and the manifest row is removed in finally,
-            // so a half-completed disable can never leave the item silently enabled again.
-            ProtectedDisabledService.Protect(item);
-            // A quiet (tray) task must also leave the quiet-protection store. Otherwise the quiet
-            // guard re-registers it as an ENABLED task every 30 seconds and the disable can never
-            // stick — the exact "disable does not work" bug for quiet apps like GameSir/AHK/whisper-key.
-            if (item.Id.StartsWith("task|", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(item.Location))
-                ProtectedQuietService.UnprotectTask(item.Location);
-            try
+            // StartupApproved is an enable-state overlay, not another registration.  Toggle the
+            // overlay in place so the real row remains visible and reversible without deleting it.
+            if (!string.IsNullOrWhiteSpace(item.ApprovalRoot))
             {
-                if (item.Id.StartsWith("reg|")) DisableRegistry(item);
-                else if (item.Id.StartsWith("active|")) DisableActiveSetup(item);
-                else if (item.Id.StartsWith("folder|")) DisableStartupFolder(item);
-                else if (item.Id.StartsWith("task|")) RunChecked("schtasks.exe", "/Change /TN " + Q(item.Location) + " /Disable");
-                else if (item.Id.StartsWith("service|")) DisableServiceOrDriver(item, "service");
-                else if (item.Id.StartsWith("driver|")) DisableServiceOrDriver(item, "driver");
-                else throw new InvalidOperationException("Unsupported item: " + item.Id);
-            }
-            finally
-            {
+                SetStartupApproval(item, false);
                 EnabledStartupService.Remove(item);
+                return;
             }
+            if (item.Id.StartsWith("winlogon|", StringComparison.OrdinalIgnoreCase)) DisableWinlogonComponent(item);
+            else if (item.Id.StartsWith("appinit|", StringComparison.OrdinalIgnoreCase)) DisableAppInit(item);
+            else if (item.Id.StartsWith("advanced|", StringComparison.OrdinalIgnoreCase)) DisableAdvancedMultiStringComponent(item);
+            else if (item.Id.StartsWith("reg|")) DisableRegistry(item);
+            else if (item.Id.StartsWith("active|")) DisableActiveSetup(item);
+            else if (item.Id.StartsWith("folder|")) DisableStartupFolder(item);
+            else if (item.Id.StartsWith("task|"))
+            {
+                RunChecked("schtasks.exe", "/Change /TN " + Q(item.Location) + " /Disable");
+                // A quiet task must leave the quiet-protection store only after Task Scheduler
+                // confirmed the disable; otherwise a failed request can silently lose quiet intent.
+                if (!string.IsNullOrWhiteSpace(item.Location)) ProtectedQuietService.UnprotectTask(item.Location);
+            }
+            else if (item.Id.StartsWith("service|")) DisableServiceOrDriver(item, "service");
+            else if (item.Id.StartsWith("driver|")) DisableServiceOrDriver(item, "driver");
+            else if (item.Id.StartsWith("wmisub|")) DisableWmiBinding(item);
+            else throw new InvalidOperationException("Unsupported item: " + item.Id);
+            // Protection is opt-in through the explicit "Protect disabled" action.  Automatically
+            // claiming every click created stale guards that fought later restore/open operations.
+            EnabledStartupService.Remove(item);
         }
 
         public static void Enable(StartupItem item)
         {
+            Enable(item, false);
+        }
+
+        public static void Enable(StartupItem item, bool expertConfirmed)
+        {
             if (item == null) throw new ArgumentNullException("item");
+            if (!string.IsNullOrWhiteSpace(item.MutationCapability) || item.RequiresExpertConfirmation || !string.IsNullOrWhiteSpace(item.ExternalAuthority)) EnsureMutationAuthorized(item, expertConfirmed);
+            ExecuteStartupMutation("Enable", item, () => EnableCore(item));
+        }
+
+        private static void EnableCore(StartupItem item)
+        {
             if (item.Id.StartsWith("legacy|", StringComparison.OrdinalIgnoreCase))
             {
                 // Recreate the managed startup from the item's stored v2 configuration.
                 EnableLegacyV2(item);
                 return;
             }
-            ProtectedDisabledService.Unprotect(item);
-            if (item.Id.StartsWith("disabled|reg|")) RestoreRegistry(item);
+            if (!string.IsNullOrWhiteSpace(item.ApprovalRoot))
+            {
+                SetStartupApproval(item, true);
+                EnabledStartupService.UpsertFromItemChecked(item);
+                // The disabled guard remains authoritative until both the Windows source and
+                // enabled-intent manifest have committed successfully.
+                ProtectedDisabledService.Unprotect(item);
+                return;
+            }
+            if (item.Id.StartsWith("disabled|winlogon|", StringComparison.OrdinalIgnoreCase)
+                || item.Id.StartsWith("disabled|appinit|", StringComparison.OrdinalIgnoreCase)
+                || item.Id.StartsWith("disabled|advanced|", StringComparison.OrdinalIgnoreCase)) RestoreAdvancedRegistryValue(item);
+            else if (item.Id.StartsWith("disabled|reg|")) RestoreRegistry(item);
             else if (item.Id.StartsWith("disabled|active|")) RestoreActiveSetup(item);
             else if (item.Id.StartsWith("disabled|folder|")) RestoreStartupFolder(item);
             else if (item.Id.StartsWith("disabled|service|")) RestoreServiceOrDriver(item);
             else if (item.Id.StartsWith("disabled|driver|")) RestoreServiceOrDriver(item);
+            else if (item.Id.StartsWith("disabled|wmisub|")) RestoreWmiBinding(item);
             else if (item.Id.StartsWith("task|")) RunChecked("schtasks.exe", "/Change /TN " + Q(item.Location) + " /Enable");
             else throw new InvalidOperationException("Unsupported disabled item: " + item.Id);
-            EnabledStartupService.UpsertFromItem(item);
+            EnabledStartupService.UpsertFromItemChecked(item);
+            ProtectedDisabledService.Unprotect(item);
             // Re-assert quiet protection for a quiet task so the quiet guard keeps it running
             // quietly even if the manifest row is ever lost again.
-            if (item.Id.StartsWith("task|") && StartupService.CommandUsesTrayWrapper(item.Command ?? "") && !string.IsNullOrWhiteSpace(item.Location))
+            if (item.Id.StartsWith("task|") && StartupService.IsQuietLaunch(item.Command ?? "") && !string.IsNullOrWhiteSpace(item.Location))
             {
                 string quietTarget, quietArgs;
+                StartupService.ResolveLaunchTarget(item, out quietTarget, out quietArgs);
+                if (!string.IsNullOrWhiteSpace(quietTarget)) ProtectedQuietService.ProtectTask(item.Location, quietTarget, quietArgs ?? "");
+            }
+        }
+
+        private static void ExecuteStartupMutation(string operation, StartupItem item, Action mutation)
+        {
+            StartupMutationCoordinator.Run(() =>
+            {
+                StartupMutationSnapshot before = StartupMutationSnapshot.Capture(item, operation);
                 try
                 {
-                    StartupService.ResolveLaunchTarget(item, out quietTarget, out quietArgs);
-                    if (!string.IsNullOrWhiteSpace(quietTarget)) ProtectedQuietService.ProtectTask(item.Location, quietTarget, quietArgs ?? "");
+                    mutation();
                 }
-                catch { }
-            }
+                catch (Exception ex)
+                {
+                    try { before.Restore(item); }
+                    catch (Exception rollbackEx)
+                    {
+                        throw new InvalidOperationException(operation + " failed and rollback was incomplete: " + rollbackEx.GetBaseException().Message + ". Cause: " + ex.GetBaseException().Message, ex);
+                    }
+                    throw new InvalidOperationException(operation + " failed; the Windows source and all intent stores were restored. Cause: " + ex.GetBaseException().Message, ex);
+                }
+            });
         }
 
         private static void EnableLegacyV2(StartupItem item)
@@ -1102,6 +5490,126 @@ foreach($t in Get-ScheduledTask){
             catch (Exception ex) { throw new InvalidOperationException("Could not restore legacy item: " + ex.Message, ex); }
         }
 
+        private static RegistryValueState ReadRegistryValueState(RegistryKey root, string subKey, string valueName)
+        {
+            using (var key = root.OpenSubKey(subKey, false))
+            {
+                bool exists = key != null && key.GetValueNames().Any(name => string.Equals(name, valueName, StringComparison.OrdinalIgnoreCase));
+                if (!exists) return BuildRegistryValueState(false, RegistryValueKind.None, null);
+                RegistryValueKind kind = key.GetValueKind(valueName);
+                object value = key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                return BuildRegistryValueState(true, kind, value);
+            }
+        }
+
+        private static void WriteRegistryValueStateExact(RegistryKey root, string subKey, string valueName, RegistryValueState expectedBefore, RegistryValueState desiredAfter)
+        {
+            if (expectedBefore == null || desiredAfter == null
+                || !RegistryValueStateEquals(expectedBefore, expectedBefore) || !RegistryValueStateEquals(desiredAfter, desiredAfter))
+                throw new InvalidOperationException("Registry mutation state is hash-invalid");
+            RegistryValueState current = ReadRegistryValueState(root, subKey, valueName);
+            if (!RegistryValueStateEquals(current, expectedBefore)) throw new InvalidOperationException("Registry startup value changed after scanning; refresh before changing it");
+            using (var key = root.OpenSubKey(subKey, true))
+            {
+                if (key == null) throw new InvalidOperationException("Registry startup key is missing or not writable: " + subKey);
+                if (desiredAfter.Exists)
+                {
+                    RegistryValueKind kind;
+                    if (!Enum.TryParse(desiredAfter.Kind, true, out kind) || kind == RegistryValueKind.None || kind == RegistryValueKind.Unknown)
+                        throw new InvalidOperationException("Stored registry value kind is invalid");
+                    key.SetValue(valueName, DeserializeRegistryValueExact(desiredAfter.Payload, kind), kind);
+                }
+                else key.DeleteValue(valueName, false);
+            }
+            RegistryValueState verified = ReadRegistryValueState(root, subKey, valueName);
+            if (!RegistryValueStateEquals(verified, desiredAfter)) throw new IOException("Registry startup value did not verify after writing");
+        }
+
+        private static void DisableWinlogonComponent(StartupItem item)
+        {
+            string[] parts = (item.Id ?? "").Split('|');
+            if (parts.Length < 7) throw new InvalidOperationException("Malformed Winlogon component identity");
+            string scope = parts[1], rootName = UnB64(parts[2]), subKey = UnB64(parts[3]), valueName = UnB64(parts[4]), viewLabel = parts[6];
+            int index;
+            if (!int.TryParse(parts[5], out index) || index < 0) throw new InvalidOperationException("Malformed Winlogon component index");
+            RegistryKey root = RootFromName(rootName, viewLabel);
+            RegistryValueState before = ReadRegistryValueState(root, subKey, valueName);
+            AdvancedMutationPlan plan = BuildWinlogonRemovalPlan(before, index, item.Command);
+            var record = new AdvancedDisabledState
+            {
+                Version = 1, RouteType = "winlogon", Source = "Winlogon Autostart", RootName = rootName, SubKey = subKey,
+                ValueName = valueName, RegistryView = viewLabel, OriginalIndex = index, Component = item.Command,
+                Before = before, After = plan.After, RequiresExpertConfirmation = true, RequiresReboot = true
+            };
+            string disabledId = DisabledStoreService.Add("winlogon", item.Name, scope, item.Command, item.Location, EncodeAdvancedDisabledState(record));
+            try { WriteRegistryValueStateExact(root, subKey, valueName, before, plan.After); }
+            catch { DisabledStoreService.Remove(disabledId); throw; }
+        }
+
+        private static void DisableAdvancedMultiStringComponent(StartupItem item)
+        {
+            string[] parts = (item.Id ?? "").Split('|');
+            if (parts.Length < 5) throw new InvalidOperationException("Malformed advanced startup identity");
+            string rootName = UnB64(parts[1]), subKey = UnB64(parts[2]), valueName = UnB64(parts[3]);
+            int index;
+            if (!int.TryParse(parts[4], out index) || index < 0) throw new InvalidOperationException("Malformed advanced startup component index");
+            string viewLabel = string.IsNullOrWhiteSpace(item.RegistryView) ? (Environment.Is64BitOperatingSystem ? "Registry64" : "Registry32") : item.RegistryView;
+            RegistryKey root = RootFromName(rootName, viewLabel);
+            RegistryValueState before = ReadRegistryValueState(root, subKey, valueName);
+            AdvancedMutationPlan plan = BuildIndexedMultiStringRemovalPlan(before, index, item.Command);
+            var record = new AdvancedDisabledState
+            {
+                Version = 1, RouteType = "advanced", Source = item.Source, RootName = rootName, SubKey = subKey,
+                ValueName = valueName, RegistryView = viewLabel, OriginalIndex = index, Component = item.Command,
+                Before = before, After = plan.After, RequiresExpertConfirmation = true, RequiresReboot = true
+            };
+            string disabledId = DisabledStoreService.Add("advanced", item.Name, item.Scope, item.Command, item.Location, EncodeAdvancedDisabledState(record));
+            try { WriteRegistryValueStateExact(root, subKey, valueName, before, plan.After); }
+            catch { DisabledStoreService.Remove(disabledId); throw; }
+        }
+
+        private static void DisableAppInit(StartupItem item)
+        {
+            string[] parts = (item.Id ?? "").Split('|');
+            if (parts.Length < 3) throw new InvalidOperationException("Malformed AppInit identity");
+            string subKey = UnB64(parts[1]), viewLabel = parts[2];
+            RegistryKey root = RootFromName(Registry.LocalMachine.Name, viewLabel);
+            RegistryValueState dlls = ReadRegistryValueState(root, subKey, "AppInit_DLLs");
+            RegistryValueState load = ReadRegistryValueState(root, subKey, "LoadAppInit_DLLs");
+            AdvancedMutationPlan plan = BuildAppInitTogglePlan(dlls, load);
+            var record = new AdvancedDisabledState
+            {
+                Version = 1, RouteType = "appinit", Source = "AppInit DLLs", RootName = Registry.LocalMachine.Name, SubKey = subKey,
+                ValueName = "LoadAppInit_DLLs", RegistryView = viewLabel, OriginalIndex = -1, Component = item.Command,
+                Before = load, After = plan.After, GuardValueName = "AppInit_DLLs", GuardBefore = dlls,
+                RequiresExpertConfirmation = true, RequiresReboot = true
+            };
+            string disabledId = DisabledStoreService.Add("appinit", item.Name, item.Scope, item.Command, item.Location, EncodeAdvancedDisabledState(record));
+            try
+            {
+                if (!RegistryValueStateEquals(ReadRegistryValueState(root, subKey, "AppInit_DLLs"), dlls)) throw new InvalidOperationException("AppInit_DLLs changed after scanning; refresh before changing it");
+                WriteRegistryValueStateExact(root, subKey, "LoadAppInit_DLLs", load, plan.After);
+                if (!RegistryValueStateEquals(ReadRegistryValueState(root, subKey, "AppInit_DLLs"), dlls)) throw new IOException("AppInit_DLLs changed while toggling its loader; rollback is required");
+            }
+            catch { DisabledStoreService.Remove(disabledId); throw; }
+        }
+
+        private static void RestoreAdvancedRegistryValue(StartupItem item)
+        {
+            AdvancedDisabledState record = DecodeAdvancedDisabledState(item.Status);
+            RegistryKey root = RootFromName(record.RootName, record.RegistryView);
+            if (record.GuardBefore != null)
+            {
+                RegistryValueState guard = ReadRegistryValueState(root, record.SubKey, record.GuardValueName);
+                if (!RegistryValueStateEquals(guard, record.GuardBefore)) throw new InvalidOperationException("A guarded registry value changed externally; refusing to restore over it");
+            }
+            WriteRegistryValueStateExact(root, record.SubKey, record.ValueName, record.After, record.Before);
+            if (record.GuardBefore != null && !RegistryValueStateEquals(ReadRegistryValueState(root, record.SubKey, record.GuardValueName), record.GuardBefore))
+                throw new IOException("Guarded registry value changed during restore; rollback is required");
+            DisabledStoreService.Remove(item.Id);
+            item.Enabled = true;
+        }
+
         private static void DisableRegistry(StartupItem item)
         {
             string[] p = item.Id.Split('|');
@@ -1121,14 +5629,17 @@ foreach($t in Get-ScheduledTask){
                 subKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
                 name = UnB64(p[2]);
             }
-            RegistryKey root = RootFromName(rootName);
+            string viewLabel = p.Length > 5 ? p[5] : item.RegistryView;
+            RegistryKey root = RootFromName(rootName, viewLabel);
             using (var key = root.OpenSubKey(subKey, true))
             {
                 if (key == null) throw new InvalidOperationException("Registry startup key missing: " + subKey);
                 object value = key.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
                 RegistryValueKind kind = key.GetValueKind(name);
-                DisabledStoreService.Add("reg", item.Name, scope, value == null ? "" : value.ToString(), item.Location, root.Name + "\t" + subKey + "\t" + name + "\t" + kind.ToString() + "\t" + item.Source);
-                key.DeleteValue(name, false);
+                string payload = SerializeRegistryValue(value, kind);
+                string disabledId = DisabledStoreService.Add("reg", item.Name, scope, item.Command ?? Convert.ToString(value ?? ""), item.Location, root.Name + "\t" + subKey + "\t" + name + "\t" + kind.ToString() + "\t" + item.Source + "\t" + B64(payload) + "\t" + (viewLabel ?? ""));
+                try { key.DeleteValue(name, true); }
+                catch { DisabledStoreService.Remove(disabledId); throw; }
             }
         }
 
@@ -1141,7 +5652,7 @@ foreach($t in Get-ScheduledTask){
             int kindIndex;
             if (meta.Length >= 4 && meta[0].StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase))
             {
-                root = RootFromName(meta[0]);
+                root = RootFromName(meta[0], meta.Length > 6 ? meta[6] : "");
                 subKey = meta[1];
                 valueName = meta[2];
                 kindIndex = 3;
@@ -1155,7 +5666,13 @@ foreach($t in Get-ScheduledTask){
             }
             RegistryValueKind kind = RegistryValueKind.String;
             if (meta.Length > kindIndex) { try { kind = (RegistryValueKind)Enum.Parse(typeof(RegistryValueKind), meta[kindIndex], true); } catch { kind = RegistryValueKind.String; } }
-            using (var key = root.CreateSubKey(subKey)) key.SetValue(valueName, item.Command ?? "", kind);
+            object restored = item.Command ?? "";
+            if (meta.Length > 5 && !string.IsNullOrWhiteSpace(meta[5])) restored = DeserializeRegistryValue(UnB64(meta[5]), kind);
+            using (var key = root.CreateSubKey(subKey))
+            {
+                if (key.GetValueNames().Any(n => string.Equals(n, valueName, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException("A registry value now exists at the restore location; refusing to overwrite it: " + valueName);
+                key.SetValue(valueName, restored, kind);
+            }
             DisabledStoreService.Remove(item.Id);
         }
 
@@ -1164,15 +5681,17 @@ foreach($t in Get-ScheduledTask){
             string[] p = item.Id.Split('|');
             if (p.Length < 4) throw new InvalidOperationException("Malformed Active Setup id");
             string scope = p[1];
-            RegistryKey root = RootFromName(UnB64(p[2]));
+            string viewLabel = p.Length > 4 ? p[4] : item.RegistryView;
+            RegistryKey root = RootFromName(UnB64(p[2]), viewLabel);
             string subKey = UnB64(p[3]);
             using (var key = root.OpenSubKey(subKey, true))
             {
                 if (key == null) throw new InvalidOperationException("Active Setup key missing");
                 object value = key.GetValue("StubPath", null, RegistryValueOptions.DoNotExpandEnvironmentNames);
                 RegistryValueKind kind = key.GetValueKind("StubPath");
-                DisabledStoreService.Add("active", item.Name, scope, value == null ? "" : value.ToString(), item.Location, root.Name + "\t" + subKey + "\tStubPath\t" + kind.ToString());
-                key.DeleteValue("StubPath", false);
+                string disabledId = DisabledStoreService.Add("active", item.Name, scope, item.Command ?? Convert.ToString(value ?? ""), item.Location, root.Name + "\t" + subKey + "\tStubPath\t" + kind.ToString() + "\t" + B64(SerializeRegistryValue(value, kind)) + "\t" + (viewLabel ?? ""));
+                try { key.DeleteValue("StubPath", true); }
+                catch { DisabledStoreService.Remove(disabledId); throw; }
             }
         }
 
@@ -1180,19 +5699,26 @@ foreach($t in Get-ScheduledTask){
         {
             string[] meta = (item.Status ?? "").Split('\t');
             if (meta.Length < 4) throw new InvalidOperationException("Stored Active Setup metadata is incomplete");
-            RegistryKey root = RootFromName(meta[0]);
+            RegistryKey root = RootFromName(meta[0], meta.Length > 5 ? meta[5] : "");
             RegistryValueKind kind = RegistryValueKind.String;
             try { kind = (RegistryValueKind)Enum.Parse(typeof(RegistryValueKind), meta[3], true); } catch { }
-            using (var key = root.CreateSubKey(meta[1])) key.SetValue(meta[2], item.Command ?? "", kind);
+            object restored = meta.Length > 4 && !string.IsNullOrWhiteSpace(meta[4]) ? DeserializeRegistryValue(UnB64(meta[4]), kind) : (object)(item.Command ?? "");
+            using (var key = root.CreateSubKey(meta[1]))
+            {
+                if (key.GetValueNames().Any(n => string.Equals(n, meta[2], StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException("Active Setup StubPath was recreated externally; refusing to overwrite it");
+                key.SetValue(meta[2], restored, kind);
+            }
             DisabledStoreService.Remove(item.Id);
         }
 
         private static void DisableServiceOrDriver(StartupItem item, string type)
         {
             string name = UnB64(item.Id.Split('|')[1]);
-            int originalStart = ReadServiceStartValue(name, 2);
-            SetServiceStartValue(name, 4);
-            DisabledStoreService.Add(type, item.Name, item.Scope, item.Command, item.Location, name + "\t" + originalStart.ToString());
+            int originalStart = ReadServiceStartValue(name, -1);
+            if (originalStart < 0 || originalStart > 3) throw new InvalidOperationException("Could not read the exact startup type for service " + name + "; nothing was changed");
+            string disabledId = DisabledStoreService.Add(type, item.Name, item.Scope, item.Command, item.Location, name + "\t" + originalStart.ToString());
+            try { SetServiceStartValue(name, 4); }
+            catch { DisabledStoreService.Remove(disabledId); throw; }
         }
 
         private static void RestoreServiceOrDriver(StartupItem item)
@@ -1200,12 +5726,16 @@ foreach($t in Get-ScheduledTask){
             string[] meta = (item.Status ?? "").Split('\t');
             if (meta.Length < 2) throw new InvalidOperationException("Stored service metadata is incomplete");
             int start;
-            if (!int.TryParse(meta[1], out start)) start = 2;
+            if (!int.TryParse(meta[1], out start) || start < 0 || start > 3) throw new InvalidOperationException("Stored service startup type is invalid; refusing to guess Automatic");
+            int current = ReadServiceStartValue(meta[0], -1);
+            if (current < 0 || current > 4) throw new InvalidOperationException("Could not read the current service startup type; nothing was changed");
+            if (current == start) { DisabledStoreService.Remove(item.Id); return; }
+            if (current != 4) throw new InvalidOperationException("Service startup type changed externally; refusing to overwrite it (current=" + current + ")");
             SetServiceStartValue(meta[0], start);
             DisabledStoreService.Remove(item.Id);
         }
 
-        private static int ReadServiceStartValue(string serviceName, int fallback)
+        internal static int ReadServiceStartValue(string serviceName, int fallback)
         {
             try
             {
@@ -1217,6 +5747,23 @@ foreach($t in Get-ScheduledTask){
                 }
             }
             catch { return fallback; }
+        }
+
+        internal static string ServiceNameFromItem(StartupItem item)
+        {
+            if (item == null) return "";
+            string id = item.Id ?? "";
+            if (id.StartsWith("disabled|service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|driver|", StringComparison.OrdinalIgnoreCase))
+            {
+                string[] meta = (item.Status ?? "").Split('\t');
+                return meta.Length > 0 ? meta[0] : "";
+            }
+            if (id.StartsWith("service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("driver|", StringComparison.OrdinalIgnoreCase))
+            {
+                string[] parts = id.Split('|');
+                return parts.Length > 1 ? UnB64(parts[1]) : "";
+            }
+            return "";
         }
 
         private static void SetServiceStartValue(string serviceName, int start)
@@ -1241,86 +5788,1579 @@ foreach($t in Get-ScheduledTask){
             Directory.CreateDirectory(Program.DisabledStartupFolder);
             string source = item.Command;
             string dest = Path.Combine(Program.DisabledStartupFolder, Path.GetFileName(source) + "." + DateTime.Now.Ticks + ".disabled");
-            File.Move(source, dest);
-            DisabledStoreService.Add("folder", item.Name, item.Scope, dest, item.Location, source);
+            string disabledId = DisabledStoreService.Add("folder", item.Name, item.Scope, dest, item.Location, source);
+            try { File.Move(source, dest); }
+            catch { DisabledStoreService.Remove(disabledId); throw; }
         }
 
         private static void RestoreStartupFolder(StartupItem item)
         {
             string original = item.Status;
             string disabledPath = item.Command;
+            if (File.Exists(original)) throw new InvalidOperationException("A startup file now exists at the restore location; refusing to overwrite it: " + original);
             Directory.CreateDirectory(Path.GetDirectoryName(original));
             File.Move(disabledPath, original);
             DisabledStoreService.Remove(item.Id);
         }
 
-        // Guarantee the hidden boot agent is registered from this copy of the app:
-        // a Startup-folder shortcut and a managed logon task, both launching --agent.
-        public static void EnsureAgentRegistered()
+        private static string SerializeRegistryValue(object value, RegistryValueKind kind)
         {
-            // Adopt legacy v2 enabled items into the enforcement manifest right away, so items
-            // set to start in the old app are registered and running at this very boot.
-            try { EnabledStartupService.MigrateV2EnabledItems(); } catch { }
+            if (value == null) return "";
+            if (kind == RegistryValueKind.MultiString) return JsonSerializer.Serialize(value as string[] ?? new[] { Convert.ToString(value) });
+            if (kind == RegistryValueKind.Binary) return Convert.ToBase64String(value as byte[] ?? new byte[0]);
+            return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "";
+        }
+
+        private static object DeserializeRegistryValue(string payload, RegistryValueKind kind)
+        {
+            if (kind == RegistryValueKind.MultiString)
+            {
+                try { return JsonSerializer.Deserialize<string[]>(payload) ?? new string[0]; } catch { return new[] { payload ?? "" }; }
+            }
+            if (kind == RegistryValueKind.Binary)
+            {
+                try { return Convert.FromBase64String(payload ?? ""); } catch { return new byte[0]; }
+            }
+            if (kind == RegistryValueKind.DWord) { int v; return int.TryParse(payload, out v) ? v : 0; }
+            if (kind == RegistryValueKind.QWord) { long v; return long.TryParse(payload, out v) ? v : 0L; }
+            return payload ?? "";
+        }
+
+        private static object DeserializeRegistryValueExact(string payload, RegistryValueKind kind)
+        {
             try
             {
-                string exe = ProcessExePath();
-                if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe)) return;
-                string wd = Path.GetDirectoryName(exe) ?? "";
-                string lnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "Mich Startup Master Agent.lnk");
-                bool lnkOk = false;
-                try
+                if (kind == RegistryValueKind.MultiString)
                 {
-                    if (File.Exists(lnk))
-                    {
-                        Type shellType = Type.GetTypeFromProgID("WScript.Shell");
-                        if (shellType != null)
-                        {
-                            dynamic shell = Activator.CreateInstance(shellType);
-                            dynamic shortcut = shell.CreateShortcut(lnk);
-                            lnkOk = string.Equals(Convert.ToString(shortcut.TargetPath), exe, StringComparison.OrdinalIgnoreCase)
-                                && string.Equals(Convert.ToString(shortcut.Arguments ?? "").Trim(), "--agent", StringComparison.OrdinalIgnoreCase);
-                        }
-                    }
+                    string[] values = JsonSerializer.Deserialize<string[]>(payload ?? "");
+                    if (values == null) throw new InvalidDataException("REG_MULTI_SZ payload is null");
+                    return values;
                 }
-                catch { lnkOk = false; }
-                if (!lnkOk)
+                if (kind == RegistryValueKind.Binary) return Convert.FromBase64String(payload ?? "");
+                if (kind == RegistryValueKind.DWord)
                 {
-                    string script =
-                        "$ErrorActionPreference='SilentlyContinue';" +
-                        "function D($s){[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))};" +
-                        "$lnk = D '" + B64(lnk) + "';" +
-                        "$exe = D '" + B64(exe) + "';" +
-                        "$wd = D '" + B64(wd) + "';" +
-                        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($lnk);" +
-                        "$s.TargetPath=$exe;$s.Arguments='--agent';$s.WorkingDirectory=$wd;" +
-                        "$s.Description='Mich Startup Master hidden startup agent';$s.Save();";
-                    RunPowerShellScript(script);
+                    int value;
+                    if (!int.TryParse(payload, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value))
+                        throw new InvalidDataException("REG_DWORD payload is invalid");
+                    return value;
                 }
-                // Backup path: a managed logon task that re-runs the agent with no delay.
-                string task = Program.ManagedTaskRoot + "MichStartupMasterApp";
-                RegisterLogonTaskAt(task, exe, "--agent");
+                if (kind == RegistryValueKind.QWord)
+                {
+                    long value;
+                    if (!long.TryParse(payload, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value))
+                        throw new InvalidDataException("REG_QWORD payload is invalid");
+                    return value;
+                }
+                if (kind == RegistryValueKind.String || kind == RegistryValueKind.ExpandString) return payload ?? "";
+                throw new InvalidDataException("Unsupported exact registry value kind: " + kind);
+            }
+            catch (InvalidDataException) { throw; }
+            catch (Exception ex) { throw new InvalidDataException("Stored registry payload cannot be decoded exactly", ex); }
+        }
+
+        private static void DisableWmiBinding(StartupItem item)
+        {
+            string disabledId = DisabledStoreService.Add("wmisub", item.Name, item.Scope, item.Command, item.Location, item.Status ?? "");
+            try
+            {
+                using (var binding = new ManagementObject(item.Location)) { binding.Get(); binding.Delete(); }
+            }
+            catch { DisabledStoreService.Remove(disabledId); throw; }
+        }
+
+        private static void RestoreWmiBinding(StartupItem item)
+        {
+            string[] meta = (item.Status ?? "").Split('\t');
+            if (meta.Length < 2 || string.IsNullOrWhiteSpace(meta[0]) || string.IsNullOrWhiteSpace(meta[1])) throw new InvalidOperationException("Stored WMI binding metadata is incomplete");
+            var scope = new ManagementScope(@"\\.\root\subscription");
+            scope.Connect();
+            try
+            {
+                using (var existing = new ManagementObject(item.Location)) { existing.Get(); DisabledStoreService.Remove(item.Id); return; }
             }
             catch { }
+            using (var bindingClass = new ManagementClass(scope, new ManagementPath("__FilterToConsumerBinding"), null))
+            using (var binding = bindingClass.CreateInstance())
+            {
+                binding["Filter"] = meta[0];
+                binding["Consumer"] = meta[1];
+                binding.Put();
+            }
+            DisabledStoreService.Remove(item.Id);
+        }
+
+        private sealed class AgentShortcutRoute
+        {
+            public string Path;
+            public string Scope;
+            public string Target;
+            public string Arguments;
+        }
+
+        private sealed class RetiredAgentShortcut
+        {
+            public string OriginalPath;
+            public string ArchivePath;
+        }
+
+        // Keep exactly one authoritative, immediate logon route for the hidden agent. Registration
+        // and legacy-route retirement form one transaction: if any step or final verification fails,
+        // every moved shortcut and the prior task XML are restored.
+        public static void EnsureAgentRegistered()
+        {
+            EnsureAgentRegistered(null);
+        }
+
+        internal static string EnsureAgentRegistered(ReleaseGateChildRequest releaseGateChild)
+        {
+            return StartupMutationCoordinator.Run(() => EnsureAgentRegisteredCore(), releaseGateChild);
+        }
+
+        private static string EnsureAgentRegisteredCore()
+        {
+            string exe = ProcessExePath();
+            if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe)) throw new FileNotFoundException("Startup Master executable was not found", exe);
+            string task = Program.ManagedTaskRoot + "MichStartupMasterApp";
+            string priorXml;
+            bool priorTaskExisted = TryReadTaskXml(task, out priorXml);
+            bool taskMutationAttempted = false;
+            var retired = new List<RetiredAgentShortcut>();
+            try
+            {
+                string currentDetail;
+                bool currentTaskValid = priorTaskExisted && VerifyAgentTaskXml(priorXml, exe, out currentDetail);
+                if (!currentTaskValid)
+                {
+                    taskMutationAttempted = true;
+                    RegisterLogonTaskAt(task, exe, "--agent");
+                }
+
+                string registeredXml;
+                if (!TryReadTaskXml(task, out registeredXml)) throw new InvalidOperationException("The scheduled startup-agent task was not present after registration");
+                string registeredDetail;
+                if (!VerifyAgentTaskXml(registeredXml, exe, out registeredDetail)) throw new InvalidOperationException("The scheduled startup-agent task failed verification: " + registeredDetail);
+
+                List<AgentShortcutRoute> legacyRoutes = EnumerateOwnedAgentShortcuts();
+                if (legacyRoutes.Count > 0) RetireAgentShortcuts(legacyRoutes, retired);
+
+                string receipt;
+                if (!VerifyAgentRegistration(out receipt)) throw new InvalidOperationException(receipt);
+                return receipt;
+            }
+            catch (Exception registrationError)
+            {
+                var rollbackErrors = new List<string>();
+                try { RestoreRetiredAgentShortcuts(retired); }
+                catch (Exception ex) { rollbackErrors.Add("shortcut restore: " + ex.GetBaseException().Message); }
+                if (taskMutationAttempted)
+                {
+                    try
+                    {
+                        if (priorTaskExisted) RestoreTaskXml(task, priorXml);
+                        else DeleteTaskIfPresent(task);
+                    }
+                    catch (Exception ex) { rollbackErrors.Add("task restore: " + ex.GetBaseException().Message); }
+                }
+                if (rollbackErrors.Count > 0)
+                {
+                    throw new InvalidOperationException("Startup-agent registration failed and rollback was incomplete (" + string.Join("; ", rollbackErrors) + "): " + registrationError.GetBaseException().Message, registrationError);
+                }
+                throw new InvalidOperationException("Startup-agent registration failed; the prior task and legacy shortcuts were restored: " + registrationError.GetBaseException().Message, registrationError);
+            }
+        }
+
+        public static bool VerifyAgentRegistration(out string receipt)
+        {
+            string task = Program.ManagedTaskRoot + "MichStartupMasterApp";
+            string exe = ProcessExePath();
+            string xml;
+            bool taskExists = TryReadTaskXml(task, out xml);
+            string taskDetail = "";
+            bool taskValid = taskExists && VerifyAgentTaskXml(xml, exe, out taskDetail);
+            if (!taskExists) taskDetail = "taskExists=false";
+
+            List<AgentShortcutRoute> legacyRoutes = EnumerateOwnedAgentShortcuts();
+            int ownedRoutes = (taskExists ? 1 : 0) + legacyRoutes.Count;
+            bool valid = taskValid && ownedRoutes == 1 && legacyRoutes.Count == 0;
+            receipt = (valid ? "REGISTER_AGENT_OK" : "REGISTER_AGENT_FAILED")
+                + " task=" + Q(task)
+                + " action=" + Q(exe + " --agent")
+                + " " + taskDetail
+                + " ownedRoutes=" + ownedRoutes
+                + " legacyRoutes=" + legacyRoutes.Count;
+            return valid;
+        }
+
+        public static string AgentRegistrationSelfTest()
+        {
+            const string exe = @"C:\Program Files\Mich Startup Master\MichStartupMaster.exe";
+            string escapedExe = System.Security.SecurityElement.Escape(exe);
+            string currentSid = CurrentUserSid();
+            string escapedUser = System.Security.SecurityElement.Escape(currentSid);
+            string otherSid = string.Equals(currentSid, "S-1-5-18", StringComparison.OrdinalIgnoreCase) ? "S-1-5-19" : "S-1-5-18";
+            string trigger = "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + escapedUser + "</UserId></LogonTrigger></Triggers>";
+            string principal = "<Principals><Principal id=\"Author\"><UserId>" + escapedUser + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>";
+            string battery = "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable>";
+            string actions = "<Actions Context=\"Author\"><Exec><Command>" + escapedExe + "</Command><Arguments>--agent</Arguments></Exec></Actions>";
+            string good = "<Task>" + trigger + principal + "<Settings><Enabled>true</Enabled>" + battery + "</Settings>" + actions + "</Task>";
+            string omittedDefault = good.Replace("<Enabled>true</Enabled>", "");
+            string detail;
+            bool goodAccepted = VerifyAgentTaskXml(good, exe, out detail);
+            bool omittedDefaultAccepted = VerifyAgentTaskXml(omittedDefault, exe, out detail);
+            bool delayedRejected = !VerifyAgentTaskXml(good.Replace("</LogonTrigger>", "<Delay>PT30S</Delay></LogonTrigger>"), exe, out detail);
+            bool wrongActionRejected = !VerifyAgentTaskXml(good.Replace("--agent", "--start-in-tray"), exe, out detail);
+            bool settingsFalseRejected = !VerifyAgentTaskXml(good.Replace("<Settings><Enabled>true</Enabled>", "<Settings><Enabled>false</Enabled>"), exe, out detail);
+            bool triggerFalseRejected = !VerifyAgentTaskXml(good.Replace("<LogonTrigger><Enabled>true</Enabled>", "<LogonTrigger><Enabled>false</Enabled>"), exe, out detail);
+            bool batteryStopRejected = !VerifyAgentTaskXml(good.Replace("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>", "<StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>"), exe, out detail);
+            bool badPrincipalRejected = !VerifyAgentTaskXml(good.Replace("<LogonType>InteractiveToken</LogonType>", "<LogonType>Password</LogonType>"), exe, out detail);
+            bool extraTriggerRejected = !VerifyAgentTaskXml(good.Replace("</Triggers>", "<BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>"), exe, out detail);
+            bool extraActionRejected = !VerifyAgentTaskXml(good.Replace("</Actions>", "<ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId></ComHandler></Actions>"), exe, out detail);
+            bool wrongUserRejected = !VerifyAgentTaskXml(good.Replace(escapedUser, otherSid), exe, out detail);
+            string system32 = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32");
+            string fixtureRoot = Path.Combine(Path.GetTempPath(), "MichStartupMaster-agent-shortcut-fixture-" + Guid.NewGuid().ToString("N"));
+            bool legacyDirectAccepted = false, legacyWscriptAccepted = false, legacyCscriptAccepted = false, unrelatedShortcutRejected = false, sameNameWrongPathRejected = false;
+            try
+            {
+                Directory.CreateDirectory(fixtureRoot);
+                string legacyScript = Path.Combine(fixtureRoot, "MichStartupMasterAgent.vbs");
+                File.WriteAllText(legacyScript, "CreateObject(\"WScript.Shell\").Run \"\"\"" + exe.Replace("\"", "\"\"") + "\"\" --agent\", 0, False", new UTF8Encoding(false));
+                legacyDirectAccepted = IsExactOwnedAgentLaunch(exe, "--agent", exe);
+                legacyWscriptAccepted = IsExactOwnedAgentLaunch(Path.Combine(system32, "wscript.exe"), "//B //NoLogo \"" + legacyScript + "\"", exe);
+                legacyCscriptAccepted = IsExactOwnedAgentLaunch(Path.Combine(system32, "cscript.exe"), "\"" + legacyScript + "\"", exe);
+                sameNameWrongPathRejected = !IsExactOwnedAgentLaunch(@"D:\Old\MichStartupMaster.exe", "--agent", exe);
+                string unrelatedScript = Path.Combine(fixtureRoot, "Other.vbs");
+                File.WriteAllText(unrelatedScript, "WScript.Echo \"unrelated\"", new UTF8Encoding(false));
+                unrelatedShortcutRejected = !IsExactOwnedAgentLaunch(@"C:\Tools\wscript.exe", "\"" + legacyScript + "\"", exe)
+                    && !IsExactOwnedAgentLaunch(Path.Combine(system32, "wscript.exe"), "\"" + unrelatedScript + "\"", exe)
+                    && !IsExactOwnedAgentLaunch(@"D:\Old\SomethingElse.exe", "--agent", exe);
+            }
+            finally { try { if (Directory.Exists(fixtureRoot)) Directory.Delete(fixtureRoot, true); } catch { } }
+            bool missingTaskErrorsRecognized = new[] { 0x80070002u, 0x80070003u, 0x8004130Fu }.All(code =>
+                IsMissingScheduledTask(new COMException("missing task", unchecked((int)code)))
+                && IsMissingScheduledTask(new System.Reflection.TargetInvocationException(new COMException("missing task", unchecked((int)code)))));
+            bool mappedMissingErrorsRecognized = IsMissingScheduledTask(new System.Reflection.TargetInvocationException(new FileNotFoundException()))
+                && IsMissingScheduledTask(new System.Reflection.TargetInvocationException(new System.Reflection.TargetInvocationException(new DirectoryNotFoundException())));
+            bool schedulerFailuresPreserved = !IsMissingScheduledTask(new COMException("access denied", unchecked((int)0x80070005u)))
+                && !IsMissingScheduledTask(new System.Reflection.TargetInvocationException(new COMException("service unavailable", unchecked((int)0x800706BAu))))
+                && !IsMissingScheduledTask(new InvalidOperationException("unrelated failure", new FileNotFoundException()))
+                && !IsMissingScheduledTask(null);
+            bool pass = missingTaskErrorsRecognized && mappedMissingErrorsRecognized && schedulerFailuresPreserved && goodAccepted && omittedDefaultAccepted && delayedRejected && wrongActionRejected && settingsFalseRejected && triggerFalseRejected && batteryStopRejected && badPrincipalRejected && extraTriggerRejected && extraActionRejected && wrongUserRejected && legacyDirectAccepted && legacyWscriptAccepted && legacyCscriptAccepted && unrelatedShortcutRejected && sameNameWrongPathRejected;
+            return (pass ? "AGENT_REGISTRATION_SELF_TEST_OK" : "AGENT_REGISTRATION_SELF_TEST_FAILED")
+                + " missingTaskErrorsRecognized=" + missingTaskErrorsRecognized.ToString().ToLowerInvariant()
+                + " mappedMissingErrorsRecognized=" + mappedMissingErrorsRecognized.ToString().ToLowerInvariant()
+                + " schedulerFailuresPreserved=" + schedulerFailuresPreserved.ToString().ToLowerInvariant()
+                + " goodAccepted=" + goodAccepted.ToString().ToLowerInvariant()
+                + " omittedDefaultAccepted=" + omittedDefaultAccepted.ToString().ToLowerInvariant()
+                + " delayedRejected=" + delayedRejected.ToString().ToLowerInvariant()
+                + " wrongActionRejected=" + wrongActionRejected.ToString().ToLowerInvariant()
+                + " settingsFalseRejected=" + settingsFalseRejected.ToString().ToLowerInvariant()
+                + " triggerFalseRejected=" + triggerFalseRejected.ToString().ToLowerInvariant()
+                + " batteryStopRejected=" + batteryStopRejected.ToString().ToLowerInvariant()
+                + " badPrincipalRejected=" + badPrincipalRejected.ToString().ToLowerInvariant()
+                + " extraTriggerRejected=" + extraTriggerRejected.ToString().ToLowerInvariant()
+                + " extraActionRejected=" + extraActionRejected.ToString().ToLowerInvariant()
+                + " wrongUserRejected=" + wrongUserRejected.ToString().ToLowerInvariant()
+                + " legacyDirectAccepted=" + legacyDirectAccepted.ToString().ToLowerInvariant()
+                + " legacyWscriptAccepted=" + legacyWscriptAccepted.ToString().ToLowerInvariant()
+                + " legacyCscriptAccepted=" + legacyCscriptAccepted.ToString().ToLowerInvariant()
+                + " unrelatedShortcutRejected=" + unrelatedShortcutRejected.ToString().ToLowerInvariant()
+                + " sameNameWrongPathRejected=" + sameNameWrongPathRejected.ToString().ToLowerInvariant();
+        }
+
+        private static bool VerifyAgentTaskXml(string xml, string expectedExe, out string detail)
+        {
+            bool singleLogonTrigger = false, currentUserTrigger = false, noDelay = false, enabled = false;
+            bool principalValid = false, singleExec = false, commandMatch = false, argumentMatch = false;
+            bool startsOnBattery = false, continuesOnBattery = false, startWhenAvailable = false;
+            string parseError = "";
+            try
+            {
+                var doc = new System.Xml.XmlDocument();
+                doc.LoadXml(xml ?? "");
+
+                System.Xml.XmlNodeList triggerContainers = doc.SelectNodes("/*[local-name()='Task']/*[local-name()='Triggers']");
+                System.Xml.XmlNodeList triggerNodes = triggerContainers != null && triggerContainers.Count == 1 ? triggerContainers[0].SelectNodes("./*") : null;
+                System.Xml.XmlNode logon = triggerNodes != null && triggerNodes.Count == 1 && string.Equals(triggerNodes[0].LocalName, "LogonTrigger", StringComparison.Ordinal) ? triggerNodes[0] : null;
+                singleLogonTrigger = logon != null;
+                noDelay = logon != null && logon.SelectNodes("./*[local-name()='Delay']").Count == 0;
+                System.Xml.XmlNode triggerUser = SingleDirectChild(logon, "UserId");
+                currentUserTrigger = triggerUser != null && IsCurrentUserIdentity(triggerUser.InnerText);
+
+                System.Xml.XmlNodeList settingsNodes = doc.SelectNodes("/*[local-name()='Task']/*[local-name()='Settings']");
+                System.Xml.XmlNode settings = settingsNodes != null && settingsNodes.Count == 1 ? settingsNodes[0] : null;
+                System.Xml.XmlNode settingsEnabled = SingleDirectChild(settings, "Enabled");
+                System.Xml.XmlNode triggerEnabled = SingleDirectChild(logon, "Enabled");
+                bool settingsAllows = settingsEnabled == null || string.Equals(settingsEnabled.InnerText.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+                bool triggerAllows = triggerEnabled == null || string.Equals(triggerEnabled.InnerText.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+                enabled = settings != null && logon != null && settingsAllows && triggerAllows;
+                System.Xml.XmlNode disallowBattery = SingleDirectChild(settings, "DisallowStartIfOnBatteries");
+                System.Xml.XmlNode stopBattery = SingleDirectChild(settings, "StopIfGoingOnBatteries");
+                System.Xml.XmlNode startAvailable = SingleDirectChild(settings, "StartWhenAvailable");
+                startsOnBattery = disallowBattery != null && string.Equals(disallowBattery.InnerText.Trim(), "false", StringComparison.OrdinalIgnoreCase);
+                continuesOnBattery = stopBattery != null && string.Equals(stopBattery.InnerText.Trim(), "false", StringComparison.OrdinalIgnoreCase);
+                startWhenAvailable = startAvailable != null && string.Equals(startAvailable.InnerText.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+
+                System.Xml.XmlNodeList principalContainers = doc.SelectNodes("/*[local-name()='Task']/*[local-name()='Principals']");
+                System.Xml.XmlNodeList principals = principalContainers != null && principalContainers.Count == 1 ? principalContainers[0].SelectNodes("./*[local-name()='Principal']") : null;
+                if (principals != null && principals.Count == 1 && principalContainers[0].SelectNodes("./*").Count == 1)
+                {
+                    System.Xml.XmlNode principalUser = SingleDirectChild(principals[0], "UserId");
+                    System.Xml.XmlNode logonType = SingleDirectChild(principals[0], "LogonType");
+                    System.Xml.XmlNode runLevel = SingleDirectChild(principals[0], "RunLevel");
+                    principalValid = principalUser != null && IsCurrentUserIdentity(principalUser.InnerText)
+                        && logonType != null && string.Equals(logonType.InnerText.Trim(), "InteractiveToken", StringComparison.OrdinalIgnoreCase)
+                        && (runLevel == null || string.Equals(runLevel.InnerText.Trim(), "LeastPrivilege", StringComparison.OrdinalIgnoreCase));
+                }
+
+                System.Xml.XmlNodeList actionContainers = doc.SelectNodes("/*[local-name()='Task']/*[local-name()='Actions']");
+                System.Xml.XmlNodeList actionNodes = actionContainers != null && actionContainers.Count == 1 ? actionContainers[0].SelectNodes("./*") : null;
+                System.Xml.XmlNode exec = actionNodes != null && actionNodes.Count == 1 && string.Equals(actionNodes[0].LocalName, "Exec", StringComparison.Ordinal) ? actionNodes[0] : null;
+                singleExec = exec != null;
+                if (singleExec)
+                {
+                    System.Xml.XmlNode command = SingleDirectChild(exec, "Command");
+                    System.Xml.XmlNode arguments = SingleDirectChild(exec, "Arguments");
+                    commandMatch = command != null && PathsEqual(command.InnerText.Trim(), expectedExe ?? "");
+                    argumentMatch = arguments != null && string.Equals(arguments.InnerText.Trim(), "--agent", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch (Exception ex) { parseError = ex.GetBaseException().Message.Replace('\r', ' ').Replace('\n', ' '); }
+            detail = "singleLogonTrigger=" + singleLogonTrigger.ToString().ToLowerInvariant()
+                + " currentUserTrigger=" + currentUserTrigger.ToString().ToLowerInvariant()
+                + " enabled=" + enabled.ToString().ToLowerInvariant()
+                + " noDelay=" + noDelay.ToString().ToLowerInvariant()
+                + " principal=" + principalValid.ToString().ToLowerInvariant()
+                + " singleExec=" + singleExec.ToString().ToLowerInvariant()
+                + " commandMatch=" + commandMatch.ToString().ToLowerInvariant()
+                + " argumentMatch=" + argumentMatch.ToString().ToLowerInvariant()
+                + " startsOnBattery=" + startsOnBattery.ToString().ToLowerInvariant()
+                + " continuesOnBattery=" + continuesOnBattery.ToString().ToLowerInvariant()
+                + " startWhenAvailable=" + startWhenAvailable.ToString().ToLowerInvariant()
+                + (parseError.Length == 0 ? "" : " parseError=" + Q(parseError));
+            return singleLogonTrigger && currentUserTrigger && enabled && noDelay && principalValid && singleExec && commandMatch && argumentMatch && startsOnBattery && continuesOnBattery && startWhenAvailable;
+        }
+
+        private static System.Xml.XmlNode SingleDirectChild(System.Xml.XmlNode parent, string localName)
+        {
+            if (parent == null) return null;
+            System.Xml.XmlNodeList nodes = parent.SelectNodes("./*[local-name()='" + localName + "']");
+            if (nodes == null || nodes.Count == 0) return null;
+            if (nodes.Count != 1) throw new InvalidOperationException("Task XML contains more than one " + localName + " element in the same parent");
+            return nodes[0];
+        }
+
+        private static bool PathsEqual(string left, string right)
+        {
+            if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) return false;
+            try
+            {
+                string normalizedLeft = Path.GetFullPath(Environment.ExpandEnvironmentVariables(left.Trim().Trim('"'))).TrimEnd('\\');
+                string normalizedRight = Path.GetFullPath(Environment.ExpandEnvironmentVariables(right.Trim().Trim('"'))).TrimEnd('\\');
+                return string.Equals(normalizedLeft, normalizedRight, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        private static string CurrentUserSid()
+        {
+            using (var identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+            {
+                if (identity.User == null) throw new InvalidOperationException("The current Windows user SID is unavailable");
+                return identity.User.Value;
+            }
+        }
+
+        private static bool IsCurrentUserIdentity(string value)
+        {
+            string candidate = (value ?? "").Trim();
+            if (candidate.Length == 0) return false;
+            string currentSid = CurrentUserSid();
+            if (string.Equals(candidate, currentSid, StringComparison.OrdinalIgnoreCase)) return true;
+            using (var identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+            {
+                if (string.Equals(candidate, identity.Name, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            try
+            {
+                var account = new System.Security.Principal.NTAccount(candidate);
+                var sid = (System.Security.Principal.SecurityIdentifier)account.Translate(typeof(System.Security.Principal.SecurityIdentifier));
+                return string.Equals(sid.Value, currentSid, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        private static List<AgentShortcutRoute> EnumerateOwnedAgentShortcuts()
+        {
+            var results = new List<AgentShortcutRoute>();
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var roots = new[]
+            {
+                Tuple.Create("CurrentUser", Environment.GetFolderPath(Environment.SpecialFolder.Startup)),
+                Tuple.Create("AllUsers", Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup))
+            };
+            foreach (var root in roots)
+            {
+                if (string.IsNullOrWhiteSpace(root.Item2) || !Directory.Exists(root.Item2)) continue;
+                string normalizedRoot = Path.GetFullPath(root.Item2).TrimEnd('\\');
+                if (!visited.Add(normalizedRoot)) continue;
+                string shortcutPath = Path.Combine(normalizedRoot, "Mich Startup Master Agent.lnk");
+                if (!File.Exists(shortcutPath)) continue;
+                string target, arguments;
+                ReadShortcutIdentity(shortcutPath, out target, out arguments);
+                if (!IsExactOwnedAgentLaunch(target, arguments)) continue;
+                results.Add(new AgentShortcutRoute { Path = shortcutPath, Scope = root.Item1, Target = target, Arguments = arguments });
+            }
+            return results.OrderBy(x => x.Path, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static void ReadShortcutIdentity(string shortcutPath, out string target, out string arguments)
+        {
+            object shellObject = null, shortcutObject = null;
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) throw new InvalidOperationException("Windows Script Host shortcut reader is unavailable");
+                shellObject = Activator.CreateInstance(shellType);
+                dynamic shell = shellObject;
+                shortcutObject = shell.CreateShortcut(shortcutPath);
+                dynamic shortcut = shortcutObject;
+                target = Convert.ToString(shortcut.TargetPath ?? "");
+                arguments = Convert.ToString(shortcut.Arguments ?? "");
+            }
+            catch (Exception ex) { throw new InvalidOperationException("Could not inspect Startup shortcut " + Q(shortcutPath) + ": " + ex.GetBaseException().Message, ex); }
+            finally
+            {
+                if (shortcutObject != null && Marshal.IsComObject(shortcutObject)) { try { Marshal.FinalReleaseComObject(shortcutObject); } catch { } }
+                if (shellObject != null && Marshal.IsComObject(shellObject)) { try { Marshal.FinalReleaseComObject(shellObject); } catch { } }
+            }
+        }
+
+        private static bool IsExactOwnedAgentLaunch(string target, string arguments, string expectedExe = null)
+        {
+            string expandedTarget = Environment.ExpandEnvironmentVariables((target ?? "").Trim().Trim('"'));
+            string ownedExe = string.IsNullOrWhiteSpace(expectedExe) ? ProcessExePath() : expectedExe;
+            if (PathsEqual(expandedTarget, ownedExe)
+                && string.Equals((arguments ?? "").Trim(), "--agent", StringComparison.OrdinalIgnoreCase)) return true;
+            string scriptPath;
+            return IsSystemScriptHost(expandedTarget) && TryGetExactLegacyAgentScript(arguments, ownedExe, out scriptPath);
+        }
+
+        private static bool IsSystemScriptHost(string target)
+        {
+            if (!string.Equals(Path.GetFileName(target ?? ""), "wscript.exe", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(Path.GetFileName(target ?? ""), "cscript.exe", StringComparison.OrdinalIgnoreCase)) return false;
+            string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string[] systemFolders = { Path.Combine(windows, "System32"), Path.Combine(windows, "SysWOW64"), Path.Combine(windows, "Sysnative") };
+            return systemFolders.Any(folder => PathsEqual(target, Path.Combine(folder, Path.GetFileName(target))));
+        }
+
+        private static bool TryGetExactLegacyAgentScript(string arguments, string expectedExe, out string scriptPath)
+        {
+            scriptPath = "";
+            string value = (arguments ?? "").Trim();
+            string[] prefixes = { "//B //NoLogo ", "//NoLogo //B ", "//B ", "//NoLogo ", "" };
+            foreach (string prefix in prefixes)
+            {
+                if (!value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                string candidate = value.Substring(prefix.Length).Trim();
+                if (candidate.Length >= 2 && candidate[0] == '"' && candidate[candidate.Length - 1] == '"') candidate = candidate.Substring(1, candidate.Length - 2);
+                else if (candidate.IndexOf('"') >= 0) continue;
+                candidate = Environment.ExpandEnvironmentVariables(candidate.Trim());
+                if (!Path.IsPathRooted(candidate) || !string.Equals(Path.GetFileName(candidate), "MichStartupMasterAgent.vbs", StringComparison.OrdinalIgnoreCase) || !File.Exists(candidate)) continue;
+                string script;
+                try { script = File.ReadAllText(candidate); } catch { continue; }
+                string normalizedScript = script.Replace('/', '\\');
+                string normalizedExe = (expectedExe ?? "").Replace('/', '\\');
+                if (string.IsNullOrWhiteSpace(normalizedExe) || normalizedScript.IndexOf(normalizedExe, StringComparison.OrdinalIgnoreCase) < 0 || normalizedScript.IndexOf("--agent", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                scriptPath = candidate;
+                return true;
+            }
+            return false;
+        }
+
+        private static void RetireAgentShortcuts(List<AgentShortcutRoute> routes, List<RetiredAgentShortcut> retired)
+        {
+            if (routes == null || routes.Count == 0) return;
+            string batch = DateTime.UtcNow.ToString("yyyyMMddTHHmmssfffZ") + "-" + Guid.NewGuid().ToString("N");
+            string archiveRoot = Path.Combine(Program.AppData, "RetiredAgentLaunchers", batch);
+            foreach (AgentShortcutRoute route in routes)
+            {
+                string scopeFolder = Path.Combine(archiveRoot, route.Scope);
+                Directory.CreateDirectory(scopeFolder);
+                string destination = Path.Combine(scopeFolder, Path.GetFileName(route.Path));
+                if (File.Exists(destination)) destination = Path.Combine(scopeFolder, Path.GetFileNameWithoutExtension(route.Path) + "." + Guid.NewGuid().ToString("N") + Path.GetExtension(route.Path));
+                File.Move(route.Path, destination);
+                retired.Add(new RetiredAgentShortcut { OriginalPath = route.Path, ArchivePath = destination });
+            }
+        }
+
+        private static void RestoreRetiredAgentShortcuts(List<RetiredAgentShortcut> retired)
+        {
+            if (retired == null) return;
+            var errors = new List<string>();
+            for (int i = retired.Count - 1; i >= 0; i--)
+            {
+                RetiredAgentShortcut route = retired[i];
+                try
+                {
+                    if (!File.Exists(route.ArchivePath)) throw new FileNotFoundException("Archived startup shortcut is missing during rollback", route.ArchivePath);
+                    if (File.Exists(route.OriginalPath)) throw new IOException("A file now exists at the legacy shortcut restore path: " + route.OriginalPath);
+                    Directory.CreateDirectory(Path.GetDirectoryName(route.OriginalPath));
+                    File.Move(route.ArchivePath, route.OriginalPath);
+                }
+                catch (Exception ex) { errors.Add(route.OriginalPath + ": " + ex.GetBaseException().Message); }
+            }
+            if (errors.Count > 0) throw new InvalidOperationException(string.Join("; ", errors));
+        }
+
+        private static void DeleteTaskIfPresent(string fullTaskName)
+        {
+            string ignored;
+            if (TryReadTaskXml(fullTaskName, out ignored)) RunChecked("schtasks.exe", "/Delete /F /TN " + Q(fullTaskName));
+        }
+
+        // A managed task is one logical startup slot, not an opportunity to create another
+        // wrapper whenever a user re-selects the same application.  Launch identity remains
+        // exact (path + argument vector); the slot identity lets us also retire a stale disabled
+        // "FooLauncher" sibling after the user has kept one live "Foo" registration.
+        private sealed class ManagedRouteCandidate
+        {
+            public string TaskLocation;
+            public string Target;
+            public string Arguments;
+            public string LaunchIdentity;
+            public string SlotIdentity;
+            public bool Enabled;
+        }
+
+        private sealed class ManagedRouteDedupePlan
+        {
+            public readonly HashSet<string> RetiredTaskLocations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            public readonly List<string> ConflictingSlots = new List<string>();
+        }
+
+        private static string ManagedTaskLeaf(string taskLocation)
+        {
+            string value = (taskLocation ?? "").Trim().Replace('/', '\\').TrimEnd('\\');
+            int slash = value.LastIndexOf('\\');
+            return slash >= 0 ? value.Substring(slash + 1) : value;
+        }
+
+        // Keep this deliberately conservative: a user-visible Launcher/Launch suffix denotes
+        // the launcher for the same named application, while unrelated names stay distinct.
+        internal static string CanonicalManagedSlot(string taskName)
+        {
+            string value = ManagedTaskLeaf(taskName);
+            try
+            {
+                string extension = Path.GetExtension(value);
+                if (string.Equals(extension, ".exe", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(extension, ".com", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(extension, ".lnk", StringComparison.OrdinalIgnoreCase))
+                    value = Path.GetFileNameWithoutExtension(value);
+            }
+            catch { }
+            value = Regex.Replace(value ?? "", @"(?i)(?:[\s._-]*(?:launcher|launch))+$", "");
+            return Regex.Replace(value, @"[^A-Za-z0-9]+", "").ToLowerInvariant();
+        }
+
+        // This deliberately does not call File.Exists. A stale or slow removable target must
+        // not make duplicate prevention hang, and its registration is still useful evidence.
+        private static bool TryGetManagedRouteTarget(StartupItem item, out string target, out string arguments)
+        {
+            target = "";
+            arguments = "";
+            string command = item == null ? "" : (item.Command ?? "");
+            if (TryDecodeTrayPayload(command, out target, out arguments) && !string.IsNullOrWhiteSpace(target)) return true;
+            if (command.IndexOf(" || ", StringComparison.Ordinal) >= 0) return false;
+            return TrySplitCommand(command, out target, out arguments) && !string.IsNullOrWhiteSpace(target);
+        }
+
+        private static List<ManagedRouteCandidate> ReadManagedRouteCandidates(string taskNamePrefix = null)
+        {
+            string prefix = ManagedTaskLeaf(taskNamePrefix);
+            var result = new List<ManagedRouteCandidate>();
+            foreach (StartupItem item in ScanAll())
+            {
+                if (item == null || !item.IsManaged || !string.Equals(item.Source, "Scheduled Task", StringComparison.OrdinalIgnoreCase)) continue;
+                string taskLocation = item.Location ?? "";
+                if (!IsManagedScheduledTaskPath(taskLocation)
+                    || string.Equals(taskLocation, Program.ManagedTaskRoot + "MichStartupMasterApp", StringComparison.OrdinalIgnoreCase)) continue;
+                string leaf = ManagedTaskLeaf(taskLocation);
+                if (!string.IsNullOrWhiteSpace(prefix) && !leaf.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                string target, arguments;
+                if (!TryGetManagedRouteTarget(item, out target, out arguments)) continue;
+                string launch = NormalizeManagedCommand(target, arguments);
+                if (string.IsNullOrWhiteSpace(launch)) continue;
+                result.Add(new ManagedRouteCandidate
+                {
+                    TaskLocation = taskLocation,
+                    Target = target,
+                    Arguments = arguments ?? "",
+                    LaunchIdentity = launch,
+                    SlotIdentity = CanonicalManagedSlot(leaf),
+                    Enabled = item.Enabled
+                });
+            }
+            return result
+                .GroupBy(route => route.TaskLocation ?? "", StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.OrderByDescending(route => route.Enabled).ThenBy(route => route.LaunchIdentity, StringComparer.OrdinalIgnoreCase).First())
+                .OrderBy(route => route.TaskLocation, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static ManagedRouteDedupePlan PlanManagedRouteDedupe(IEnumerable<ManagedRouteCandidate> candidates)
+        {
+            var plan = new ManagedRouteDedupePlan();
+            var routes = (candidates ?? Enumerable.Empty<ManagedRouteCandidate>())
+                .Where(route => route != null && !string.IsNullOrWhiteSpace(route.TaskLocation) && !string.IsNullOrWhiteSpace(route.LaunchIdentity))
+                .GroupBy(route => route.TaskLocation, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.OrderByDescending(route => route.Enabled).ThenBy(route => route.LaunchIdentity, StringComparer.OrdinalIgnoreCase).First())
+                .ToList();
+
+            // Exact launch duplicates are never meaningful: retain a live route when one exists,
+            // otherwise retain the deterministic first task so a retry cannot re-create a pair.
+            foreach (var group in routes.GroupBy(route => route.LaunchIdentity, StringComparer.OrdinalIgnoreCase).Where(group => group.Count() > 1))
+            {
+                ManagedRouteCandidate keeper = group.OrderByDescending(route => route.Enabled).ThenBy(route => route.TaskLocation, StringComparer.OrdinalIgnoreCase).First();
+                foreach (ManagedRouteCandidate route in group)
+                    if (!string.Equals(route.TaskLocation, keeper.TaskLocation, StringComparison.OrdinalIgnoreCase)) plan.RetiredTaskLocations.Add(route.TaskLocation);
+            }
+
+            // A sole enabled route is the user's current intent for that named application slot.
+            // Disabled Launcher/Launch aliases cannot fire and are retired rather than retained as
+            // future broken-icon or duplicate-startup landmines. Two different enabled launch
+            // identities are surfaced as a conflict and are never guessed/deleted automatically.
+            foreach (var group in routes.Where(route => !plan.RetiredTaskLocations.Contains(route.TaskLocation))
+                .Where(route => !string.IsNullOrWhiteSpace(route.SlotIdentity))
+                .GroupBy(route => route.SlotIdentity, StringComparer.OrdinalIgnoreCase))
+            {
+                var enabled = group.Where(route => route.Enabled).ToList();
+                if (enabled.Count == 1)
+                {
+                    foreach (ManagedRouteCandidate disabled in group.Where(route => !route.Enabled)) plan.RetiredTaskLocations.Add(disabled.TaskLocation);
+                    continue;
+                }
+                if (enabled.Count > 1 && enabled.Select(route => route.LaunchIdentity).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1)
+                    plan.ConflictingSlots.Add(group.Key);
+            }
+            return plan;
+        }
+
+        public static string ReconcileManagedStartupRoutes(string taskNamePrefix = null)
+        {
+            return StartupMutationCoordinator.Run(() =>
+            {
+                string prefix = ManagedTaskLeaf(taskNamePrefix);
+                if (!string.IsNullOrWhiteSpace(prefix) && (prefix.IndexOfAny(new[] { '\\', '/', '\0', '\r', '\n' }) >= 0 || prefix.Length > 160))
+                    throw new ArgumentException("Managed-task reconciliation prefix is invalid");
+
+                List<ManagedRouteCandidate> candidates = ReadManagedRouteCandidates(prefix);
+                ManagedRouteDedupePlan plan = PlanManagedRouteDedupe(candidates);
+                int retired = plan.RetiredTaskLocations.Count;
+                int compactedEnabled = 0;
+                int compactedQuiet = 0;
+                // One snapshot covers task deletion *and* both intent files. A state-file write
+                // failure must never leave a deleted Scheduler sibling behind with a record that
+                // could recreate it on the next boot.
+                ManagedMutationSnapshot before = ManagedMutationSnapshot.Capture(null, plan.RetiredTaskLocations);
+                try
+                {
+                    foreach (string taskLocation in plan.RetiredTaskLocations.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+                    {
+                        DeleteTaskIfPresent(taskLocation);
+                        EnabledStartupService.RemoveByTask(taskLocation);
+                        ProtectedQuietService.UnprotectTask(taskLocation);
+                        ProtectedDisabledService.UnprotectKey("task|" + taskLocation);
+                        EnabledStartupService.MarkV2MigratedChecked(taskLocation);
+                    }
+                    compactedEnabled = EnabledStartupService.DedupeManagedIntentRows();
+                    compactedQuiet = ProtectedQuietService.DedupeExactRoutes();
+                }
+                catch (Exception ex)
+                {
+                    try { before.Restore(); }
+                    catch (Exception restoreEx) { throw new InvalidOperationException("Managed duplicate repair failed and rollback was incomplete: " + restoreEx.GetBaseException().Message, ex); }
+                    throw new InvalidOperationException("Managed duplicate repair failed; task XML and intent stores were restored: " + ex.GetBaseException().Message, ex);
+                }
+                return "MANAGED_DEDUPE scanned=" + candidates.Count
+                    + " retired=" + retired
+                    + " conflicts=" + plan.ConflictingSlots.Count
+                    + " compacted_enabled=" + compactedEnabled
+                    + " compacted_quiet=" + compactedQuiet
+                    + (plan.ConflictingSlots.Count == 0 ? "" : " conflict_slots=" + string.Join(",", plan.ConflictingSlots.OrderBy(value => value, StringComparer.OrdinalIgnoreCase)));
+            });
+        }
+
+        private static void EnsureNoManagedSlotConflict(string displayName, string targetPath, string arguments)
+        {
+            string slot = CanonicalManagedSlot(displayName);
+            if (string.IsNullOrWhiteSpace(slot)) return;
+            string requested = NormalizeManagedCommand(targetPath, arguments);
+            var divergent = ReadManagedRouteCandidates()
+                .Where(route => string.Equals(route.SlotIdentity, slot, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(route.LaunchIdentity, requested, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (divergent.Count == 0) return;
+            string locations = string.Join(",", divergent.Select(route => route.TaskLocation).OrderBy(value => value, StringComparer.OrdinalIgnoreCase));
+            if (divergent.Any(route => route.Enabled))
+                throw new InvalidOperationException("A different enabled managed route already owns the '" + displayName + "' startup slot. Edit or remove that route instead; no duplicate was created: " + locations);
+            throw new InvalidOperationException("A disabled managed route already owns the '" + displayName + "' startup slot. Enable, edit, or permanently delete it first; no duplicate was created: " + locations);
+        }
+
+        public static string ManagedStartupDedupeSelfTest()
+        {
+            int checks = 0;
+            Action<bool> require = condition => { checks++; if (!condition) throw new InvalidOperationException("MANAGED_DEDUPE_SELF_TEST failed at " + checks); };
+            require(CanonicalManagedSlot("OpenWhisprLauncher.exe") == "openwhispr" && CanonicalManagedSlot("OpenWhispr") == "openwhispr");
+
+            var exact = PlanManagedRouteDedupe(new[]
+            {
+                new ManagedRouteCandidate { TaskLocation = @"\MichStartupMaster\Fixture", Target = @"C:\Fixture\app.exe", Arguments = "--ready", LaunchIdentity = NormalizeManagedCommand(@"C:\Fixture\app.exe", "--ready"), SlotIdentity = "fixture", Enabled = true },
+                new ManagedRouteCandidate { TaskLocation = @"\MichStartupMaster\FixtureLauncher", Target = @"C:\Fixture\app.exe", Arguments = "--ready", LaunchIdentity = NormalizeManagedCommand(@"C:\Fixture\app.exe", "--ready"), SlotIdentity = "fixture", Enabled = true }
+            });
+            require(exact.RetiredTaskLocations.SetEquals(new[] { @"\MichStartupMaster\FixtureLauncher" }) && exact.ConflictingSlots.Count == 0);
+
+            var staleAlias = PlanManagedRouteDedupe(new[]
+            {
+                new ManagedRouteCandidate { TaskLocation = @"\MichStartupMaster\OpenWhisprLauncher.exe", Target = @"C:\OpenWhispr\OpenWhisprLauncher.exe", Arguments = "", LaunchIdentity = NormalizeManagedCommand(@"C:\OpenWhispr\OpenWhisprLauncher.exe", ""), SlotIdentity = CanonicalManagedSlot("OpenWhisprLauncher.exe"), Enabled = true },
+                new ManagedRouteCandidate { TaskLocation = @"\MichStartupMaster\OpenWhispr", Target = @"C:\OpenWhispr\CustomRuntime\OpenWhispr.exe", Arguments = "", LaunchIdentity = NormalizeManagedCommand(@"C:\OpenWhispr\CustomRuntime\OpenWhispr.exe", ""), SlotIdentity = CanonicalManagedSlot("OpenWhispr"), Enabled = false }
+            });
+            require(staleAlias.RetiredTaskLocations.SetEquals(new[] { @"\MichStartupMaster\OpenWhispr" }) && staleAlias.ConflictingSlots.Count == 0);
+
+            var conflict = PlanManagedRouteDedupe(new[]
+            {
+                new ManagedRouteCandidate { TaskLocation = @"\MichStartupMaster\Dashboard", Target = @"C:\Fixture\one.exe", Arguments = "", LaunchIdentity = NormalizeManagedCommand(@"C:\Fixture\one.exe", ""), SlotIdentity = "dashboard", Enabled = true },
+                new ManagedRouteCandidate { TaskLocation = @"\MichStartupMaster\DashboardLauncher", Target = @"C:\Fixture\two.exe", Arguments = "", LaunchIdentity = NormalizeManagedCommand(@"C:\Fixture\two.exe", ""), SlotIdentity = "dashboard", Enabled = true }
+            });
+            require(conflict.RetiredTaskLocations.Count == 0 && conflict.ConflictingSlots.SequenceEqual(new[] { "dashboard" }));
+
+            return "MANAGED_DEDUPE_SELF_TEST checks=" + checks + " passed=" + checks + " exactOne=true staleAliasRetired=true conflictsFailClosed=true";
         }
 
         public static string AddManagedStartup(string name, string targetPath, string arguments, bool trayMode, bool noDelay)
         {
+            return AddManagedStartupCore(name, targetPath, arguments, trayMode, noDelay, null, null);
+        }
+
+        private static string AddManagedStartupCore(string name, string targetPath, string arguments, bool trayMode, bool noDelay, Action afterIntentCommitted, StartupSourceSnapshot originalSource)
+        {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name is required");
             if (string.IsNullOrWhiteSpace(targetPath) || !File.Exists(targetPath)) throw new FileNotFoundException("Application not found", targetPath);
-            if (!IsSupportedStartupTarget(targetPath)) throw new ArgumentException("Choose an executable startup target: .exe, .cmd, .bat, .ps1, or .lnk");
+            if (!IsSupportedStartupTarget(targetPath)) throw new ArgumentException("Choose a supported startup target: .exe, .com, .lnk, .cmd, .bat, .ps1, .vbs, .vbe, .js, .jse, .wsf, .wsh, .py, or .pyw");
+            // Repair known stale pairs before evaluating this request. The reconciliation is
+            // transaction-locked and fail-closed, so an Add can never use a temporary sibling
+            // task as a shortcut around an existing disabled or conflicting route.
+            ReconcileManagedStartupRoutes();
             string safeName = Regex.Replace(name, "[^A-Za-z0-9 _.-]", "").Trim();
             if (safeName.Length == 0) safeName = "StartupApp";
+            safeName = Regex.Replace(safeName, @"\s+", " ").Trim(' ', '.');
+            if (safeName.Length == 0) safeName = "StartupApp";
+            if (safeName.Length > 160) safeName = safeName.Substring(0, 160).TrimEnd(' ', '.');
+            string namedTaskLocation = Program.ManagedTaskRoot + safeName;
+            string namedTaskState = EnabledStartupService.QueryTaskState(namedTaskLocation);
+            if (!CanUpsertManagedTaskState(namedTaskState))
+                throw new InvalidOperationException("A matching managed startup task is disabled. Enable it first; add/update left its task XML and stores unchanged: " + namedTaskLocation);
+            NormalizeManagedMode(ref targetPath, ref arguments, trayMode);
+            string originalTarget = targetPath;
+            string originalArguments = arguments ?? "";
+            string equivalentTarget = originalTarget;
+            string equivalentArguments = originalArguments;
+            QuietLaunchPlanner.NormalizePersistent(ref equivalentTarget, ref equivalentArguments);
+            equivalentArguments = StripKnownQuietArguments(equivalentTarget, equivalentArguments);
             string execute;
             string actionArgs;
             BuildManagedAction(targetPath, arguments ?? "", trayMode, out execute, out actionArgs);
-            string taskLocation = RegisterLogonTaskAt(Program.ManagedTaskRoot + safeName, execute, actionArgs);
-            if (trayMode) ProtectedQuietService.ProtectTask(taskLocation, targetPath, arguments ?? "");
+            EnsureNoManagedSlotConflict(safeName, originalTarget, originalArguments);
+            EnabledStartupService.Row existingRoute = FindEquivalentManagedRoute(EnabledStartupService.Load(), originalTarget, originalArguments, equivalentTarget, equivalentArguments);
+            if (existingRoute == null) existingRoute = FindEquivalentLiveManagedRoute(originalTarget, originalArguments, equivalentTarget, equivalentArguments);
+            if (existingRoute != null)
+            {
+                string existingTask = !string.IsNullOrWhiteSpace(existingRoute.TaskLocation) ? existingRoute.TaskLocation : existingRoute.Location;
+                if (!string.IsNullOrWhiteSpace(existingTask) && existingTask.StartsWith(Program.ManagedTaskRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!CanUpsertManagedTaskState(EnabledStartupService.QueryTaskState(existingTask)))
+                        throw new InvalidOperationException("This managed startup task is disabled. Enable it first; no update, implicit enable, or sibling task was created: " + existingTask);
+                    string existingName = existingTask.TrimEnd('\\').Split('\\').LastOrDefault();
+                    var row = new EnabledStartupService.Row { Kind = "managed-task", Name = string.IsNullOrWhiteSpace(existingName) ? safeName : existingName, Scope = "User/System", Command = (execute + " " + actionArgs).Trim(), Location = existingTask, Status = "Managed startup task (existing route updated)", Target = targetPath, Arguments = arguments ?? "", Mode = trayMode ? "tray" : "normal", TaskLocation = existingTask };
+                    return CommitManagedTaskMutation(existingTask, execute, actionArgs, row, trayMode, afterIntentCommitted, originalSource);
+                }
+            }
+            string chosenName = ChooseManagedTaskName(safeName, name, targetPath, arguments ?? "", trayMode, ManagedTaskExists);
+            string taskLocation = Program.ManagedTaskRoot + chosenName;
             if (!noDelay) { /* Task Scheduler has no explicit Delay either way; this app always uses immediate logon triggers. */ }
-            EnabledStartupService.Upsert(new EnabledStartupService.Row { Kind = "managed-task", Name = safeName, Scope = "User/System", Command = execute + " " + actionArgs, Location = taskLocation, Status = "Managed startup task", Target = targetPath, Arguments = arguments ?? "", Mode = trayMode ? "tray" : "normal", TaskLocation = taskLocation });
-            return taskLocation;
+            var created = new EnabledStartupService.Row { Kind = "managed-task", Name = chosenName, Scope = "User/System", Command = (execute + " " + actionArgs).Trim(), Location = taskLocation, Status = "Managed startup task", Target = targetPath, Arguments = arguments ?? "", Mode = trayMode ? "tray" : "normal", TaskLocation = taskLocation };
+            return CommitManagedTaskMutation(taskLocation, execute, actionArgs, created, trayMode, afterIntentCommitted, originalSource);
         }
 
-        public static string RegisterLogonTaskAt(string fullTaskName, string execute, string arguments)
+        internal static bool CanUpsertManagedTaskState(string taskState)
+        {
+            return !string.Equals(taskState, "disabled", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void NormalizeManagedMode(ref string targetPath, ref string arguments, bool trayMode)
+        {
+            if (trayMode) ResolveShortcutForManagedStartup(ref targetPath, ref arguments, trayMode);
+            // Normalize legacy OpenSpeedy launchers for both modes. Persistent quiet state stores
+            // user arguments (not the generated native tray flag), then the action builder adds the
+            // flag only for Quiet. Window mode explicitly removes every native quiet switch we own.
+            QuietLaunchPlanner.NormalizePersistent(ref targetPath, ref arguments);
+            if (!trayMode) arguments = StripKnownQuietArguments(targetPath, arguments);
+        }
+
+        private static void ResolveShortcutForManagedStartup(ref string targetPath, ref string arguments, bool trayMode)
+        {
+            if (!string.Equals(Path.GetExtension(targetPath ?? ""), ".lnk", StringComparison.OrdinalIgnoreCase)) return;
+            string resolved, shortcutArguments;
+            ResolveShortcut(targetPath, out resolved, out shortcutArguments);
+            if (string.IsNullOrWhiteSpace(resolved) || string.Equals(resolved, targetPath, StringComparison.OrdinalIgnoreCase) || !File.Exists(resolved))
+            {
+                string prefix = trayMode ? "Quiet mode cannot reliably identify this shortcut. " : "";
+                throw new InvalidOperationException(prefix + "Select the shortcut's real target instead: " + targetPath);
+            }
+            if (!IsSupportedStartupTarget(resolved) || string.Equals(Path.GetExtension(resolved), ".lnk", StringComparison.OrdinalIgnoreCase))
+            {
+                string prefix = trayMode ? "Quiet mode cannot reliably attribute this shortcut target. " : "";
+                throw new InvalidOperationException(prefix + "Choose Window mode or select a directly supported target: " + resolved);
+            }
+            targetPath = resolved;
+            arguments = MergeArguments(shortcutArguments, arguments);
+        }
+
+        private static string MergeArguments(string first, string second)
+        {
+            return Regex.Replace(((first ?? "").Trim() + " " + (second ?? "").Trim()).Trim(), @"\s+", " ");
+        }
+
+        private static string StripKnownQuietArguments(string targetPath, string arguments)
+        {
+            string result = Regex.Replace(arguments ?? "", @"(?i)(?:^|\s+)(?:--minimize-to-tray|--start-in-tray)(?=\s+|$)", " ");
+            return Regex.Replace(result, @"\s+", " ").Trim();
+        }
+
+        private static string CommitManagedTaskMutation(string taskLocation, string execute, string actionArgs, EnabledStartupService.Row row, bool trayMode, Action afterIntentCommitted, StartupSourceSnapshot originalSource, bool preserveDisabled = false)
+        {
+            return StartupMutationCoordinator.Run(() =>
+            {
+                ManagedMutationSnapshot before = ManagedMutationSnapshot.Capture(taskLocation);
+                try
+                {
+                    RegisterLogonTaskAt(taskLocation, execute, actionArgs, before.Task.Exists);
+                    if (preserveDisabled)
+                    {
+                        // Editing or changing the mode of a disabled managed task must never
+                        // turn it back on or place it in the enabled guard manifest.
+                        RunChecked("schtasks.exe", "/Change /TN " + Q(taskLocation) + " /Disable");
+                        ProtectedQuietService.UnprotectTask(taskLocation);
+                        EnabledStartupService.RemoveByTask(taskLocation);
+                    }
+                    else
+                    {
+                        if (trayMode) ProtectedQuietService.ProtectTask(taskLocation, row.Target, row.Arguments ?? "");
+                        else ProtectedQuietService.UnprotectTask(taskLocation);
+                        EnabledStartupService.Upsert(row);
+                    }
+                    EnabledStartupService.MarkV2MigratedChecked(taskLocation);
+                    // Replacing an unmanaged source is deliberately last: the replacement task
+                    // and both intent stores are already durable before the old route is disabled.
+                    if (afterIntentCommitted != null) afterIntentCommitted();
+                    return taskLocation;
+                }
+                catch (Exception ex)
+                {
+                    var rollbackErrors = new List<string>();
+                    if (originalSource != null)
+                    {
+                        try { originalSource.Restore(); }
+                        catch (Exception restoreEx) { rollbackErrors.Add("original=" + restoreEx.GetBaseException().Message); }
+                    }
+                    try { before.Restore(); }
+                    catch (Exception restoreEx) { rollbackErrors.Add("managed=" + restoreEx.GetBaseException().Message); }
+                    string suffix = rollbackErrors.Count == 0 ? " rollback=complete" : " rollback-errors=" + string.Join(" | ", rollbackErrors);
+                    throw new InvalidOperationException("Managed startup change failed; prior task and intent were restored." + suffix + " Cause: " + ex.GetBaseException().Message, ex);
+                }
+            });
+        }
+
+        private sealed class ManagedMutationSnapshot
+        {
+            public ScheduledTaskSnapshot Task;
+            public List<ScheduledTaskSnapshot> Tasks;
+            public StoreSnapshot Enabled;
+            public StoreSnapshot Quiet;
+            public StoreSnapshot Disabled;
+            public StoreSnapshot ProtectedDisabled;
+            public StoreSnapshot Migrated;
+
+            public static ManagedMutationSnapshot Capture(string taskLocation, IEnumerable<string> additionalTaskLocations = null)
+            {
+                var taskLocations = new List<string>();
+                if (!string.IsNullOrWhiteSpace(taskLocation)) taskLocations.Add(taskLocation);
+                if (additionalTaskLocations != null) taskLocations.AddRange(additionalTaskLocations.Where(value => !string.IsNullOrWhiteSpace(value)));
+                taskLocations = taskLocations.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                var taskSnapshots = taskLocations.Select(ScheduledTaskSnapshot.Capture).ToList();
+                return new ManagedMutationSnapshot
+                {
+                    // Keep the original single-task property for callers that need to know
+                    // whether their primary task existed before the mutation.
+                    Task = taskSnapshots.FirstOrDefault(),
+                    Tasks = taskSnapshots,
+                    Enabled = StoreSnapshot.Capture(Program.EnabledStore),
+                    Quiet = StoreSnapshot.Capture(Program.ProtectedQuietStore),
+                    Disabled = StoreSnapshot.Capture(Program.DisabledStore),
+                    ProtectedDisabled = StoreSnapshot.Capture(Program.ProtectedDisabledStore),
+                    Migrated = StoreSnapshot.Capture(EnabledStartupService.MigratedMarkerPath)
+                };
+            }
+
+            public void Restore()
+            {
+                var errors = new List<string>();
+                var tasks = Tasks;
+                if ((tasks == null || tasks.Count == 0) && Task != null) tasks = new List<ScheduledTaskSnapshot> { Task };
+                foreach (ScheduledTaskSnapshot task in (tasks ?? new List<ScheduledTaskSnapshot>()).AsEnumerable().Reverse())
+                {
+                    try { task.Restore(); }
+                    catch (Exception ex) { errors.Add("task=" + ex.GetBaseException().Message); }
+                }
+                try { Enabled.Restore(); } catch (Exception ex) { errors.Add("enabled=" + ex.GetBaseException().Message); }
+                try { Quiet.Restore(); } catch (Exception ex) { errors.Add("quiet=" + ex.GetBaseException().Message); }
+                try { Disabled.Restore(); } catch (Exception ex) { errors.Add("disabled=" + ex.GetBaseException().Message); }
+                try { ProtectedDisabled.Restore(); } catch (Exception ex) { errors.Add("protected-disabled=" + ex.GetBaseException().Message); }
+                try { Migrated.Restore(); } catch (Exception ex) { errors.Add("migrated=" + ex.GetBaseException().Message); }
+                if (errors.Count > 0) throw new InvalidOperationException(string.Join(" | ", errors));
+            }
+        }
+
+        private sealed class StoreSnapshot
+        {
+            private string _path;
+            private bool _exists;
+            private byte[] _bytes;
+
+            public static StoreSnapshot Capture(string path)
+            {
+                bool exists = File.Exists(path);
+                return new StoreSnapshot { _path = path, _exists = exists, _bytes = exists ? File.ReadAllBytes(path) : new byte[0] };
+            }
+
+            public void Restore()
+            {
+                if (_exists) WriteBytesAtomic(_path, _bytes);
+                else if (File.Exists(_path)) File.Delete(_path);
+            }
+        }
+
+        private sealed class StartupMutationSnapshot
+        {
+            private StartupSourceSnapshot _source;
+            private StoreSnapshot _disabled;
+            private StoreSnapshot _enabled;
+            private StoreSnapshot _protectedDisabled;
+            private StoreSnapshot _protectedQuiet;
+            private StoreSnapshot _migrated;
+            private bool _itemEnabled;
+            private byte[] _approvalData;
+
+            public static StartupMutationSnapshot Capture(StartupItem item, string operation)
+            {
+                return new StartupMutationSnapshot
+                {
+                    _source = StartupSourceSnapshot.Capture(item, operation),
+                    _disabled = StoreSnapshot.Capture(Program.DisabledStore),
+                    _enabled = StoreSnapshot.Capture(Program.EnabledStore),
+                    _protectedDisabled = StoreSnapshot.Capture(Program.ProtectedDisabledStore),
+                    _protectedQuiet = StoreSnapshot.Capture(Program.ProtectedQuietStore),
+                    _migrated = StoreSnapshot.Capture(EnabledStartupService.MigratedMarkerPath),
+                    _itemEnabled = item.Enabled,
+                    _approvalData = item.ApprovalData == null ? null : (byte[])item.ApprovalData.Clone()
+                };
+            }
+
+            public void Restore(StartupItem item)
+            {
+                var errors = new List<string>();
+                try { _source.Restore(); } catch (Exception ex) { errors.Add("source=" + ex.GetBaseException().Message); }
+                try { _disabled.Restore(); } catch (Exception ex) { errors.Add("disabled=" + ex.GetBaseException().Message); }
+                try { _enabled.Restore(); } catch (Exception ex) { errors.Add("enabled=" + ex.GetBaseException().Message); }
+                try { _protectedDisabled.Restore(); } catch (Exception ex) { errors.Add("protected-disabled=" + ex.GetBaseException().Message); }
+                try { _protectedQuiet.Restore(); } catch (Exception ex) { errors.Add("protected-quiet=" + ex.GetBaseException().Message); }
+                try { _migrated.Restore(); } catch (Exception ex) { errors.Add("migrated=" + ex.GetBaseException().Message); }
+                item.Enabled = _itemEnabled;
+                item.ApprovalData = _approvalData == null ? null : (byte[])_approvalData.Clone();
+                if (errors.Count > 0) throw new InvalidOperationException(string.Join(" | ", errors));
+            }
+        }
+
+        private sealed class ScheduledTaskSnapshot
+        {
+            public string Location;
+            public bool Exists;
+            public string Xml;
+
+            public static ScheduledTaskSnapshot Capture(string taskLocation)
+            {
+                string xml;
+                bool exists = TryReadTaskXml(taskLocation, out xml);
+                return new ScheduledTaskSnapshot { Location = taskLocation, Exists = exists, Xml = xml ?? "" };
+            }
+
+            public void Restore()
+            {
+                if (Exists) RestoreTaskXml(Location, Xml);
+                else if (TaskExists(Location)) RunChecked("schtasks.exe", "/Delete /F /TN " + Q(Location));
+            }
+        }
+
+        private sealed class StartupSourceSnapshot
+        {
+            private string _kind;
+            private ScheduledTaskSnapshot _task;
+            private RegistryKey _root;
+            private string _subKey;
+            private string _valueName;
+            private bool _valueExisted;
+            private object _value;
+            private RegistryValueKind _valueKind;
+            private RegistryValueState _exactOriginal;
+            private RegistryValueState _exactMutation;
+            private string _exactGuardValueName;
+            private RegistryValueState _exactGuard;
+            private FileStateSnapshot _folderOriginal;
+            private FileStateSnapshot _folderQuarantine;
+            private HashSet<string> _quarantineBefore;
+            private string _wmiLocation;
+            private bool _wmiExisted;
+            private string _wmiFilter;
+            private string _wmiConsumer;
+
+            public static StartupSourceSnapshot Capture(StartupItem item, string operation = null)
+            {
+                if (item == null) throw new ArgumentNullException("item");
+                var snapshot = new StartupSourceSnapshot();
+                if (!string.IsNullOrWhiteSpace(item.ApprovalRoot))
+                {
+                    string approvalView = string.IsNullOrWhiteSpace(item.ApprovalRegistryView) ? StartupApprovalRegistryViewLabel() : item.ApprovalRegistryView;
+                    RegistryKey approvalRoot = RootFromName(item.ApprovalRoot, approvalView);
+                    if (string.Equals(operation, "Disable", StringComparison.OrdinalIgnoreCase) || string.Equals(operation, "Enable", StringComparison.OrdinalIgnoreCase))
+                    {
+                        RegistryValueState approvalOriginal = ReadRegistryValueState(approvalRoot, item.ApprovalPath, item.ApprovalName);
+                        if (!approvalOriginal.Exists || !string.Equals(approvalOriginal.Kind, RegistryValueKind.Binary.ToString(), StringComparison.Ordinal))
+                            throw new InvalidOperationException("Startup approval state is not an existing REG_BINARY value");
+                        byte[] approvalBytes = DeserializeRegistryValueExact(approvalOriginal.Payload, RegistryValueKind.Binary) as byte[];
+                        if (approvalBytes == null || item.ApprovalData == null || !approvalBytes.SequenceEqual(item.ApprovalData))
+                            throw new InvalidOperationException("Startup approval state changed after scanning; refresh before changing it");
+                        RegistryValueState approvalMutation = BuildRegistryValueState(true, RegistryValueKind.Binary, ApplyStartupApprovalState(approvalBytes, string.Equals(operation, "Enable", StringComparison.OrdinalIgnoreCase)));
+                        snapshot.CaptureRegistryExact(approvalRoot, item.ApprovalPath, item.ApprovalName, approvalOriginal, approvalMutation);
+                    }
+                    else snapshot.CaptureRegistry(approvalRoot, item.ApprovalPath, item.ApprovalName);
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                string id = item.Id ?? "";
+                if (id.StartsWith("legacy|", StringComparison.OrdinalIgnoreCase))
+                {
+                    snapshot._kind = "none";
+                    return snapshot;
+                }
+                if (id.StartsWith("winlogon|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] parts = id.Split('|');
+                    if (parts.Length < 7) throw new InvalidOperationException("Malformed Winlogon component identity");
+                    RegistryKey root = RootFromName(UnB64(parts[2]), parts[6]);
+                    string subKey = UnB64(parts[3]), valueName = UnB64(parts[4]);
+                    int index;
+                    if (!int.TryParse(parts[5], out index) || index < 0) throw new InvalidOperationException("Malformed Winlogon component index");
+                    RegistryValueState original = ReadRegistryValueState(root, subKey, valueName);
+                    AdvancedMutationPlan plan = BuildWinlogonRemovalPlan(original, index, item.Command);
+                    snapshot.CaptureRegistryExact(root, subKey, valueName, original, plan.After);
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                if (id.StartsWith("advanced|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] parts = id.Split('|');
+                    if (parts.Length < 5) throw new InvalidOperationException("Malformed advanced startup identity");
+                    string viewLabel = string.IsNullOrWhiteSpace(item.RegistryView) ? (Environment.Is64BitOperatingSystem ? "Registry64" : "Registry32") : item.RegistryView;
+                    RegistryKey root = RootFromName(UnB64(parts[1]), viewLabel);
+                    string subKey = UnB64(parts[2]), valueName = UnB64(parts[3]);
+                    int index;
+                    if (!int.TryParse(parts[4], out index) || index < 0) throw new InvalidOperationException("Malformed advanced startup component index");
+                    RegistryValueState original = ReadRegistryValueState(root, subKey, valueName);
+                    AdvancedMutationPlan plan = BuildIndexedMultiStringRemovalPlan(original, index, item.Command);
+                    snapshot.CaptureRegistryExact(root, subKey, valueName, original, plan.After);
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                if (id.StartsWith("appinit|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] parts = id.Split('|');
+                    if (parts.Length < 3) throw new InvalidOperationException("Malformed AppInit identity");
+                    RegistryKey root = RootFromName(Registry.LocalMachine.Name, parts[2]);
+                    string subKey = UnB64(parts[1]);
+                    RegistryValueState dlls = ReadRegistryValueState(root, subKey, "AppInit_DLLs");
+                    RegistryValueState load = ReadRegistryValueState(root, subKey, "LoadAppInit_DLLs");
+                    AdvancedMutationPlan plan = BuildAppInitTogglePlan(dlls, load);
+                    snapshot.CaptureRegistryExact(root, subKey, "LoadAppInit_DLLs", load, plan.After, "AppInit_DLLs", dlls);
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                if (id.StartsWith("disabled|winlogon|", StringComparison.OrdinalIgnoreCase)
+                    || id.StartsWith("disabled|advanced|", StringComparison.OrdinalIgnoreCase)
+                    || id.StartsWith("disabled|appinit|", StringComparison.OrdinalIgnoreCase))
+                {
+                    AdvancedDisabledState record = DecodeAdvancedDisabledState(item.Status);
+                    snapshot.CaptureRegistryExact(RootFromName(record.RootName, record.RegistryView), record.SubKey, record.ValueName, record.After, record.Before, record.GuardValueName, record.GuardBefore);
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                if (id.StartsWith("task|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|task|", StringComparison.OrdinalIgnoreCase))
+                {
+                    snapshot._kind = "task";
+                    snapshot._task = ScheduledTaskSnapshot.Capture(item.Location);
+                    return snapshot;
+                }
+                if (id.StartsWith("reg|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] p = item.Id.Split('|');
+                    string scope = p.Length > 1 ? p[1] : "User";
+                    RegistryKey root;
+                    string subKey;
+                    string name;
+                    if (p.Length >= 5)
+                    {
+                        root = RootFromName(UnB64(p[2]), p.Length > 5 ? p[5] : item.RegistryView);
+                        subKey = UnB64(p[3]);
+                        name = UnB64(p[4]);
+                    }
+                    else
+                    {
+                        root = string.Equals(scope, "Machine", StringComparison.OrdinalIgnoreCase) ? Registry.LocalMachine : Registry.CurrentUser;
+                        subKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+                        name = p.Length > 2 ? UnB64(p[2]) : item.Name;
+                    }
+                    snapshot.CaptureRegistry(root, subKey, name);
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                if (id.StartsWith("disabled|reg|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] meta = (item.Status ?? "").Split('\t');
+                    if (meta.Length < 4) throw new InvalidOperationException("Stored registry metadata is incomplete");
+                    snapshot.CaptureRegistry(RootFromName(meta[0], meta.Length > 6 ? meta[6] : ""), meta[1], meta[2]);
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                if (id.StartsWith("active|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] p = id.Split('|');
+                    if (p.Length < 4) throw new InvalidOperationException("Malformed Active Setup identity");
+                    snapshot.CaptureRegistry(RootFromName(UnB64(p[2]), p.Length > 4 ? p[4] : item.RegistryView), UnB64(p[3]), "StubPath");
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                if (id.StartsWith("disabled|active|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] meta = (item.Status ?? "").Split('\t');
+                    if (meta.Length < 3) throw new InvalidOperationException("Stored Active Setup metadata is incomplete");
+                    snapshot.CaptureRegistry(RootFromName(meta[0], meta.Length > 5 ? meta[5] : ""), meta[1], meta[2]);
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                if (id.StartsWith("folder|", StringComparison.OrdinalIgnoreCase))
+                {
+                    snapshot._kind = "folder";
+                    snapshot._folderOriginal = FileStateSnapshot.Capture(item.Command);
+                    if (!snapshot._folderOriginal.Exists) throw new FileNotFoundException("Startup-folder entry was not found", item.Command);
+                    snapshot._quarantineBefore = new HashSet<string>(Directory.Exists(Program.DisabledStartupFolder) ? Directory.GetFiles(Program.DisabledStartupFolder) : new string[0], StringComparer.OrdinalIgnoreCase);
+                    return snapshot;
+                }
+                if (id.StartsWith("disabled|folder|", StringComparison.OrdinalIgnoreCase))
+                {
+                    snapshot._kind = "folder";
+                    snapshot._folderOriginal = FileStateSnapshot.Capture(item.Status);
+                    snapshot._folderQuarantine = FileStateSnapshot.Capture(item.Command);
+                    if (snapshot._folderOriginal.Exists) throw new InvalidOperationException("A startup file now exists at the restore location; refusing to overwrite it: " + item.Status);
+                    if (!snapshot._folderQuarantine.Exists) throw new FileNotFoundException("Disabled startup-folder entry was not found", item.Command);
+                    snapshot._quarantineBefore = new HashSet<string>(Directory.Exists(Program.DisabledStartupFolder) ? Directory.GetFiles(Program.DisabledStartupFolder) : new string[0], StringComparer.OrdinalIgnoreCase);
+                    return snapshot;
+                }
+                if (id.StartsWith("service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("driver|", StringComparison.OrdinalIgnoreCase)
+                    || id.StartsWith("disabled|service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|driver|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string serviceName = ServiceNameFromItem(item);
+                    if (string.IsNullOrWhiteSpace(serviceName)) throw new InvalidOperationException("Service identity is missing");
+                    snapshot.CaptureRegistry(Registry.LocalMachine, @"SYSTEM\CurrentControlSet\Services\" + serviceName, "Start");
+                    if (!snapshot._valueExisted) throw new InvalidOperationException("Service Start value is missing: " + serviceName);
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
+                if (id.StartsWith("wmisub|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|wmisub|", StringComparison.OrdinalIgnoreCase))
+                {
+                    snapshot.CaptureWmiBinding(item);
+                    snapshot._kind = "wmi";
+                    return snapshot;
+                }
+                throw new InvalidOperationException("This startup source cannot be changed transactionally: " + id);
+            }
+
+            private void CaptureRegistry(RegistryKey root, string subKey, string valueName)
+            {
+                if (root == null || string.IsNullOrWhiteSpace(subKey) || string.IsNullOrWhiteSpace(valueName)) throw new InvalidOperationException("Registry startup identity is incomplete");
+                _root = root; _subKey = subKey; _valueName = valueName;
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    _valueExisted = key != null && key.GetValueNames().Any(n => string.Equals(n, valueName, StringComparison.OrdinalIgnoreCase));
+                    if (_valueExisted)
+                    {
+                        _valueKind = key.GetValueKind(valueName);
+                        _value = CloneRegistryValue(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    }
+                }
+            }
+
+            private void CaptureRegistryExact(RegistryKey root, string subKey, string valueName, RegistryValueState expectedOriginal, RegistryValueState expectedMutation, string guardValueName = null, RegistryValueState expectedGuard = null)
+            {
+                if (root == null || string.IsNullOrWhiteSpace(subKey) || string.IsNullOrWhiteSpace(valueName)) throw new InvalidOperationException("Registry startup identity is incomplete");
+                if (expectedOriginal == null || expectedMutation == null
+                    || !RegistryValueStateEquals(expectedOriginal, expectedOriginal) || !RegistryValueStateEquals(expectedMutation, expectedMutation))
+                    throw new InvalidOperationException("Exact registry snapshot state is hash-invalid");
+                if ((expectedGuard == null) != string.IsNullOrWhiteSpace(guardValueName))
+                    throw new InvalidOperationException("Exact registry guard identity is incomplete");
+                RegistryValueState current = ReadRegistryValueState(root, subKey, valueName);
+                if (!RegistryValueStateEquals(current, expectedOriginal))
+                    throw new InvalidOperationException("Registry startup value changed while capturing its transaction snapshot; refresh before changing it");
+                if (expectedGuard != null)
+                {
+                    if (!RegistryValueStateEquals(expectedGuard, expectedGuard)) throw new InvalidOperationException("Exact registry guard state is hash-invalid");
+                    RegistryValueState currentGuard = ReadRegistryValueState(root, subKey, guardValueName);
+                    if (!RegistryValueStateEquals(currentGuard, expectedGuard))
+                        throw new InvalidOperationException("Guarded registry value changed while capturing its transaction snapshot; refresh before changing it");
+                }
+                _root = root;
+                _subKey = subKey;
+                _valueName = valueName;
+                _exactOriginal = expectedOriginal;
+                _exactMutation = expectedMutation;
+                _exactGuardValueName = guardValueName;
+                _exactGuard = expectedGuard;
+            }
+
+            public void Restore()
+            {
+                if (_kind == "none") return;
+                if (_kind == "task") { _task.Restore(); return; }
+                if (_kind == "registry")
+                {
+                    if (_exactOriginal != null)
+                    {
+                        if (_exactGuard != null && !RegistryValueStateEquals(ReadRegistryValueState(_root, _subKey, _exactGuardValueName), _exactGuard))
+                            throw new InvalidOperationException("Guarded registry value changed concurrently; rollback refuses to overwrite startup state");
+                        RegistryValueState current = ReadRegistryValueState(_root, _subKey, _valueName);
+                        if (ShouldApplyExactRegistryRollback(_exactOriginal, _exactMutation, current))
+                            WriteRegistryValueStateExact(_root, _subKey, _valueName, _exactMutation, _exactOriginal);
+                        if (_exactGuard != null && !RegistryValueStateEquals(ReadRegistryValueState(_root, _subKey, _exactGuardValueName), _exactGuard))
+                            throw new IOException("Guarded registry value changed during rollback verification");
+                        return;
+                    }
+                    using (var key = _root.CreateSubKey(_subKey))
+                    {
+                        if (_valueExisted) key.SetValue(_valueName, _value, _valueKind);
+                        else if (key.GetValueNames().Any(n => string.Equals(n, _valueName, StringComparison.OrdinalIgnoreCase))) key.DeleteValue(_valueName, false);
+                    }
+                    return;
+                }
+                if (_kind == "folder")
+                {
+                    if (_folderOriginal != null && _folderOriginal.Exists && !File.Exists(_folderOriginal.Path))
+                    {
+                        string prefix = Path.GetFileName(_folderOriginal.Path) + ".";
+                        string moved = Directory.Exists(Program.DisabledStartupFolder)
+                            ? Directory.GetFiles(Program.DisabledStartupFolder).Where(f => !_quarantineBefore.Contains(f) && Path.GetFileName(f).StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && f.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase)).OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault()
+                            : null;
+                        if (!string.IsNullOrWhiteSpace(moved))
+                        {
+                            Directory.CreateDirectory(Path.GetDirectoryName(_folderOriginal.Path));
+                            File.Move(moved, _folderOriginal.Path);
+                        }
+                    }
+                    // Restore both ends exactly.  This also moves a partially restored disabled
+                    // entry back into quarantine and removes only files created by this mutation.
+                    if (_folderOriginal != null) _folderOriginal.Restore();
+                    if (_folderQuarantine != null) _folderQuarantine.Restore();
+                    if (_quarantineBefore != null && Directory.Exists(Program.DisabledStartupFolder))
+                    {
+                        foreach (string extra in Directory.GetFiles(Program.DisabledStartupFolder).Where(f => !_quarantineBefore.Contains(f)).ToArray())
+                        {
+                            if (_folderQuarantine != null && string.Equals(extra, _folderQuarantine.Path, StringComparison.OrdinalIgnoreCase)) continue;
+                            File.Delete(extra);
+                        }
+                    }
+                    return;
+                }
+                if (_kind == "wmi")
+                {
+                    bool exists; string filter; string consumer;
+                    ReadWmiBinding(_wmiLocation, out exists, out filter, out consumer);
+                    if (_wmiExisted && !exists) CreateWmiBinding(_wmiFilter, _wmiConsumer);
+                    else if (!_wmiExisted && exists)
+                    {
+                        using (var binding = new ManagementObject(_wmiLocation)) { binding.Get(); binding.Delete(); }
+                    }
+                }
+            }
+
+            private void CaptureWmiBinding(StartupItem item)
+            {
+                _wmiLocation = item.Location;
+                if (string.IsNullOrWhiteSpace(_wmiLocation)) throw new InvalidOperationException("WMI binding location is missing");
+                ReadWmiBinding(_wmiLocation, out _wmiExisted, out _wmiFilter, out _wmiConsumer);
+                if (!_wmiExisted)
+                {
+                    string[] meta = (item.Status ?? "").Split('\t');
+                    if (meta.Length >= 2) { _wmiFilter = meta[0]; _wmiConsumer = meta[1]; }
+                }
+                if (_wmiExisted && (string.IsNullOrWhiteSpace(_wmiFilter) || string.IsNullOrWhiteSpace(_wmiConsumer))) throw new InvalidOperationException("WMI binding metadata is incomplete");
+            }
+
+            private static void ReadWmiBinding(string location, out bool exists, out string filter, out string consumer)
+            {
+                exists = false; filter = ""; consumer = "";
+                try
+                {
+                    using (var binding = new ManagementObject(location))
+                    {
+                        binding.Get();
+                        filter = Convert.ToString(binding["Filter"] ?? "");
+                        consumer = Convert.ToString(binding["Consumer"] ?? "");
+                        exists = true;
+                    }
+                }
+                catch (ManagementException ex)
+                {
+                    if (ex.ErrorCode != ManagementStatus.NotFound) throw;
+                }
+            }
+
+            private static void CreateWmiBinding(string filter, string consumer)
+            {
+                if (string.IsNullOrWhiteSpace(filter) || string.IsNullOrWhiteSpace(consumer)) throw new InvalidOperationException("Stored WMI binding metadata is incomplete");
+                var scope = new ManagementScope(@"\\.\root\subscription");
+                scope.Connect();
+                using (var bindingClass = new ManagementClass(scope, new ManagementPath("__FilterToConsumerBinding"), null))
+                using (var binding = bindingClass.CreateInstance())
+                {
+                    binding["Filter"] = filter;
+                    binding["Consumer"] = consumer;
+                    binding.Put();
+                }
+            }
+        }
+
+        private sealed class FileStateSnapshot
+        {
+            public string Path;
+            public bool Exists;
+            private byte[] _bytes;
+            private FileAttributes _attributes;
+            private DateTime _createdUtc;
+            private DateTime _writtenUtc;
+
+            public static FileStateSnapshot Capture(string path)
+            {
+                if (string.IsNullOrWhiteSpace(path)) throw new InvalidOperationException("Startup-folder path is missing");
+                bool exists = File.Exists(path);
+                return new FileStateSnapshot
+                {
+                    Path = path,
+                    Exists = exists,
+                    _bytes = exists ? File.ReadAllBytes(path) : new byte[0],
+                    _attributes = exists ? File.GetAttributes(path) : FileAttributes.Normal,
+                    _createdUtc = exists ? File.GetCreationTimeUtc(path) : DateTime.MinValue,
+                    _writtenUtc = exists ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue
+                };
+            }
+
+            public void Restore()
+            {
+                if (!Exists)
+                {
+                    if (File.Exists(Path)) File.Delete(Path);
+                    return;
+                }
+                WriteBytesAtomic(Path, _bytes);
+                File.SetAttributes(Path, _attributes);
+                File.SetCreationTimeUtc(Path, _createdUtc);
+                File.SetLastWriteTimeUtc(Path, _writtenUtc);
+            }
+        }
+
+        private static object CloneRegistryValue(object value)
+        {
+            if (value is byte[]) return ((byte[])value).ToArray();
+            if (value is string[]) return ((string[])value).ToArray();
+            return value;
+        }
+
+        private static void WriteBytesAtomic(string path, byte[] bytes)
+        {
+            string directory = Path.GetDirectoryName(Path.GetFullPath(path));
+            Directory.CreateDirectory(directory);
+            string temp = Path.Combine(directory, Path.GetFileName(path) + ".rollback." + Guid.NewGuid().ToString("N"));
+            try
+            {
+                using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    byte[] payload = bytes ?? new byte[0];
+                    stream.Write(payload, 0, payload.Length);
+                    stream.Flush(true);
+                }
+                if (File.Exists(path)) File.Replace(temp, path, null, true);
+                else File.Move(temp, path);
+            }
+            finally { if (File.Exists(temp)) { try { File.Delete(temp); } catch { } } }
+        }
+
+        private static EnabledStartupService.Row FindEquivalentLiveManagedRoute(string targetPath, string arguments, string equivalentTarget, string equivalentArguments)
+        {
+            try
+            {
+                var requested = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { NormalizeManagedCommand(targetPath, arguments), NormalizeManagedCommand(equivalentTarget, equivalentArguments) };
+                foreach (StartupItem item in ScanAll().Where(i => i != null && i.IsManaged && string.Equals(i.Source, "Scheduled Task", StringComparison.OrdinalIgnoreCase)))
+                {
+                    string liveTarget, liveArguments;
+                    try { ResolveLaunchTarget(item, out liveTarget, out liveArguments); }
+                    catch { continue; }
+                    string normalizedTarget = liveTarget;
+                    string normalizedArguments = liveArguments;
+                    QuietLaunchPlanner.NormalizePersistent(ref normalizedTarget, ref normalizedArguments);
+                    normalizedArguments = StripKnownQuietArguments(normalizedTarget, normalizedArguments);
+                    if (!requested.Contains(NormalizeManagedCommand(liveTarget, liveArguments)) && !requested.Contains(NormalizeManagedCommand(normalizedTarget, normalizedArguments))) continue;
+                    return new EnabledStartupService.Row { Kind = "managed-task", Name = item.Name, Scope = item.Scope, Command = item.Command, Location = item.Location, Status = item.Status, Target = liveTarget, Arguments = liveArguments, Mode = IsQuietLaunch(item.Command, item.Location) ? "tray" : "normal", TaskLocation = item.Location };
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static string ChooseManagedTaskName(string safeBase, string displayName, string targetPath, string arguments, bool trayMode, Func<string, bool> exists)
+        {
+            if (exists == null || !exists(Program.ManagedTaskRoot + safeBase)) return safeBase;
+            string fingerprint = NormalizeManagedCommand(targetPath, arguments);
+            string suffix;
+            using (var sha = SHA256.Create()) suffix = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(fingerprint))).Replace("-", "").Substring(0, 10).ToLowerInvariant();
+            string stem = safeBase;
+            if (stem.Length > 145) stem = stem.Substring(0, 145).TrimEnd(' ', '.');
+            string candidate = stem + "-" + suffix;
+            if (!exists(Program.ManagedTaskRoot + candidate)) return candidate;
+            for (int i = 2; i < 10000; i++)
+            {
+                string numbered = candidate + "-" + i;
+                if (!exists(Program.ManagedTaskRoot + numbered)) return numbered;
+            }
+            throw new InvalidOperationException("Could not allocate a unique managed startup identity for " + displayName);
+        }
+
+        private static EnabledStartupService.Row FindEquivalentManagedRoute(IEnumerable<EnabledStartupService.Row> rows, string targetPath, string arguments, string equivalentTarget, string equivalentArguments)
+        {
+            var requested = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                NormalizeManagedCommand(targetPath, arguments),
+                NormalizeManagedCommand(equivalentTarget, equivalentArguments)
+            };
+            foreach (var row in (rows ?? Enumerable.Empty<EnabledStartupService.Row>()).Where(r => r != null && string.Equals(r.Kind, "managed-task", StringComparison.OrdinalIgnoreCase)).OrderBy(r => r.TaskLocation ?? r.Location, StringComparer.OrdinalIgnoreCase))
+            {
+                string rowTarget = row.Target ?? "";
+                string rowArguments = row.Arguments ?? "";
+                string normalizedTarget = rowTarget;
+                string normalizedArguments = rowArguments;
+                QuietLaunchPlanner.NormalizePersistent(ref normalizedTarget, ref normalizedArguments);
+                if (requested.Contains(NormalizeManagedCommand(rowTarget, rowArguments)) || requested.Contains(NormalizeManagedCommand(normalizedTarget, normalizedArguments))) return row;
+            }
+            return null;
+        }
+
+        private static bool ManagedTaskExists(string fullTaskName)
+        {
+            return TaskExists(fullTaskName);
+        }
+
+        internal static bool IsMissingScheduledTask(Exception exception)
+        {
+            // Dynamic COM dispatch can wrap the scheduler's HRESULT in reflection exceptions.
+            // Unwrap only dispatch wrappers; arbitrary failures must not look like absent tasks.
+            while (exception is System.Reflection.TargetInvocationException && exception.InnerException != null)
+                exception = exception.InnerException;
+            if (exception is FileNotFoundException || exception is DirectoryNotFoundException) return true;
+            var com = exception as COMException;
+            if (com == null) return false;
+            uint code = unchecked((uint)com.HResult);
+            return code == 0x80070002u || code == 0x80070003u || code == 0x8004130Fu;
+        }
+
+        private static bool TaskExists(string fullTaskName)
+        {
+            string xml;
+            return TryReadTaskXml(fullTaskName, out xml);
+        }
+
+        private static bool TryReadTaskXml(string fullTaskName, out string xml)
+        {
+            xml = "";
+            object serviceObject = null, folderObject = null, taskObject = null;
+            try
+            {
+                string folderPath, taskName;
+                SplitTaskLocation(fullTaskName, out folderPath, out taskName);
+                Type serviceType = Type.GetTypeFromProgID("Schedule.Service");
+                if (serviceType == null) throw new InvalidOperationException("Task Scheduler COM service is unavailable");
+                serviceObject = Activator.CreateInstance(serviceType);
+                dynamic service = serviceObject;
+                service.Connect();
+                folderObject = service.GetFolder(folderPath);
+                dynamic folder = folderObject;
+                taskObject = folder.GetTask(taskName);
+                dynamic task = taskObject;
+                xml = Convert.ToString(task.Xml ?? "");
+                return true;
+            }
+            catch (Exception ex) when (StartupService.IsMissingScheduledTask(ex)) { return false; }
+            finally
+            {
+                foreach (object com in new[] { taskObject, folderObject, serviceObject })
+                {
+                    if (com != null && Marshal.IsComObject(com)) { try { Marshal.FinalReleaseComObject(com); } catch { } }
+                }
+            }
+        }
+
+        private static void SplitTaskLocation(string fullTaskName, out string folderPath, out string taskName)
+        {
+            string normalized = (fullTaskName ?? "").Trim();
+            if (!normalized.StartsWith("\\", StringComparison.Ordinal)) normalized = "\\" + normalized.TrimStart('\\');
+            normalized = normalized.TrimEnd('\\');
+            int split = normalized.LastIndexOf('\\');
+            folderPath = split <= 0 ? "\\" : normalized.Substring(0, split);
+            taskName = split < 0 ? normalized.Trim('\\') : normalized.Substring(split + 1);
+            if (string.IsNullOrWhiteSpace(taskName)) throw new ArgumentException("Task name is required", "fullTaskName");
+        }
+
+        private static void RestoreTaskXml(string fullTaskName, string xml)
+        {
+            string folderPath, taskName;
+            SplitTaskLocation(fullTaskName, out folderPath, out taskName);
+            string taskPath = folderPath == "\\" ? "\\" : folderPath.TrimEnd('\\') + "\\";
+            string script =
+                "$ErrorActionPreference='Stop';" +
+                "function D($s){[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))};" +
+                "$path=D '" + B64(taskPath) + "';" +
+                "$name=D '" + B64(taskName) + "';" +
+                "$xml=D '" + B64(xml ?? "") + "';" +
+                "Register-ScheduledTask -TaskPath $path -TaskName $name -Xml $xml -Force | Out-Null;";
+            RunPowerShellScript(script);
+        }
+
+        public static string RegisterLogonTaskAt(string fullTaskName, string execute, string arguments, bool replaceExisting = true)
         {
             string normalized = fullTaskName.StartsWith("\\") ? fullTaskName : Program.ManagedTaskRoot + fullTaskName.Trim('\\');
             int split = normalized.LastIndexOf('\\');
@@ -1337,11 +7377,15 @@ foreach($t in Get-ScheduledTask){
                 "$execute = D '" + B64(execute) + "';" +
                 "$arguments = D '" + B64(arguments ?? "") + "';" +
                 "if(-not (Test-Path -LiteralPath $execute)){throw ('Startup executable was not found: ' + $execute)};" +
+                "$folderPath=$path.TrimEnd('\\');" +
+                "$schedule=New-Object -ComObject 'Schedule.Service';$schedule.Connect();$folder=$schedule.GetFolder('\\');$currentPath='';" +
+                "if($folderPath -ne ''){foreach($segment in ($folderPath.Trim('\\') -split '\\\\')){if([string]::IsNullOrWhiteSpace($segment)){continue};$currentPath += '\\' + $segment;try{$folder=$schedule.GetFolder($currentPath)}catch{$null=$folder.CreateFolder($segment);$folder=$schedule.GetFolder($currentPath)}}};" +
+                "$identity=[Security.Principal.WindowsIdentity]::GetCurrent();if([string]::IsNullOrWhiteSpace($identity.Name)){throw 'The current Windows user is unavailable'};$currentUser=$identity.Name;" +
                 "$action=if([string]::IsNullOrWhiteSpace($arguments)){New-ScheduledTaskAction -Execute $execute}else{New-ScheduledTaskAction -Execute $execute -Argument $arguments};" +
-                "$trigger=New-ScheduledTaskTrigger -AtLogOn;" +
-                "$principal=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited;" +
-                "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 0);" +
-                "Register-ScheduledTask -TaskPath $path -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null;";
+                "$trigger=New-ScheduledTaskTrigger -AtLogOn -User $currentUser;" +
+                "$principal=New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited;" +
+                "$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 0);" +
+                "Register-ScheduledTask -TaskPath $path -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings" + (replaceExisting ? " -Force" : "") + " | Out-Null;";
             RunPowerShellScript(script);
             return path + taskName;
         }
@@ -1349,10 +7393,56 @@ foreach($t in Get-ScheduledTask){
         private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
         private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
 
+        internal static string RegistryProtectionKey(string scope, string rootName, string subKey, string valueName, string viewLabel = null)
+        {
+            return "reg|" + (scope ?? "") + "|" + B64(rootName ?? "") + "|" + B64(subKey ?? "") + "|" + B64(valueName ?? "") + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "|" + viewLabel);
+        }
+
+        internal static string RegistryIntentStatus(StartupItem item)
+        {
+            if (item == null) throw new ArgumentNullException("item");
+            string[] parts = (item.Id ?? "").Split('|');
+            if (parts.Length < 5 || !string.Equals(parts[0], "reg", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("Registry startup identity is incomplete");
+            string rootName = UnB64(parts[2]);
+            string subKey = UnB64(parts[3]);
+            string valueName = UnB64(parts[4]);
+            string viewLabel = parts.Length > 5 ? parts[5] : item.RegistryView;
+            RegistryValueKind kind;
+            RegistryKey root = RootFromName(rootName, viewLabel);
+            using (var key = root.OpenSubKey(subKey, false))
+            {
+                if (key == null || !key.GetValueNames().Any(n => string.Equals(n, valueName, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException("Registry startup value is missing: " + valueName);
+                kind = key.GetValueKind(valueName);
+            }
+            // Keep the established disabled/enabled manifest format. Field 5 is reserved for
+            // the disabled-store payload; field 6 is the explicit registry view.
+            return rootName + "\t" + subKey + "\t" + valueName + "\t" + kind + "\t" + (item.Source ?? "Registry Run") + "\t\t" + (viewLabel ?? "");
+        }
+
+        internal static string ActiveSetupProtectionKey(string scope, string rootName, string subKey, string viewLabel = null)
+        {
+            return "active|" + (scope ?? "") + "|" + B64(rootName ?? "") + "|" + B64(subKey ?? "") + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "|" + viewLabel);
+        }
+
+        internal static string ServiceProtectionKey(string kind, string serviceName)
+        {
+            string prefix = string.Equals(kind, "driver", StringComparison.OrdinalIgnoreCase) || string.Equals(kind, "System Driver", StringComparison.OrdinalIgnoreCase) ? "driver" : "service";
+            return prefix + "|" + B64(serviceName ?? "");
+        }
+
+        internal static string WmiProtectionKey(string location) { return "wmisub|" + B64(location ?? ""); }
+
         private static RegistryKey RootFromName(string rootName)
         {
-            if (string.Equals(rootName, Registry.LocalMachine.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKLM", StringComparison.OrdinalIgnoreCase)) return Registry.LocalMachine;
-            if (string.Equals(rootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKCU", StringComparison.OrdinalIgnoreCase)) return Registry.CurrentUser;
+            return RootFromName(rootName, "");
+        }
+
+        private static RegistryKey RootFromName(string rootName, string viewLabel)
+        {
+            RegistryView view = ParseRegistryView(viewLabel);
+            if (string.Equals(rootName, Registry.LocalMachine.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKLM", StringComparison.OrdinalIgnoreCase)) return view == RegistryView.Default ? Registry.LocalMachine : OpenRegistryRoot(RegistryHive.LocalMachine, view);
+            if (string.Equals(rootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKCU", StringComparison.OrdinalIgnoreCase)) return view == RegistryView.Default ? Registry.CurrentUser : OpenRegistryRoot(RegistryHive.CurrentUser, view);
+            if (string.Equals(rootName, Registry.Users.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKU", StringComparison.OrdinalIgnoreCase)) return view == RegistryView.Default ? Registry.Users : OpenRegistryRoot(RegistryHive.Users, view);
             throw new InvalidOperationException("Unsupported registry root: " + rootName);
         }
 
@@ -1370,15 +7460,36 @@ foreach($t in Get-ScheduledTask){
         public static void DeleteManagedTask(string nameOrTask)
         {
             string tn = nameOrTask.StartsWith("\\") ? nameOrTask : Program.ManagedTaskRoot + nameOrTask.Replace(Program.ManagedTaskRoot.Trim('\\'), "").Trim('\\');
-            ProtectedQuietService.UnprotectTask(tn);
-            EnabledStartupService.RemoveByTask(tn);
-            RunChecked("schtasks.exe", "/Delete /F /TN " + Q(tn));
+            StartupMutationCoordinator.Run(() =>
+            {
+                ManagedMutationSnapshot before = ManagedMutationSnapshot.Capture(tn);
+                try
+                {
+                    // A missing task already satisfies the deletion postcondition. If present,
+                    // delete it first; only then remove the intent that could resurrect it.
+                    if (before.Task.Exists) RunChecked("schtasks.exe", "/Delete /F /TN " + Q(tn));
+                    EnabledStartupService.RemoveByTask(tn);
+                    ProtectedQuietService.UnprotectTask(tn);
+                    EnabledStartupService.MarkV2MigratedChecked(tn);
+                }
+                catch (Exception ex)
+                {
+                    try { before.Restore(); }
+                    catch (Exception restoreEx) { throw new InvalidOperationException("Managed task deletion failed and rollback was incomplete: " + restoreEx.GetBaseException().Message, ex); }
+                    throw new InvalidOperationException("Managed task deletion failed; prior task and intent were restored: " + ex.GetBaseException().Message, ex);
+                }
+            });
         }
 
-        public static bool CommandUsesTrayWrapper(string command)
+        public static bool IsQuietLaunch(string command, string taskLocation = null)
         {
-            return Regex.IsMatch(command ?? "", @"--tray-run\s+[A-Za-z0-9+/=]+|--start-in-tray\b", RegexOptions.IgnoreCase);
+            if (Regex.IsMatch(command ?? "", @"--tray-run\s+[A-Za-z0-9+/=]+|--start-in-tray\b|--minimize-to-tray\b", RegexOptions.IgnoreCase)) return true;
+            return !string.IsNullOrWhiteSpace(taskLocation) && EnabledStartupService.IsQuietTask(taskLocation);
         }
+
+        // Compatibility alias for older call sites and scripts. Quiet launch is a semantic mode,
+        // not proof that an MSM wrapper is present: native targets such as OpenSpeedy run direct.
+        public static bool CommandUsesTrayWrapper(string command) { return IsQuietLaunch(command); }
 
         public static void TogglePopupMode(StartupItem item)
         {
@@ -1388,25 +7499,28 @@ foreach($t in Get-ScheduledTask){
         public static void SetPopupMode(StartupItem item, bool popupEnabled)
         {
             if (item.PopupLabel() == "N/A") throw new InvalidOperationException("Popup control applies to app/task/folder/registry launch commands, not service, driver, Winlogon, AppInit, or Active Setup rows.");
+            if (item == null || !item.Enabled)
+                throw new InvalidOperationException("This startup entry is disabled. Enable it first, then change Window/Quiet mode; no enabled duplicate was created.");
+            if (!CanMutateStartupMode(item))
+                throw new InvalidOperationException("This scheduled task has multiple or non-executable actions. Window/Quiet mode editing is disabled so its original action set remains intact.");
             string target, arguments;
             ResolveLaunchTarget(item, out target, out arguments);
-            string execute = popupEnabled ? target : Process.GetCurrentProcess().MainModule.FileName;
-            string actionArgs = popupEnabled ? (IsSelfTarget(target) ? "" : (arguments ?? "")) : (IsSelfTarget(target) ? "--start-in-tray" : "--tray-run " + Convert.ToBase64String(Encoding.UTF8.GetBytes(target + "\n" + (arguments ?? ""))));
+            NormalizeManagedMode(ref target, ref arguments, !popupEnabled);
+            string execute;
+            string actionArgs;
+            if (popupEnabled) BuildDirectAction(target, arguments ?? "", out execute, out actionArgs);
+            else BuildManagedAction(target, arguments ?? "", true, out execute, out actionArgs);
 
             if (item.Id.StartsWith("task|") && item.IsManaged)
             {
-                RegisterLogonTaskAt(item.Location, execute, actionArgs);
-                if (popupEnabled) ProtectedQuietService.UnprotectTask(item.Location);
-                else ProtectedQuietService.ProtectTask(item.Location, target, arguments ?? "");
-                EnabledStartupService.Upsert(new EnabledStartupService.Row { Kind = "managed-task", Name = item.Name ?? "", Scope = item.Scope ?? "", Command = execute + " " + actionArgs, Location = item.Location, Status = item.Status ?? "", Target = target, Arguments = arguments ?? "", Mode = popupEnabled ? "normal" : "tray", TaskLocation = item.Location });
+                var row = new EnabledStartupService.Row { Kind = "managed-task", Name = item.Name ?? "", Scope = item.Scope ?? "", Command = (execute + " " + actionArgs).Trim(), Location = item.Location, Status = item.Status ?? "", Target = target, Arguments = arguments ?? "", Mode = popupEnabled ? "normal" : "tray", TaskLocation = item.Location };
+                CommitManagedTaskMutation(item.Location, execute, actionArgs, row, !popupEnabled, null, null, false);
                 return;
             }
 
-            if (item.Enabled && item.CanDisable) Disable(item);
-            else if (item.Enabled && !item.CanDisable) throw new InvalidOperationException("This startup source is read-only here. Select its matching Registry Run, Startup Folder, or Scheduled Task row if Windows exposes one.");
-
-            string createdTask = AddManagedStartup(item.Name, target, arguments, !popupEnabled, true);
-            if (!popupEnabled) ProtectedQuietService.ProtectTask(createdTask, target, arguments ?? "");
+            if (item.Enabled && !item.CanDisable) throw new InvalidOperationException("This startup source is read-only here. Select its matching Registry Run, Startup Folder, or Scheduled Task row if Windows exposes one.");
+            StartupSourceSnapshot source = item.Enabled ? StartupSourceSnapshot.Capture(item) : null;
+            AddManagedStartupCore(item.Name, target, arguments, !popupEnabled, true, item.Enabled ? (Action)(() => Disable(item)) : null, source);
         }
 
         public static string EditStartup(StartupItem item, string name, string targetPath, string arguments, bool trayMode)
@@ -1414,39 +7528,60 @@ foreach($t in Get-ScheduledTask){
             if (item == null) throw new ArgumentException("No startup item selected");
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name is required");
             if (string.IsNullOrWhiteSpace(targetPath) || !File.Exists(targetPath)) throw new FileNotFoundException("Application not found", targetPath);
-            if (!IsSupportedStartupTarget(targetPath)) throw new ArgumentException("Choose an executable startup target: .exe, .cmd, .bat, .ps1, or .lnk");
+            if (!IsSupportedStartupTarget(targetPath)) throw new ArgumentException("Choose a supported startup target: .exe, .com, .lnk, .cmd, .bat, .ps1, .vbs, .vbe, .js, .jse, .wsf, .wsh, .py, or .pyw");
+            if (!item.Enabled)
+                throw new InvalidOperationException("This startup entry is disabled. Enable it first, then edit it; no enabled duplicate was created.");
+            if (!CanMutateStartupMode(item))
+                throw new InvalidOperationException("This scheduled task has multiple or non-executable actions. Editing is disabled so its original action set remains intact.");
+            NormalizeManagedMode(ref targetPath, ref arguments, trayMode);
             if (item.Id.StartsWith("task|") && item.IsManaged)
             {
                 string execute;
                 string actionArgs;
                 BuildManagedAction(targetPath, arguments ?? "", trayMode, out execute, out actionArgs);
-                RegisterLogonTaskAt(item.Location, execute, actionArgs);
-                if (trayMode) ProtectedQuietService.ProtectTask(item.Location, targetPath, arguments ?? "");
-                else ProtectedQuietService.UnprotectTask(item.Location);
-                EnabledStartupService.Upsert(new EnabledStartupService.Row { Kind = "managed-task", Name = name ?? "", Scope = item.Scope ?? "", Command = execute + " " + actionArgs, Location = item.Location, Status = item.Status ?? "", Target = targetPath, Arguments = arguments ?? "", Mode = trayMode ? "tray" : "normal", TaskLocation = item.Location });
+                var row = new EnabledStartupService.Row { Kind = "managed-task", Name = name ?? "", Scope = item.Scope ?? "", Command = (execute + " " + actionArgs).Trim(), Location = item.Location, Status = item.Status ?? "", Target = targetPath, Arguments = arguments ?? "", Mode = trayMode ? "tray" : "normal", TaskLocation = item.Location };
+                CommitManagedTaskMutation(item.Location, execute, actionArgs, row, trayMode, null, null, false);
                 return item.Location;
             }
             if (item.PopupLabel() == "N/A") throw new InvalidOperationException("This startup source cannot be edited as an application launch. Services, drivers, Winlogon, AppInit, and Active Setup rows should be changed from their owning tool.");
-            if (item.Enabled && item.CanDisable) Disable(item);
-            else if (item.Enabled && !item.CanDisable) throw new InvalidOperationException("This startup source is read-only here. Run elevated or choose its matching Registry Run, Startup Folder, or Scheduled Task row.");
-            return AddManagedStartup(name, targetPath, arguments ?? "", trayMode, true);
+            if (item.Enabled && !item.CanDisable) throw new InvalidOperationException("This startup source is read-only here. Run elevated or choose its matching Registry Run, Startup Folder, or Scheduled Task row.");
+            StartupSourceSnapshot source = item.Enabled ? StartupSourceSnapshot.Capture(item) : null;
+            return AddManagedStartupCore(name, targetPath, arguments ?? "", trayMode, true, item.Enabled ? (Action)(() => Disable(item)) : null, source);
+        }
+
+        internal static bool CanMutateStartupMode(StartupItem item)
+        {
+            if (item == null || !item.Enabled) return false;
+            return !string.Equals(item.Source, "Scheduled Task", StringComparison.OrdinalIgnoreCase)
+                || (item.Status ?? "").IndexOf("modeEditable=false", StringComparison.OrdinalIgnoreCase) < 0;
         }
 
         internal static void BuildManagedAction(string targetPath, string arguments, bool trayMode, out string execute, out string actionArgs)
         {
             if (trayMode)
             {
-                execute = Process.GetCurrentProcess().MainModule.FileName;
-                if (IsSelfTarget(targetPath)) actionArgs = "--start-in-tray";
-                else actionArgs = "--tray-run " + Convert.ToBase64String(Encoding.UTF8.GetBytes(targetPath + "\n" + (arguments ?? "")));
+                QuietLaunchPlan plan = QuietLaunchPlanner.Create(targetPath, arguments ?? "");
+                if (!plan.UsesWrapper)
+                {
+                    if (string.Equals(plan.Strategy, "self-tray", StringComparison.OrdinalIgnoreCase))
+                    {
+                        execute = Process.GetCurrentProcess().MainModule.FileName;
+                        actionArgs = "--start-in-tray";
+                    }
+                    else BuildDirectAction(plan.Target, plan.LaunchArguments, out execute, out actionArgs);
+                }
+                else
+                {
+                    execute = Process.GetCurrentProcess().MainModule.FileName;
+                    actionArgs = "--tray-run " + Convert.ToBase64String(Encoding.UTF8.GetBytes(plan.Target + "\n" + (plan.UserArguments ?? "")));
+                }
             }
             else BuildDirectAction(targetPath, arguments ?? "", out execute, out actionArgs);
         }
 
         public static bool IsSupportedStartupTarget(string path)
         {
-            string ext = Path.GetExtension(path ?? "").ToLowerInvariant();
-            return ext == ".exe" || ext == ".cmd" || ext == ".bat" || ext == ".ps1" || ext == ".lnk";
+            return !string.IsNullOrWhiteSpace(path) && path.IndexOfAny(new[] { '\0', '\r', '\n' }) < 0;
         }
 
         // Packaged (MSIX/Store) apps live under WindowsApps in a versioned folder that moves
@@ -1512,16 +7647,71 @@ foreach($t in Get-ScheduledTask){
                 execute = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"System32\cmd.exe");
                 actionArgs = "/d /c " + WinArg(targetPath) + AppendArgs(arguments);
             }
-            else if (ext == ".lnk")
+            else if (ext == ".vbs" || ext == ".vbe" || ext == ".js" || ext == ".jse" || ext == ".wsf" || ext == ".wsh")
             {
-                execute = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
-                actionArgs = WinArg(targetPath) + AppendArgs(arguments);
+                execute = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"System32\wscript.exe");
+                if (!File.Exists(execute)) throw new FileNotFoundException("Windows Script Host is unavailable", execute);
+                actionArgs = "//B //NoLogo " + WinArg(targetPath) + AppendArgs(arguments);
             }
-            else
+            else if (ext == ".py" || ext == ".pyw")
+            {
+                bool windowless = ext == ".pyw";
+                execute = ResolvePythonHost(windowless);
+                bool launcher = string.Equals(Path.GetFileName(execute), "py.exe", StringComparison.OrdinalIgnoreCase) || string.Equals(Path.GetFileName(execute), "pyw.exe", StringComparison.OrdinalIgnoreCase);
+                actionArgs = (launcher ? "-3 " : "") + WinArg(targetPath) + AppendArgs(arguments);
+            }
+
+            else if (ext == ".exe" || ext == ".com")
             {
                 execute = targetPath;
                 actionArgs = arguments ?? "";
             }
+            else
+            {
+                // Task Scheduler cannot execute documents. Let the Windows shell select the
+                // current default app at launch time, without interpreting the path as shell code.
+                execute = Process.GetCurrentProcess().MainModule.FileName;
+                actionArgs = "--shell-open " + B64(targetPath + "\n" + (arguments ?? ""));
+            }
+        }
+
+        private static string ResolvePythonHost(bool windowless)
+        {
+            string[] names = windowless ? new[] { "pythonw.exe", "pyw.exe", "python.exe", "py.exe" } : new[] { "python.exe", "py.exe" };
+            foreach (string name in names)
+            {
+                string exact = ResolveExecutableOnPath(name);
+                if (!string.IsNullOrWhiteSpace(exact)) return exact;
+            }
+            string localPrograms = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Python");
+            if (Directory.Exists(localPrograms))
+            {
+                foreach (string directory in Directory.GetDirectories(localPrograms, "Python*").OrderByDescending(x => x, StringComparer.OrdinalIgnoreCase))
+                foreach (string name in names)
+                {
+                    string candidate = Path.Combine(directory, name);
+                    if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+                }
+            }
+            string launcher = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), windowless ? "pyw.exe" : "py.exe");
+            if (File.Exists(launcher)) return launcher;
+            throw new FileNotFoundException("No exact Python interpreter or launcher could be resolved. Install Python or choose another startup target.");
+        }
+
+        private static string ResolveExecutableOnPath(string fileName)
+        {
+            foreach (string raw in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string directory = Environment.ExpandEnvironmentVariables(raw.Trim().Trim('"'));
+                if (string.IsNullOrWhiteSpace(directory)) continue;
+                try
+                {
+                    string candidate = Path.Combine(directory, fileName);
+                    if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+                }
+                catch { }
+            }
+            return "";
         }
 
         private static string AppendArgs(string arguments) { return string.IsNullOrWhiteSpace(arguments) ? "" : " " + arguments.Trim(); }
@@ -1539,14 +7729,20 @@ foreach($t in Get-ScheduledTask){
             }
             if (TryDecodeTrayPayload(command, out targetPath, out arguments) && File.Exists(targetPath)) return;
             if (!TrySplitCommand(command, out targetPath, out arguments)) throw new InvalidOperationException("Could not parse executable from command");
-            if (targetPath.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) ResolveShortcut(targetPath, out targetPath, out arguments);
+            if (targetPath.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+            {
+                string commandArguments = arguments;
+                string shortcutArguments;
+                ResolveShortcut(targetPath, out targetPath, out shortcutArguments);
+                arguments = MergeArguments(shortcutArguments, commandArguments);
+            }
             if (!File.Exists(targetPath) || !IsSupportedStartupTarget(targetPath)) throw new FileNotFoundException("Resolved startup target is not a supported startup target", targetPath);
         }
 
         internal static bool TryDecodeTrayPayload(string command, out string targetPath, out string arguments)
         {
             targetPath = ""; arguments = "";
-            Match m = Regex.Match(command ?? "", @"--tray-run\s+(?<payload>[A-Za-z0-9+/=]+)", RegexOptions.IgnoreCase);
+            Match m = Regex.Match(command ?? "", @"--(?:tray-run|shell-open)\s+(?<payload>[A-Za-z0-9+/=]+)", RegexOptions.IgnoreCase);
             if (!m.Success) return false;
             try
             {
@@ -1568,7 +7764,7 @@ foreach($t in Get-ScheduledTask){
                 int end = command.IndexOf('"', 1);
                 if (end > 1) { exe = command.Substring(1, end - 1); args = command.Substring(end + 1).Trim(); return true; }
             }
-            Match m = Regex.Match(command, @"^(?<exe>.+?\.(?:exe|lnk|ps1|cmd|bat|vbs|py|pyw|com|msc))(?:\s+(?<args>.*))?$", RegexOptions.IgnoreCase);
+            Match m = Regex.Match(command, @"^(?<exe>.+?\.(?:exe|com|lnk|ps1|cmd|bat|vbs|vbe|js|jse|wsf|wsh|py|pyw|msc))(?:\s+(?<args>.*))?$", RegexOptions.IgnoreCase);
             if (m.Success) { exe = m.Groups["exe"].Value.Trim(); args = m.Groups["args"].Value.Trim(); return true; }
             if (File.Exists(command)) { exe = command; args = ""; return true; }
             return false;
@@ -1593,16 +7789,112 @@ foreach($t in Get-ScheduledTask){
         private static void ResolveShortcut(string shortcutPath, out string targetPath, out string arguments)
         {
             targetPath = shortcutPath; arguments = "";
+            object shellObject = null, shortcutObject = null;
             try
             {
                 Type shellType = Type.GetTypeFromProgID("WScript.Shell");
                 if (shellType == null) return;
-                dynamic shell = Activator.CreateInstance(shellType);
-                dynamic shortcut = shell.CreateShortcut(shortcutPath);
+                shellObject = Activator.CreateInstance(shellType);
+                dynamic shell = shellObject;
+                shortcutObject = shell.CreateShortcut(shortcutPath);
+                dynamic shortcut = shortcutObject;
                 targetPath = Convert.ToString(shortcut.TargetPath ?? shortcutPath);
                 arguments = Convert.ToString(shortcut.Arguments ?? "");
             }
             catch { }
+            finally
+            {
+                if (shortcutObject != null && Marshal.IsComObject(shortcutObject)) { try { Marshal.FinalReleaseComObject(shortcutObject); } catch { } }
+                if (shellObject != null && Marshal.IsComObject(shellObject)) { try { Marshal.FinalReleaseComObject(shellObject); } catch { } }
+            }
+        }
+
+        internal static string AdvancedDisabledSourceName(string type, string status)
+        {
+            if (type != "winlogon" && type != "appinit" && type != "advanced") return type ?? "";
+            try { return DecodeAdvancedDisabledState(status).Source; }
+            catch { return type == "winlogon" ? "Winlogon Autostart" : (type == "appinit" ? "AppInit DLLs" : "Advanced startup"); }
+        }
+
+        internal static void HydrateAdvancedDisabledItem(StartupItem item)
+        {
+            if (item == null) throw new ArgumentNullException("item");
+            AdvancedDisabledState record = DecodeAdvancedDisabledState(item.Status);
+            string accessReason;
+            bool writable;
+            RegistryValueState current;
+            bool exactGuardState;
+            using (RegistryKey root = RootFromName(record.RootName, record.RegistryView))
+            {
+                writable = CanOpenRegistryValueForWrite(root, record.SubKey, record.ValueName, out accessReason);
+                current = ReadRegistryValueState(root, record.SubKey, record.ValueName);
+                exactGuardState = record.GuardBefore == null
+                    || RegistryValueStateEquals(ReadRegistryValueState(root, record.SubKey, record.GuardValueName), record.GuardBefore);
+            }
+            var capability = DecideRegistryMutationCapability(item.Scope, record.RootName, writable, IsElevated(), "", record.SubKey);
+            bool exactDisabledState = RegistryValueStateEquals(current, record.After);
+            bool canRestore = capability.CanMutate && exactDisabledState && exactGuardState;
+            item.Source = record.Source;
+            item.RegistryView = record.RegistryView;
+            item.CanDisable = canRestore;
+            item.MutationCapability = canRestore ? "TransactionalRegistryRestore" : "ReadOnly";
+            item.MutationReason = !exactGuardState
+                ? "A guarded registry value changed externally; refresh and review before restoring"
+                : (!exactDisabledState
+                    ? "The registry startup value no longer matches the manager-created disabled snapshot; refresh and review before restoring"
+                    : (canRestore ? "Restore the exact original registry value only while the disabled state and guard still match" : capability.Reason + (string.IsNullOrWhiteSpace(accessReason) ? "" : ": " + accessReason)));
+            item.RequiresExpertConfirmation = record.RequiresExpertConfirmation;
+            item.RequiresElevation = capability.RequiresElevation;
+            item.RequiresReboot = record.RequiresReboot;
+            item.ExternalAuthority = capability.ExternalAuthority;
+        }
+
+        internal static string AdvancedProtectionKeyForItem(StartupItem item)
+        {
+            if (item == null) return "";
+            string id = item.Id ?? "";
+            try
+            {
+                if (id.StartsWith("disabled|winlogon|", StringComparison.OrdinalIgnoreCase)
+                    || id.StartsWith("disabled|appinit|", StringComparison.OrdinalIgnoreCase)
+                    || id.StartsWith("disabled|advanced|", StringComparison.OrdinalIgnoreCase))
+                {
+                    AdvancedDisabledState record = DecodeAdvancedDisabledState(item.Status);
+                    return AdvancedProtectionKey(record.RootName, record.SubKey, record.ValueName, record.OriginalIndex, record.RegistryView);
+                }
+                if (id.StartsWith("winlogon|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] parts = id.Split('|');
+                    return parts.Length >= 7 ? AdvancedProtectionKey(UnB64(parts[2]), UnB64(parts[3]), UnB64(parts[4]), int.Parse(parts[5]), parts[6]) : "";
+                }
+                if (id.StartsWith("advanced|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] parts = id.Split('|');
+                    return parts.Length >= 5 ? AdvancedProtectionKey(UnB64(parts[1]), UnB64(parts[2]), UnB64(parts[3]), int.Parse(parts[4]), item.RegistryView) : "";
+                }
+                if (id.StartsWith("appinit|", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] parts = id.Split('|');
+                    return parts.Length >= 3 ? AdvancedProtectionKey(Registry.LocalMachine.Name, UnB64(parts[1]), "LoadAppInit_DLLs", -1, parts[2]) : "";
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        internal static bool EnforceAdvancedDisabledState(string status)
+        {
+            AdvancedDisabledState record = DecodeAdvancedDisabledState(status);
+            using (RegistryKey root = RootFromName(record.RootName, record.RegistryView))
+            {
+                if (record.GuardBefore != null && !RegistryValueStateEquals(ReadRegistryValueState(root, record.SubKey, record.GuardValueName), record.GuardBefore))
+                    throw new InvalidOperationException("Guarded registry value changed externally; protected disable was not enforced");
+                RegistryValueState current = ReadRegistryValueState(root, record.SubKey, record.ValueName);
+                if (RegistryValueStateEquals(current, record.After)) return false;
+                if (!RegistryValueStateEquals(current, record.Before)) throw new InvalidOperationException("Registry startup value changed externally; protected disable refuses to overwrite it");
+                WriteRegistryValueStateExact(root, record.SubKey, record.ValueName, record.Before, record.After);
+                return true;
+            }
         }
 
         public static string ToJson(List<StartupItem> items)
@@ -1611,7 +7903,7 @@ foreach($t in Get-ScheduledTask){
             for (int i = 0; i < items.Count; i++)
             {
                 if (i > 0) sb.Append(','); var x = items[i];
-                sb.Append("{\"name\":\"").Append(Esc(x.Name)).Append("\",\"appName\":\"").Append(Esc(x.HumanName())).Append("\",\"source\":\"").Append(Esc(x.Source)).Append("\",\"scope\":\"").Append(Esc(x.Scope)).Append("\",\"location\":\"").Append(Esc(x.Location)).Append("\",\"enabled\":").Append(x.Enabled ? "true" : "false").Append(",\"canDisable\":").Append(x.CanDisable ? "true" : "false").Append(",\"command\":\"").Append(Esc(x.Command)).Append("\",\"status\":\"").Append(Esc(x.Status)).Append("\",\"popup\":\"").Append(x.PopupLabel()).Append("\",\"risk\":\"").Append(Esc(x.RiskLevel())).Append("\",\"riskLabel\":\"").Append(Esc(x.RiskLabel())).Append("\",\"riskReason\":\"").Append(Esc(x.RiskReason())).Append("\",\"advice\":\"").Append(Esc(x.AdviceLevel())).Append("\",\"adviceLabel\":\"").Append(Esc(x.AdviceLabel())).Append("\",\"adviceReason\":\"").Append(Esc(x.AdviceReason())).Append("\"}");
+                sb.Append("{\"enabledEvidence\":\"configuration-only; consult startupState\",\"popupEvidence\":\"configuration-only; consult presentationState\",\"startupState\":\"").Append(Esc(x.StateText())).Append("\",\"startupReason\":\"").Append(Esc(x.EvidenceReason)).Append("\",\"presentationState\":\"").Append(Esc(x.PresentationState)).Append("\",\"presentationReason\":\"").Append(Esc(x.PresentationReason)).Append("\",\"id\":\"").Append(Esc(x.Id)).Append("\",\"name\":\"").Append(Esc(x.Name)).Append("\",\"appName\":\"").Append(Esc(x.HumanName())).Append("\",\"source\":\"").Append(Esc(x.Source)).Append("\",\"scope\":\"").Append(Esc(x.Scope)).Append("\",\"registryView\":\"").Append(Esc(x.RegistryView)).Append("\",\"location\":\"").Append(Esc(x.Location)).Append("\",\"enabled\":").Append(x.Enabled ? "true" : "false").Append(",\"canDisable\":").Append(x.CanDisable ? "true" : "false").Append(",\"mutationCapability\":\"").Append(Esc(x.MutationCapability)).Append("\",\"mutationReason\":\"").Append(Esc(x.MutationReason)).Append("\",\"requiresExpertConfirmation\":").Append(x.RequiresExpertConfirmation ? "true" : "false").Append(",\"requiresElevation\":").Append(x.RequiresElevation ? "true" : "false").Append(",\"requiresReboot\":").Append(x.RequiresReboot ? "true" : "false").Append(",\"externalAuthority\":\"").Append(Esc(x.ExternalAuthority)).Append("\",\"command\":\"").Append(Esc(x.Command)).Append("\",\"status\":\"").Append(Esc(x.Status)).Append("\",\"popup\":\"").Append(x.PopupLabel()).Append("\",\"risk\":\"").Append(Esc(x.RiskLevel())).Append("\",\"riskLabel\":\"").Append(Esc(x.RiskLabel())).Append("\",\"riskReason\":\"").Append(Esc(x.RiskReason())).Append("\",\"advice\":\"").Append(Esc(x.AdviceLevel())).Append("\",\"adviceLabel\":\"").Append(Esc(x.AdviceLabel())).Append("\",\"adviceReason\":\"").Append(Esc(x.AdviceReason())).Append("\"}");
             }
             sb.Append("]"); return sb.ToString();
         }
@@ -1659,7 +7951,7 @@ foreach($t in Get-ScheduledTask){
                 }
                 string o = so.Result;
                 string e = se.Result;
-                if (p.ExitCode != 0 && string.IsNullOrWhiteSpace(o)) throw new Exception(e);
+                if (p.ExitCode != 0) throw new Exception((o + " " + e).Trim());
                 return o;
             }
         }
@@ -1699,37 +7991,53 @@ foreach($t in Get-ScheduledTask){
 
     internal static class DisabledStoreService
     {
-        public static void Add(string type, string name, string scope, string command, string location, string status)
+        public static string Add(string type, string name, string scope, string command, string location, string status)
         {
             Directory.CreateDirectory(Program.AppData);
             string id = "disabled|" + type + "|" + Guid.NewGuid().ToString("N");
-            File.AppendAllText(Program.DisabledStore, string.Join("\t", new[] { id, type, B64(name), B64(scope), B64(command), B64(location), B64(status) }) + Environment.NewLine, Encoding.UTF8);
+            string record = string.Join("\t", new[] { id, type, B64(name), B64(scope), B64(command), B64(location), B64(status) });
+            StateStoreFile.UpdateLines(Program.DisabledStore, lines => { lines.Add(record); return lines; });
+            return id;
         }
         public static List<StartupItem> LoadDisabledItems()
         {
-            var list = new List<StartupItem>(); if (!File.Exists(Program.DisabledStore)) return list;
-            foreach (var line in File.ReadAllLines(Program.DisabledStore))
+            var list = new List<StartupItem>();
+            foreach (var line in StateStoreFile.ReadAllLines(Program.DisabledStore))
             {
                 var p = line.Split('\t'); if (p.Length < 7) continue;
                 string type = p[1];
-                list.Add(new StartupItem { Id = p[0], Name = UnB64(p[2]), Source = SourceName(type, UnB64(p[6])), Scope = UnB64(p[3]), Command = UnB64(p[4]), Location = UnB64(p[5]), Status = UnB64(p[6]), Enabled = false, CanDisable = true, IsManaged = true });
+                string status = UnB64(p[6]);
+                var item = new StartupItem { Id = p[0], Name = UnB64(p[2]), Source = SourceName(type, status), Scope = UnB64(p[3]), Command = UnB64(p[4]), Location = UnB64(p[5]), Status = status, Enabled = false, CanDisable = true, IsManaged = true };
+                if (type == "winlogon" || type == "appinit" || type == "advanced")
+                {
+                    try { StartupService.HydrateAdvancedDisabledItem(item); }
+                    catch (Exception ex)
+                    {
+                        item.CanDisable = false;
+                        item.MutationCapability = "ReadOnly";
+                        item.MutationReason = "Could not validate this advanced startup record against Windows: " + ex.Message;
+                        item.RequiresExpertConfirmation = true;
+                    }
+                }
+                list.Add(item);
             }
             return list;
         }
         public static void Remove(string id)
         {
-            if (!File.Exists(Program.DisabledStore)) return;
-            var kept = File.ReadAllLines(Program.DisabledStore).Where(l => !l.StartsWith(id + "\t", StringComparison.Ordinal)).ToArray();
-            File.WriteAllLines(Program.DisabledStore, kept, Encoding.UTF8);
+            if (string.IsNullOrWhiteSpace(id)) return;
+            StateStoreFile.UpdateLines(Program.DisabledStore, lines => lines.Where(l => !l.StartsWith(id + "\t", StringComparison.Ordinal)).ToArray());
         }
         private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
         private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
         private static string SourceName(string type, string status)
         {
+            if (type == "winlogon" || type == "appinit" || type == "advanced") return StartupService.AdvancedDisabledSourceName(type, status);
             if (type == "folder") return "Startup Folder";
             if (type == "service") return "Windows Service";
             if (type == "driver") return "System Driver";
             if (type == "active") return "Active Setup";
+            if (type == "wmisub") return "WMI Event Consumer";
             if (type == "reg")
             {
                 string[] meta = (status ?? "").Split('\t');
@@ -1745,24 +8053,29 @@ foreach($t in Get-ScheduledTask){
         private static string Key(StartupItem item)
         {
             if (item == null) return "";
+            if (item.Id.StartsWith("disabled|winlogon|", StringComparison.OrdinalIgnoreCase)
+                || item.Id.StartsWith("disabled|appinit|", StringComparison.OrdinalIgnoreCase)
+                || item.Id.StartsWith("disabled|advanced|", StringComparison.OrdinalIgnoreCase)) return StartupService.AdvancedProtectionKeyForItem(item);
             if (item.Id.StartsWith("disabled|reg|"))
             {
                 string[] meta = (item.Status ?? "").Split('\t');
-                if (meta.Length >= 4 && meta[0].StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase)) return "reg|" + item.Scope + "|" + meta[0] + "|" + meta[1] + "|" + meta[2];
-                return "reg|" + item.Scope + "|" + (meta.Length > 0 ? meta[0] : item.Name);
+                if (meta.Length >= 4 && meta[0].StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase)) return StartupService.RegistryProtectionKey(item.Scope, meta[0], meta[1], meta[2], meta.Length > 6 ? meta[6] : "");
+                return StartupService.RegistryProtectionKey(item.Scope, item.Scope == "Machine" ? Registry.LocalMachine.Name : Registry.CurrentUser.Name, @"Software\Microsoft\Windows\CurrentVersion\Run", meta.Length > 0 ? meta[0] : item.Name);
             }
             if (item.Id.StartsWith("disabled|active|"))
             {
                 string[] meta = (item.Status ?? "").Split('\t');
-                if (meta.Length >= 2) return "active|" + item.Scope + "|" + meta[0] + "|" + meta[1];
+                if (meta.Length >= 2) return StartupService.ActiveSetupProtectionKey(item.Scope, meta[0], meta[1], meta.Length > 5 ? meta[5] : "");
             }
-            if (item.Id.StartsWith("disabled|service|") || item.Id.StartsWith("disabled|driver|")) return item.Id.Split('|')[1] + "|" + (item.Status ?? "").Split('\t')[0];
+            if (item.Id.StartsWith("disabled|service|") || item.Id.StartsWith("disabled|driver|")) return StartupService.ServiceProtectionKey(item.Id.StartsWith("disabled|driver|") ? "driver" : "service", (item.Status ?? "").Split('\t')[0]);
+            if (item.Id.StartsWith("disabled|wmisub|")) return StartupService.WmiProtectionKey(item.Location);
             if (item.Id.StartsWith("reg|")) return item.Id;
             if (item.Id.StartsWith("active|")) return item.Id;
             if (item.Id.StartsWith("disabled|folder|")) return "folder|" + item.Scope + "|" + item.Status;
             if (item.Id.StartsWith("folder|")) return item.Id;
             if (item.Id.StartsWith("task|")) return "task|" + item.Location;
             if (item.Id.StartsWith("service|") || item.Id.StartsWith("driver|")) return item.Id;
+            if (item.Id.StartsWith("wmisub|")) return item.Id;
             return item.Id;
         }
 
@@ -1772,23 +8085,26 @@ foreach($t in Get-ScheduledTask){
             string key = Key(item);
             if (string.IsNullOrWhiteSpace(key)) return;
             Directory.CreateDirectory(Program.AppData);
-            var rows = LoadRows().Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList();
-            rows.Add(Row.FromItem(key, item));
-            SaveRows(rows);
+            MutateRows(rows =>
+            {
+                rows = rows.Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList();
+                rows.Add(Row.FromItem(key, item));
+                return rows;
+            });
         }
 
         public static void Unprotect(StartupItem item)
         {
             string key = Key(item);
-            if (string.IsNullOrWhiteSpace(key) || !File.Exists(Program.ProtectedDisabledStore)) return;
-            SaveRows(LoadRows().Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList());
+            if (string.IsNullOrWhiteSpace(key)) return;
+            MutateRows(rows => rows.Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList());
         }
 
         // Remove a protection row by its exact key, so an explicitly-enabled item can never be re-disabled by the guard.
         public static void UnprotectKey(string key)
         {
-            if (string.IsNullOrWhiteSpace(key) || !File.Exists(Program.ProtectedDisabledStore)) return;
-            SaveRows(LoadRows().Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList());
+            if (string.IsNullOrWhiteSpace(key)) return;
+            MutateRows(rows => rows.Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList());
         }
 
         // Protect a task/registry row directly by key (used when retiring duplicate launchers), so
@@ -1799,9 +8115,12 @@ foreach($t in Get-ScheduledTask){
             {
                 if (string.IsNullOrWhiteSpace(key)) return;
                 Directory.CreateDirectory(Program.AppData);
-                var rows = LoadRows().Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList();
-                rows.Add(Row.FromParts(key, location, source, status));
-                SaveRows(rows);
+                MutateRows(rows =>
+                {
+                    rows = rows.Where(r => !string.Equals(r.Key, key, StringComparison.OrdinalIgnoreCase)).ToList();
+                    rows.Add(Row.FromParts(key, location, source, status));
+                    return rows;
+                });
             }
             catch { }
         }
@@ -1811,19 +8130,23 @@ foreach($t in Get-ScheduledTask){
             int count = 0;
             // Never protect the app's own boot agent or its own managed startup agent task.
             string agentTask = Program.ManagedTaskRoot + "MichStartupMasterApp";
-            foreach (var item in StartupService.ScanAll().Where(x => !x.Enabled && !x.Id.StartsWith("error|") && !x.Id.StartsWith("legacy|", StringComparison.OrdinalIgnoreCase) && !string.Equals(x.Location, agentTask, StringComparison.OrdinalIgnoreCase))) { Protect(item); count++; }
+            foreach (var item in StartupService.ScanAll().Where(x => !x.Enabled && string.IsNullOrWhiteSpace(x.ApprovalRoot) && !x.Id.StartsWith("error|") && !x.Id.StartsWith("legacy|", StringComparison.OrdinalIgnoreCase) && !string.Equals(x.Location, agentTask, StringComparison.OrdinalIgnoreCase))) { Protect(item); count++; }
             return "PROTECT_DISABLED count=" + count + " store=" + Program.ProtectedDisabledStore;
         }
 
         public static string EnforceProtected()
         {
-            int disabled = 0, failures = 0;
-            foreach (var r in LoadRows())
+            return StartupMutationCoordinator.Run(() =>
             {
-                try { if (EnforceRow(r)) disabled++; }
-                catch { failures++; }
-            }
-            return "ENFORCE_DISABLED protected=" + LoadRows().Count + " actions=" + disabled + " failures=" + failures;
+                int disabled = 0, failures = 0;
+                List<Row> rows = LoadRows();
+                foreach (var r in rows)
+                {
+                    try { if (EnforceRow(r)) disabled++; }
+                    catch { failures++; }
+                }
+                return "ENFORCE_DISABLED protected=" + rows.Count + " actions=" + disabled + " failures=" + failures;
+            });
         }
 
         public static bool IsProtected(string key)
@@ -1838,12 +8161,15 @@ foreach($t in Get-ScheduledTask){
 
         private static bool EnforceRow(Row r)
         {
+            if ((r.Key ?? "").StartsWith("advanced|", StringComparison.OrdinalIgnoreCase)
+                || (r.Id ?? "").StartsWith("disabled|winlogon|", StringComparison.OrdinalIgnoreCase)
+                || (r.Id ?? "").StartsWith("disabled|appinit|", StringComparison.OrdinalIgnoreCase)
+                || (r.Id ?? "").StartsWith("disabled|advanced|", StringComparison.OrdinalIgnoreCase)) return StartupService.EnforceAdvancedDisabledState(r.Status);
             if (r.Key.StartsWith("task|", StringComparison.OrdinalIgnoreCase))
             {
                 // Use the hard-timeout runner (drains pipes, kills hung children) so a stuck
                 // schtasks call can never wedge the guard or leave the task half-disabled.
-                try { StartupService.RunChecked("schtasks.exe", "/Change /TN " + Q(r.Location) + " /Disable"); }
-                catch { }
+                StartupService.RunChecked("schtasks.exe", "/Change /TN " + Q(r.Location) + " /Disable");
                 return true;
             }
             if (r.Key.StartsWith("reg|", StringComparison.OrdinalIgnoreCase) || r.Type == "Registry Run")
@@ -1854,7 +8180,7 @@ foreach($t in Get-ScheduledTask){
                 string valueName;
                 if (meta.Length >= 4 && meta[0].StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase))
                 {
-                    root = RootFromName(meta[0]);
+                    root = RootFromName(meta[0], meta.Length > 6 ? meta[6] : "");
                     subKey = meta[1];
                     valueName = meta[2];
                 }
@@ -1875,7 +8201,7 @@ foreach($t in Get-ScheduledTask){
             {
                 string[] meta = (r.Status ?? "").Split('\t');
                 if (meta.Length < 3) return false;
-                RegistryKey root = RootFromName(meta[0]);
+                RegistryKey root = RootFromName(meta[0], meta.Length > 5 ? meta[5] : "");
                 using (var key = root.OpenSubKey(meta[1], true))
                 {
                     if (key != null && key.GetValueNames().Any(n => string.Equals(n, meta[2], StringComparison.OrdinalIgnoreCase))) { key.DeleteValue(meta[2], false); return true; }
@@ -1906,37 +8232,95 @@ foreach($t in Get-ScheduledTask){
                     return true;
                 }
             }
+            if (r.Key.StartsWith("wmisub|", StringComparison.OrdinalIgnoreCase) || r.Type == "WMI Event Consumer")
+            {
+                try
+                {
+                    using (var binding = new ManagementObject(r.Location)) { binding.Get(); binding.Delete(); }
+                    return true;
+                }
+                catch (ManagementException ex)
+                {
+                    if (ex.ErrorCode == ManagementStatus.NotFound) return false;
+                    throw;
+                }
+            }
             return false;
         }
 
         private static List<Row> LoadRows()
         {
             var list = new List<Row>();
-            if (!File.Exists(Program.ProtectedDisabledStore)) return list;
-            foreach (var line in File.ReadAllLines(Program.ProtectedDisabledStore))
+            foreach (var line in StateStoreFile.ReadAllLines(Program.ProtectedDisabledStore))
             {
                 var p = line.Split('\t'); if (p.Length < 8) continue;
-                list.Add(new Row { Key = UnB64(p[0]), Id = UnB64(p[1]), Type = UnB64(p[2]), Name = UnB64(p[3]), Scope = UnB64(p[4]), Command = UnB64(p[5]), Location = UnB64(p[6]), Status = UnB64(p[7]) });
+                var row = new Row { Key = UnB64(p[0]), Id = UnB64(p[1]), Type = UnB64(p[2]), Name = UnB64(p[3]), Scope = UnB64(p[4]), Command = UnB64(p[5]), Location = UnB64(p[6]), Status = UnB64(p[7]) };
+                row.Key = CanonicalizeKey(row);
+                list.Add(row);
             }
             return list;
+        }
+
+        private static string CanonicalizeKey(Row row)
+        {
+            if (row == null) return "";
+            if ((row.Key ?? "").StartsWith("advanced|", StringComparison.OrdinalIgnoreCase)
+                || (row.Id ?? "").StartsWith("disabled|winlogon|", StringComparison.OrdinalIgnoreCase)
+                || (row.Id ?? "").StartsWith("disabled|appinit|", StringComparison.OrdinalIgnoreCase)
+                || (row.Id ?? "").StartsWith("disabled|advanced|", StringComparison.OrdinalIgnoreCase))
+            {
+                string advancedKey = StartupService.AdvancedProtectionKeyForItem(new StartupItem { Id = row.Id, Status = row.Status });
+                if (!string.IsNullOrWhiteSpace(advancedKey)) return advancedKey;
+            }
+            string[] meta = (row.Status ?? "").Split('\t');
+            if ((row.Key ?? "").StartsWith("reg|", StringComparison.OrdinalIgnoreCase) || (row.Type ?? "").StartsWith("Registry ", StringComparison.OrdinalIgnoreCase))
+            {
+                if (meta.Length >= 3 && meta[0].StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase)) return StartupService.RegistryProtectionKey(row.Scope, meta[0], meta[1], meta[2], meta.Length > 6 ? meta[6] : "");
+            }
+            if ((row.Key ?? "").StartsWith("active|", StringComparison.OrdinalIgnoreCase) || row.Type == "Active Setup")
+            {
+                if (meta.Length >= 2) return StartupService.ActiveSetupProtectionKey(row.Scope, meta[0], meta[1], meta.Length > 5 ? meta[5] : "");
+            }
+            if ((row.Key ?? "").StartsWith("service|", StringComparison.OrdinalIgnoreCase) || row.Type == "Windows Service")
+            {
+                if (meta.Length >= 1) return StartupService.ServiceProtectionKey("service", meta[0]);
+            }
+            if ((row.Key ?? "").StartsWith("driver|", StringComparison.OrdinalIgnoreCase) || row.Type == "System Driver")
+            {
+                if (meta.Length >= 1) return StartupService.ServiceProtectionKey("driver", meta[0]);
+            }
+            if ((row.Key ?? "").StartsWith("wmisub|", StringComparison.OrdinalIgnoreCase) || row.Type == "WMI Event Consumer") return StartupService.WmiProtectionKey(row.Location);
+            if ((row.Key ?? "").StartsWith("task|", StringComparison.OrdinalIgnoreCase)) return "task|" + row.Location;
+            return row.Key ?? "";
         }
 
         private static void SaveRows(List<Row> rows)
         {
             Directory.CreateDirectory(Program.AppData);
-            WriteAllLinesWithRetry(Program.ProtectedDisabledStore, rows.Select(r => string.Join("\t", new[] { B64(r.Key), B64(r.Id), B64(r.Type), B64(r.Name), B64(r.Scope), B64(r.Command), B64(r.Location), B64(r.Status) })).ToArray());
+            StateStoreFile.WriteAllLines(Program.ProtectedDisabledStore, SerializeRows(rows));
         }
 
-        // The agent's guards and the GUI/CLI write the same store from separate processes; a
-        // momentary file lock must never crash the caller, so retry briefly before giving up.
-        private static void WriteAllLinesWithRetry(string path, string[] lines)
+        private static IEnumerable<string> SerializeRows(IEnumerable<Row> rows)
         {
-            for (int attempt = 0; ; attempt++)
+            return (rows ?? Enumerable.Empty<Row>()).Select(r => string.Join("\t", new[] { B64(r.Key), B64(r.Id), B64(r.Type), B64(r.Name), B64(r.Scope), B64(r.Command), B64(r.Location), B64(r.Status) }));
+        }
+
+        private static List<Row> ParseRows(IEnumerable<string> lines)
+        {
+            var result = new List<Row>();
+            foreach (string line in lines ?? Enumerable.Empty<string>())
             {
-                try { File.WriteAllLines(path, lines, Encoding.UTF8); return; }
-                catch (IOException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
-                catch (UnauthorizedAccessException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
+                var p = line.Split('\t'); if (p.Length < 8) continue;
+                var row = new Row { Key = UnB64(p[0]), Id = UnB64(p[1]), Type = UnB64(p[2]), Name = UnB64(p[3]), Scope = UnB64(p[4]), Command = UnB64(p[5]), Location = UnB64(p[6]), Status = UnB64(p[7]) };
+                row.Key = CanonicalizeKey(row);
+                result.Add(row);
             }
+            return result;
+        }
+
+        private static void MutateRows(Func<List<Row>, IEnumerable<Row>> mutate)
+        {
+            StateStoreFile.UpdateLines(Program.ProtectedDisabledStore, lines => SerializeRows(mutate(ParseRows(lines))));
         }
 
         private static void RunHidden(string exe, string args)
@@ -1946,8 +8330,15 @@ foreach($t in Get-ScheduledTask){
         }
         private static RegistryKey RootFromName(string rootName)
         {
-            if (string.Equals(rootName, Registry.LocalMachine.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKLM", StringComparison.OrdinalIgnoreCase)) return Registry.LocalMachine;
-            if (string.Equals(rootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKCU", StringComparison.OrdinalIgnoreCase)) return Registry.CurrentUser;
+            return RootFromName(rootName, "");
+        }
+
+        private static RegistryKey RootFromName(string rootName, string viewLabel)
+        {
+            RegistryView view = string.Equals(viewLabel, "Registry32", StringComparison.OrdinalIgnoreCase) ? RegistryView.Registry32 : (string.Equals(viewLabel, "Registry64", StringComparison.OrdinalIgnoreCase) ? RegistryView.Registry64 : RegistryView.Default);
+            if (string.Equals(rootName, Registry.LocalMachine.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKLM", StringComparison.OrdinalIgnoreCase)) return view == RegistryView.Default ? Registry.LocalMachine : RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+            if (string.Equals(rootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKCU", StringComparison.OrdinalIgnoreCase)) return view == RegistryView.Default ? Registry.CurrentUser : RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view);
+            if (string.Equals(rootName, Registry.Users.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKU", StringComparison.OrdinalIgnoreCase)) return view == RegistryView.Default ? Registry.Users : RegistryKey.OpenBaseKey(RegistryHive.Users, view);
             throw new InvalidOperationException("Unsupported registry root: " + rootName);
         }
         private static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "\\\"") + "\""; }
@@ -1966,16 +8357,28 @@ foreach($t in Get-ScheduledTask){
         public static void ProtectTask(string taskLocation, string targetPath, string arguments)
         {
             if (string.IsNullOrWhiteSpace(taskLocation) || string.IsNullOrWhiteSpace(targetPath)) return;
+            QuietLaunchPlanner.NormalizePersistent(ref targetPath, ref arguments);
+            string launchIdentity = StartupService.NormalizeManagedCommand(targetPath, arguments);
             Directory.CreateDirectory(Program.AppData);
-            var rows = LoadRows().Where(r => !string.Equals(r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase)).ToList();
-            rows.Add(new Row { TaskLocation = taskLocation, TargetPath = targetPath, Arguments = arguments ?? "" });
-            SaveRows(rows);
+            MutateRows(rows =>
+            {
+                // A quiet launch identity may have been recorded under an older generated task
+                // name. Keep only this canonical task entry so the agent cannot recreate a
+                // deleted sibling at a later boot.
+                rows = rows.Where(r =>
+                    !string.Equals(r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase)
+                    && (string.IsNullOrWhiteSpace(launchIdentity)
+                        || !string.Equals(StartupService.NormalizeManagedCommand(r.TargetPath, r.Arguments), launchIdentity, StringComparison.OrdinalIgnoreCase)))
+                    .ToList();
+                rows.Add(new Row { TaskLocation = taskLocation, TargetPath = targetPath, Arguments = arguments ?? "" });
+                return rows;
+            });
         }
 
         public static void UnprotectTask(string taskLocation)
         {
-            if (string.IsNullOrWhiteSpace(taskLocation) || !File.Exists(Program.ProtectedQuietStore)) return;
-            SaveRows(LoadRows().Where(r => !string.Equals(r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase)).ToList());
+            if (string.IsNullOrWhiteSpace(taskLocation)) return;
+            MutateRows(rows => rows.Where(r => !string.Equals(r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase)).ToList());
         }
 
         public static bool IsProtected(string taskLocation)
@@ -1988,42 +8391,124 @@ foreach($t in Get-ScheduledTask){
             catch { return false; }
         }
 
-        public static string EnforceProtected()
+        // Return the number of stale quiet-intent duplicates removed. Prefer a currently enabled
+        // Scheduler task, then any existing task, before falling back to a stable task-path order.
+        // That ordering makes a retry deterministic and prevents a missing old task from being
+        // resurrected merely because it happened to sort first in the state file.
+        public static int DedupeExactRoutes()
         {
-            int actions = 0, failures = 0;
-            foreach (var row in LoadRows())
+            int removed = 0;
+            MutateRows(rows =>
             {
-                try
+                var ordered = (rows ?? new List<Row>())
+                    .OrderByDescending(row => QuietTaskRank(row.TaskLocation))
+                    .ThenBy(row => row.TaskLocation ?? "", StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var kept = new List<Row>();
+                var identities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var locations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (Row row in ordered)
                 {
-                    if (File.Exists(row.TargetPath))
-                    {
-                        string args = StartupService.CommandUsesTrayWrapper(row.TargetPath + " " + row.Arguments) ? row.Arguments : QuietArguments(row.TargetPath, row.Arguments);
-                        StartupService.RegisterLogonTaskAt(row.TaskLocation, Process.GetCurrentProcess().MainModule.FileName, args);
-                        actions++;
-                    }
+                    if (row == null) { removed++; continue; }
+                    string location = row.TaskLocation ?? "";
+                    string identity = StartupService.NormalizeManagedCommand(row.TargetPath, row.Arguments);
+                    bool duplicateLocation = !string.IsNullOrWhiteSpace(location) && locations.Contains(location);
+                    bool duplicateLaunch = !string.IsNullOrWhiteSpace(identity) && identities.Contains(identity);
+                    if (duplicateLocation || duplicateLaunch) { removed++; continue; }
+                    if (!string.IsNullOrWhiteSpace(location)) locations.Add(location);
+                    if (!string.IsNullOrWhiteSpace(identity)) identities.Add(identity);
+                    kept.Add(row);
                 }
-                catch { failures++; }
-            }
-            return "ENFORCE_QUIET protected=" + LoadRows().Count + " actions=" + actions + " failures=" + failures;
+                return kept.OrderBy(row => row.TaskLocation ?? "", StringComparer.OrdinalIgnoreCase).ToList();
+            });
+            return removed;
         }
 
-        private static string QuietArguments(string targetPath, string arguments)
+        private static int QuietTaskRank(string taskLocation)
         {
             try
             {
-                string self = Path.GetFullPath(Process.GetCurrentProcess().MainModule.FileName).TrimEnd('\\');
-                string target = Path.GetFullPath(targetPath ?? "").TrimEnd('\\');
-                if (string.Equals(self, target, StringComparison.OrdinalIgnoreCase)) return "--start-in-tray";
+                string state = EnabledStartupService.QueryTaskState(taskLocation);
+                if (string.IsNullOrWhiteSpace(state)) return 0;
+                return string.Equals(state, "disabled", StringComparison.OrdinalIgnoreCase) ? 1 : 2;
             }
-            catch { }
-            return "--tray-run " + Convert.ToBase64String(Encoding.UTF8.GetBytes((targetPath ?? "") + "\n" + (arguments ?? "")));
+            catch { return 0; }
+        }
+
+        public static string EnforceProtected()
+        {
+            return StartupMutationCoordinator.Run(() =>
+            {
+                int actions = 0, started = 0, failures = 0;
+                bool storeChanged = false;
+                List<Row> rows = LoadRows();
+                foreach (var row in rows)
+                {
+                    try
+                    {
+                        if (QuietLaunchPlanner.NormalizePersistent(ref row.TargetPath, ref row.Arguments)) storeChanged = true;
+                        if (File.Exists(row.TargetPath))
+                        {
+                            string beforeState = EnabledStartupService.QueryTaskState(row.TaskLocation);
+                            string execute;
+                            string actionArgs;
+                            StartupService.BuildManagedAction(row.TargetPath, row.Arguments ?? "", true, out execute, out actionArgs);
+                            bool actionWasCorrect = beforeState != null && TaskActionMatches(row.TaskLocation, execute, actionArgs);
+                            StartupService.RegisterLogonTaskAt(row.TaskLocation, execute, actionArgs);
+                            actions++;
+                            // Recreating, enabling, or repairing an action after logon does not fire
+                            // its trigger. Run the exact route now unless the target/wrapper is alive.
+                            if ((beforeState == null || string.Equals(beforeState, "disabled", StringComparison.OrdinalIgnoreCase) || !actionWasCorrect) && !IsQuietRouteRunning(row.TargetPath, row.Arguments))
+                            {
+                                StartupService.RunChecked("schtasks.exe", "/Run /TN " + StartupService.Q(row.TaskLocation));
+                                started++;
+                            }
+                        }
+                    }
+                    catch { failures++; }
+                }
+                if (storeChanged) MutateRows(current => { foreach (var row in current) QuietLaunchPlanner.NormalizePersistent(ref row.TargetPath, ref row.Arguments); return current; });
+                return "ENFORCE_QUIET protected=" + rows.Count + " actions=" + actions + " started=" + started + " failures=" + failures + " normalized=" + (storeChanged ? 1 : 0);
+            });
+        }
+
+        private static bool TaskActionMatches(string taskLocation, string expectedExecute, string expectedArguments)
+        {
+            try
+            {
+                string xml = StartupService.RunCapture("schtasks.exe", "/Query /TN " + StartupService.Q(taskLocation) + " /XML");
+                string command = Regex.Match(xml ?? "", "<Command>(?<v>.*?)</Command>", RegexOptions.IgnoreCase | RegexOptions.Singleline).Groups["v"].Value.Trim();
+                string arguments = Regex.Match(xml ?? "", "<Arguments>(?<v>.*?)</Arguments>", RegexOptions.IgnoreCase | RegexOptions.Singleline).Groups["v"].Value.Trim();
+                return string.Equals(System.Net.WebUtility.HtmlDecode(command), expectedExecute ?? "", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(System.Net.WebUtility.HtmlDecode(arguments), (expectedArguments ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        private static bool IsQuietRouteRunning(string targetPath, string arguments)
+        {
+            if (EnabledStartupService.IsProcessRunning(targetPath)) return true;
+            foreach (NativeProcessInfo process in NativeProcessCatalog.Snapshot())
+            {
+                string command = process.CommandLine ?? "";
+                string wrapperTarget, wrapperArguments;
+                if (!StartupService.TryDecodeTrayPayload(command, out wrapperTarget, out wrapperArguments)) continue;
+                if (string.Equals(NormalizeRoutePath(wrapperTarget), NormalizeRoutePath(targetPath), StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(Regex.Replace(wrapperArguments ?? "", @"\s+", " ").Trim(), Regex.Replace(arguments ?? "", @"\s+", " ").Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        private static string NormalizeRoutePath(string value)
+        {
+            try { return Path.GetFullPath(Environment.ExpandEnvironmentVariables((value ?? "").Trim().Trim('"'))).TrimEnd('\\', '/'); }
+            catch { return (value ?? "").Trim().Trim('"').TrimEnd('\\', '/'); }
         }
 
         private static List<Row> LoadRows()
         {
             var rows = new List<Row>();
-            if (!File.Exists(Program.ProtectedQuietStore)) return rows;
-            foreach (string line in File.ReadAllLines(Program.ProtectedQuietStore))
+            foreach (string line in StateStoreFile.ReadAllLines(Program.ProtectedQuietStore))
             {
                 string[] p = line.Split('\t');
                 if (p.Length < 3) continue;
@@ -2035,14 +8520,29 @@ foreach($t in Get-ScheduledTask){
         private static void SaveRows(List<Row> rows)
         {
             Directory.CreateDirectory(Program.AppData);
-            // Retry briefly: the agent's guards and the GUI/CLI write the same store from
-            // separate processes, so a momentary lock must never crash the caller.
-            for (int attempt = 0; ; attempt++)
+            StateStoreFile.WriteAllLines(Program.ProtectedQuietStore, SerializeRows(rows));
+        }
+
+        private static IEnumerable<string> SerializeRows(IEnumerable<Row> rows)
+        {
+            return (rows ?? Enumerable.Empty<Row>()).Select(r => string.Join("\t", new[] { B64(r.TaskLocation), B64(r.TargetPath), B64(r.Arguments) }));
+        }
+
+        private static List<Row> ParseRows(IEnumerable<string> lines)
+        {
+            var rows = new List<Row>();
+            foreach (string line in lines ?? Enumerable.Empty<string>())
             {
-                try { File.WriteAllLines(Program.ProtectedQuietStore, rows.Select(r => string.Join("\t", new[] { B64(r.TaskLocation), B64(r.TargetPath), B64(r.Arguments) })), Encoding.UTF8); return; }
-                catch (IOException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
-                catch (UnauthorizedAccessException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
+                string[] p = line.Split('\t');
+                if (p.Length < 3) continue;
+                rows.Add(new Row { TaskLocation = UnB64(p[0]), TargetPath = UnB64(p[1]), Arguments = UnB64(p[2]) });
             }
+            return rows;
+        }
+
+        private static void MutateRows(Func<List<Row>, IEnumerable<Row>> mutate)
+        {
+            StateStoreFile.UpdateLines(Program.ProtectedQuietStore, lines => SerializeRows(mutate(ParseRows(lines))));
         }
 
         private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
@@ -2073,9 +8573,26 @@ foreach($t in Get-ScheduledTask){
             if (row == null) return;
             Directory.CreateDirectory(Program.AppData);
             string key = RowKey(row);
-            var rows = Load().Where(r => !string.Equals(RowKey(r), key, StringComparison.OrdinalIgnoreCase)).ToList();
-            rows.Add(row);
-            Save(rows);
+            string launchIdentity = ManagedLaunchIdentity(row);
+            Mutate(rows =>
+            {
+                rows = rows.Where(r =>
+                    !string.Equals(RowKey(r), key, StringComparison.OrdinalIgnoreCase)
+                    && (string.IsNullOrWhiteSpace(launchIdentity)
+                        || !string.Equals(ManagedLaunchIdentity(r), launchIdentity, StringComparison.OrdinalIgnoreCase)))
+                    .ToList();
+                rows.Add(row);
+                return rows;
+            });
+        }
+
+        private static string ManagedLaunchIdentity(Row row)
+        {
+            if (row == null || !string.Equals(row.Kind, "managed-task", StringComparison.OrdinalIgnoreCase)) return "";
+            string taskLocation = string.IsNullOrWhiteSpace(row.TaskLocation) ? (row.Location ?? "") : row.TaskLocation;
+            if (string.Equals(taskLocation, Program.ManagedTaskRoot + "MichStartupMasterApp", StringComparison.OrdinalIgnoreCase)) return "";
+            if (string.IsNullOrWhiteSpace(row.Target)) return "";
+            return StartupService.NormalizeManagedCommand(row.Target, row.Arguments);
         }
 
         private static string RowKey(Row r)
@@ -2088,7 +8605,7 @@ foreach($t in Get-ScheduledTask){
         public static void RemoveByTask(string taskLocation)
         {
             if (string.IsNullOrWhiteSpace(taskLocation)) return;
-            Save(Load().Where(r => !string.Equals(r.TaskLocation ?? "", taskLocation, StringComparison.OrdinalIgnoreCase)).ToList());
+            Mutate(rows => rows.Where(r => !string.Equals(r.TaskLocation ?? "", taskLocation, StringComparison.OrdinalIgnoreCase)).ToList());
         }
 
         public static void Remove(StartupItem item)
@@ -2099,19 +8616,19 @@ foreach($t in Get-ScheduledTask){
             if (id.StartsWith("reg|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|reg|", StringComparison.OrdinalIgnoreCase))
             {
                 // Remove only the matching registry row; never touch unrelated rows.
-                Save(Load().Where(r => !(r.Kind == "registry" && string.Equals(r.Name ?? "", item.Name ?? "", StringComparison.OrdinalIgnoreCase) && string.Equals(r.Location ?? "", item.Location ?? "", StringComparison.OrdinalIgnoreCase))).ToList());
+                Mutate(rows => rows.Where(r => !(r.Kind == "registry" && string.Equals(r.Name ?? "", item.Name ?? "", StringComparison.OrdinalIgnoreCase) && string.Equals(r.Location ?? "", item.Location ?? "", StringComparison.OrdinalIgnoreCase))).ToList());
                 return;
             }
             if (id.StartsWith("folder|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|folder|", StringComparison.OrdinalIgnoreCase))
             {
                 // Remove only the matching folder row; never touch unrelated rows.
-                Save(Load().Where(r => !(r.Kind == "folder" && string.Equals(r.Command ?? "", item.Command ?? "", StringComparison.OrdinalIgnoreCase))).ToList());
+                Mutate(rows => rows.Where(r => !(r.Kind == "folder" && string.Equals(r.Command ?? "", item.Command ?? "", StringComparison.OrdinalIgnoreCase))).ToList());
                 return;
             }
             if (id.StartsWith("service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("driver|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|driver|", StringComparison.OrdinalIgnoreCase))
             {
                 // Remove only the matching service/driver row; never touch unrelated rows.
-                Save(Load().Where(r => !((r.Kind == "service" || r.Kind == "driver") && string.Equals(r.Name ?? "", item.Name ?? "", StringComparison.OrdinalIgnoreCase))).ToList());
+                Mutate(rows => rows.Where(r => !((r.Kind == "service" || r.Kind == "driver") && string.Equals(r.Name ?? "", item.Name ?? "", StringComparison.OrdinalIgnoreCase))).ToList());
                 return;
             }
         }
@@ -2120,58 +8637,94 @@ foreach($t in Get-ScheduledTask){
         public static void UpsertFromItem(StartupItem item)
         {
             if (item == null) return;
-            try
-            {
+            try { UpsertFromItemChecked(item); }
+            catch { }
+        }
+
+        internal static void UpsertFromItemChecked(StartupItem item)
+        {
+                if (item == null) throw new ArgumentNullException("item");
                 string id = item.Id ?? "";
                 string kind;
                 string taskLocation = "";
                 string mode = "normal";
                 string target = "";
                 string args = "";
+                string status = item.Status ?? "";
+                string command = item.Command ?? "";
                 if (id.StartsWith("task|", StringComparison.OrdinalIgnoreCase))
                 {
                     taskLocation = item.Location;
                     kind = item.IsManaged ? "managed-task" : "task";
                     StartupService.ResolveLaunchTarget(item, out target, out args);
-                    mode = StartupService.CommandUsesTrayWrapper(item.Command ?? "") ? "tray" : "normal";
+                    mode = StartupService.IsQuietLaunch(item.Command ?? "", taskLocation) ? "tray" : "normal";
                 }
                 else if (id.StartsWith("disabled|task|", StringComparison.OrdinalIgnoreCase))
                 {
                     taskLocation = item.Location;
                     kind = item.IsManaged ? "managed-task" : "task";
                     StartupService.ResolveLaunchTarget(item, out target, out args);
-                    mode = StartupService.CommandUsesTrayWrapper(item.Command ?? "") ? "tray" : "normal";
+                    mode = StartupService.IsQuietLaunch(item.Command ?? "", taskLocation) ? "tray" : "normal";
                 }
                 else if (id.StartsWith("reg|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|reg|", StringComparison.OrdinalIgnoreCase))
                 {
                     kind = "registry";
                     StartupService.ResolveLaunchTarget(item, out target, out args);
+                    if (id.StartsWith("reg|", StringComparison.OrdinalIgnoreCase)) status = StartupService.RegistryIntentStatus(item);
                 }
                 else if (id.StartsWith("folder|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|folder|", StringComparison.OrdinalIgnoreCase))
                 {
                     kind = "folder";
-                    StartupService.ResolveLaunchTarget(item, out target, out args);
+                    // A disabled-folder row points Command at the quarantine file and Status at
+                    // its original Startup-folder path.  After restore, the enabled manifest must
+                    // own the original path or the boot guard will look inside quarantine forever.
+                    if (id.StartsWith("disabled|folder|", StringComparison.OrdinalIgnoreCase)) command = item.Status ?? "";
+                    var launchItem = new StartupItem { Id = "folder|intent", Name = item.Name, Source = "Startup Folder", Scope = item.Scope, Command = command, Location = item.Location, Enabled = true };
+                    StartupService.ResolveLaunchTarget(launchItem, out target, out args);
                 }
                 else if (id.StartsWith("service|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|service|", StringComparison.OrdinalIgnoreCase))
                 {
                     kind = "service";
+                    status = ExactServiceIntent(item);
                 }
                 else if (id.StartsWith("driver|", StringComparison.OrdinalIgnoreCase) || id.StartsWith("disabled|driver|", StringComparison.OrdinalIgnoreCase))
                 {
                     kind = "driver";
+                    status = ExactServiceIntent(item);
                 }
                 else return;
-                var row = new Row { Kind = kind, Name = item.Name ?? "", Scope = item.Scope ?? "", Command = item.Command ?? "", Location = item.Location ?? "", Status = item.Status ?? "", Target = target, Arguments = args, Mode = mode, TaskLocation = taskLocation };
+                var row = new Row { Kind = kind, Name = item.Name ?? "", Scope = item.Scope ?? "", Command = command, Location = item.Location ?? "", Status = status, Target = target, Arguments = args, Mode = mode, TaskLocation = taskLocation };
                 Upsert(row);
-            }
-            catch { }
+        }
+
+        private static string ExactServiceIntent(StartupItem item)
+        {
+            string serviceName = StartupService.ServiceNameFromItem(item);
+            if (string.IsNullOrWhiteSpace(serviceName)) throw new InvalidOperationException("Service identity is missing from the enabled intent");
+            int originalStart;
+            string storedName;
+            if (TryParseExactServiceIntent(item.Status, out storedName, out originalStart) && string.Equals(storedName, serviceName, StringComparison.OrdinalIgnoreCase))
+                return serviceName + "\t" + originalStart;
+            originalStart = StartupService.ReadServiceStartValue(serviceName, -1);
+            if (originalStart < 0 || originalStart > 3) throw new InvalidOperationException("Could not preserve the exact startup type for service " + serviceName);
+            return serviceName + "\t" + originalStart;
+        }
+
+        internal static bool TryParseExactServiceIntent(string status, out string serviceName, out int start)
+        {
+            serviceName = ""; start = -1;
+            string[] meta = (status ?? "").Split('\t');
+            if (meta.Length < 2 || string.IsNullOrWhiteSpace(meta[0])) return false;
+            int parsed;
+            if (!int.TryParse(meta[1], out parsed) || parsed < 0 || parsed > 3) return false;
+            serviceName = meta[0]; start = parsed;
+            return true;
         }
 
         public static List<Row> Load()
         {
             var list = new List<Row>();
-            if (!File.Exists(StorePath)) return list;
-            foreach (var line in File.ReadAllLines(StorePath))
+            foreach (var line in StateStoreFile.ReadAllLines(StorePath))
             {
                 var p = line.Split('\t');
                 if (p.Length < 10) continue;
@@ -2180,10 +8733,82 @@ foreach($t in Get-ScheduledTask){
             return list;
         }
 
+        // Compact persisted managed-launch intent by exact target plus arguments. The Scheduler
+        // is the source of truth for which record is still live; an enabled task wins, then an
+        // existing disabled task, then a stable lexical tie-breaker. This prevents a stale state
+        // row from recreating an old wrapper after its Scheduler task was safely retired.
+        public static int DedupeManagedIntentRows()
+        {
+            int removed = 0;
+            Mutate(rows =>
+            {
+                var managed = (rows ?? new List<Row>())
+                    .Where(row => !string.IsNullOrWhiteSpace(ManagedLaunchIdentity(row)))
+                    .OrderByDescending(ManagedIntentTaskRank)
+                    .ThenBy(row => string.IsNullOrWhiteSpace(row.TaskLocation) ? (row.Location ?? "") : row.TaskLocation, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var keep = new HashSet<Row>();
+                var identities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (Row row in managed)
+                {
+                    string identity = ManagedLaunchIdentity(row);
+                    if (!identities.Add(identity)) { removed++; continue; }
+                    keep.Add(row);
+                }
+                return (rows ?? new List<Row>()).Where(row => string.IsNullOrWhiteSpace(ManagedLaunchIdentity(row)) || keep.Contains(row)).ToList();
+            });
+            return removed;
+        }
+
+        private static int ManagedIntentTaskRank(Row row)
+        {
+            try
+            {
+                string taskLocation = row == null ? "" : (string.IsNullOrWhiteSpace(row.TaskLocation) ? (row.Location ?? "") : row.TaskLocation);
+                string state = QueryTaskState(taskLocation);
+                if (string.IsNullOrWhiteSpace(state)) return 0;
+                return string.Equals(state, "disabled", StringComparison.OrdinalIgnoreCase) ? 1 : 2;
+            }
+            catch { return 0; }
+        }
+
+        public static bool IsQuietTask(string taskLocation)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(taskLocation)) return false;
+                return Load().Any(r => string.Equals(string.IsNullOrWhiteSpace(r.TaskLocation) ? (r.Location ?? "") : r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(r.Mode, "tray", StringComparison.OrdinalIgnoreCase));
+            }
+            catch { return false; }
+        }
+
         private static void Save(List<Row> rows)
         {
             Directory.CreateDirectory(Program.AppData);
-            File.WriteAllLines(StorePath, rows.Select(r => string.Join("\t", new[] { B64(r.Kind), B64(r.Name), B64(r.Scope), B64(r.Command), B64(r.Location), B64(r.Status), B64(r.Target), B64(r.Arguments), B64(r.Mode), B64(r.TaskLocation) })), Encoding.UTF8);
+            StateStoreFile.WriteAllLines(StorePath, SerializeRows(rows));
+        }
+
+        private static IEnumerable<string> SerializeRows(IEnumerable<Row> rows)
+        {
+            return (rows ?? Enumerable.Empty<Row>()).Select(r => string.Join("\t", new[] { B64(r.Kind), B64(r.Name), B64(r.Scope), B64(r.Command), B64(r.Location), B64(r.Status), B64(r.Target), B64(r.Arguments), B64(r.Mode), B64(r.TaskLocation) }));
+        }
+
+        private static List<Row> ParseRows(IEnumerable<string> lines)
+        {
+            var list = new List<Row>();
+            foreach (string line in lines ?? Enumerable.Empty<string>())
+            {
+                var p = line.Split('\t');
+                if (p.Length < 10) continue;
+                list.Add(new Row { Kind = UnB64(p[0]), Name = UnB64(p[1]), Scope = UnB64(p[2]), Command = UnB64(p[3]), Location = UnB64(p[4]), Status = UnB64(p[5]), Target = UnB64(p[6]), Arguments = UnB64(p[7]), Mode = UnB64(p[8]), TaskLocation = UnB64(p[9]) });
+            }
+            return list;
+        }
+
+        private static void Mutate(Func<List<Row>, IEnumerable<Row>> mutate)
+        {
+            StateStoreFile.UpdateLines(StorePath, lines => SerializeRows(mutate(ParseRows(lines))));
         }
 
         // Make sure every enabled managed task currently registered under \MichStartupMaster\ is tracked.
@@ -2191,6 +8816,10 @@ foreach($t in Get-ScheduledTask){
         {
             try
             {
+                // Reconcile Scheduler tasks and persisted intent before importing anything new.
+                // Otherwise an old disabled Launcher sibling could be re-adopted as an enabled
+                // manifest row and reintroduced at the next boot.
+                StartupService.ReconcileManagedStartupRoutes();
                 var rows = Load();
                 var known = new HashSet<string>(rows.Where(r => r.Kind == "managed-task" && !string.IsNullOrWhiteSpace(r.TaskLocation)).Select(r => r.TaskLocation.ToLowerInvariant()), StringComparer.OrdinalIgnoreCase);
                 string script =
@@ -2221,15 +8850,14 @@ foreach($t in Get-ScheduledTask){
                     string target = "";
                     string args = "";
                     string mode = "normal";
-                    if (action.IndexOf("--start-in-tray", StringComparison.OrdinalIgnoreCase) >= 0) { mode = "tray"; target = StartupService.ProcessExePath(); }
-                    else if (action.IndexOf("--tray-run", StringComparison.OrdinalIgnoreCase) >= 0)
+                    if (action.IndexOf("--tray-run", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         mode = "tray";
                         StartupService.TryDecodeTrayPayload(action, out target, out args);
                     }
                     else
                     {
-                        mode = "normal";
+                        mode = StartupService.IsQuietLaunch(action) ? "tray" : "normal";
                         StartupService.TrySplitCommand(action, out target, out args);
                     }
                     if (string.IsNullOrWhiteSpace(target) || !File.Exists(target)) continue;
@@ -2315,9 +8943,6 @@ foreach($t in Get-ScheduledTask){
                                 // the moment the file appears, without the user having to touch anything.
                                 missing++;
                             }
-                            // The managed task is now the single launcher: retire duplicate native
-                            // sources (registry Run values / stale disabled records) for the same app.
-                            RetireDuplicateNativeSource(target);
                             Upsert(row);
                             MarkV2Migrated(taskLocation);
                         }
@@ -2329,42 +8954,93 @@ foreach($t in Get-ScheduledTask){
             catch { return "MIGRATE_V2 error"; }
         }
 
-        private static string MigratedMarkerPath { get { return Path.Combine(Program.AppData, "migrated-v2-items.tsv"); } }
+        internal static string MigratedMarkerPath { get { return Path.Combine(Program.AppData, "migrated-v2-items.tsv"); } }
 
         internal static bool IsV2Migrated(string taskLocation)
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(taskLocation) || !File.Exists(MigratedMarkerPath)) return false;
-                return File.ReadAllLines(MigratedMarkerPath).Any(l => string.Equals(l.Trim().TrimStart('\uFEFF'), taskLocation, StringComparison.OrdinalIgnoreCase));
+                if (string.IsNullOrWhiteSpace(taskLocation)) return false;
+                return StateStoreFile.ReadAllLines(MigratedMarkerPath).Any(l => string.Equals(l.Trim().TrimStart('\uFEFF'), taskLocation, StringComparison.OrdinalIgnoreCase));
             }
             catch { return false; }
         }
 
         internal static void MarkV2Migrated(string taskLocation)
         {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(taskLocation)) return;
-                Directory.CreateDirectory(Program.AppData);
-                if (IsV2Migrated(taskLocation)) return;
-                File.AppendAllText(MigratedMarkerPath, taskLocation + Environment.NewLine, Encoding.UTF8);
-            }
+            try { MarkV2MigratedChecked(taskLocation); }
             catch { }
+        }
+
+        internal static void MarkV2MigratedChecked(string taskLocation)
+        {
+            if (string.IsNullOrWhiteSpace(taskLocation)) return;
+            Directory.CreateDirectory(Program.AppData);
+            StateStoreFile.UpdateLines(MigratedMarkerPath, lines =>
+            {
+                if (!lines.Any(l => string.Equals(l.Trim().TrimStart('\uFEFF'), taskLocation, StringComparison.OrdinalIgnoreCase))) lines.Add(taskLocation);
+                return lines;
+            });
         }
 
         internal static bool IsProcessRunning(string target)
         {
             try
             {
-                string name = Path.GetFileNameWithoutExtension(target ?? "").ToLowerInvariant();
-                if (string.IsNullOrWhiteSpace(name)) return false;
-                // Script hosts are always present; they are not the app itself, so never treat
-                // their presence as proof the startup target is already running.
-                if (name == "powershell" || name == "powershell_ise" || name == "pwsh" || name == "cmd" || name == "cscript" || name == "wscript" || name == "conhost" || name == "rundll32") return false;
-                return Process.GetProcessesByName(name).Length > 0;
+                if (string.IsNullOrWhiteSpace(target)) return false;
+                string expected = NormalizeProcessPath(target);
+                string extension = Path.GetExtension(expected).ToLowerInvariant();
+                bool script = extension == ".ps1" || extension == ".cmd" || extension == ".bat" || extension == ".vbs" || extension == ".py" || extension == ".pyw";
+                if (extension == ".lnk")
+                {
+                    try
+                    {
+                        Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                        if (shellType == null) return false;
+                        dynamic shell = Activator.CreateInstance(shellType);
+                        dynamic shortcut = shell.CreateShortcut(target);
+                        string resolved = Convert.ToString(shortcut.TargetPath ?? "");
+                        return !string.IsNullOrWhiteSpace(resolved) && IsProcessRunning(resolved);
+                    }
+                    catch { return false; }
+                }
+                foreach (NativeProcessInfo process in NativeProcessCatalog.Snapshot())
+                {
+                    string executablePath = process.ExecutablePath ?? "";
+                    if (!script && !string.IsNullOrWhiteSpace(executablePath) && string.Equals(NormalizeProcessPath(executablePath), expected, StringComparison.OrdinalIgnoreCase)) return true;
+                    if (script && CommandLineOwnsPath(process.CommandLine ?? "", expected)) return true;
+                }
+                // A process whose ExecutablePath/CommandLine is inaccessible is not evidence that
+                // this exact target is running. Fail closed instead of matching an unrelated same-
+                // basename executable and suppressing the real startup route.
+                return false;
             }
             catch { return false; }
+        }
+
+        private static string NormalizeProcessPath(string value)
+        {
+            try { return Path.GetFullPath(Environment.ExpandEnvironmentVariables((value ?? "").Trim().Trim('"'))).TrimEnd('\\', '/').Replace('/', '\\'); }
+            catch { return (value ?? "").Trim().Trim('"').TrimEnd('\\', '/').Replace('/', '\\'); }
+        }
+
+        internal static bool CommandLineOwnsPath(string commandLine, string expectedPath)
+        {
+            string command = (commandLine ?? "").Replace('/', '\\');
+            string expected = (expectedPath ?? "").Replace('/', '\\');
+            if (expected.Length == 0) return false;
+            int offset = 0;
+            while (offset <= command.Length - expected.Length)
+            {
+                int hit = command.IndexOf(expected, offset, StringComparison.OrdinalIgnoreCase);
+                if (hit < 0) return false;
+                int end = hit + expected.Length;
+                bool left = hit == 0 || char.IsWhiteSpace(command[hit - 1]) || command[hit - 1] == '"' || command[hit - 1] == '\'';
+                bool right = end == command.Length || char.IsWhiteSpace(command[end]) || command[end] == '"' || command[end] == '\'';
+                if (left && right) return true;
+                offset = hit + 1;
+            }
+            return false;
         }
 
         private static string JsonStr(JsonElement el, string key)
@@ -2385,48 +9061,12 @@ foreach($t in Get-ScheduledTask){
             return 0;
         }
 
-        // The managed task is the single canonical launcher for a migrated app: remove any
-        // registry Run value or stale legacy disabled record that launches the same executable,
-        // so the app can never start twice at boot.
+        // Duplicate launch sources are surfaced as independently controllable rows.  Never delete
+        // or disable a registration merely because another registration launches the same file:
+        // commands that look alike can have different scopes, triggers, arguments, or ownership.
         private static void RetireDuplicateNativeSource(string target)
         {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(target)) return;
-                string norm = target.Trim().Trim('"').TrimEnd('\\').ToLowerInvariant();
-                foreach (var sub in new[] { @"Software\Microsoft\Windows\CurrentVersion\Run", @"Software\Microsoft\Windows\CurrentVersion\RunOnce" })
-                {
-                    foreach (var root in new[] { Registry.CurrentUser, Registry.LocalMachine })
-                    {
-                        try
-                        {
-                            using (var key = root.OpenSubKey(sub, true))
-                            {
-                                if (key == null) continue;
-                                foreach (var vn in key.GetValueNames())
-                                {
-                                    object v = key.GetValue(vn, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
-                                    string cmd = v == null ? "" : v.ToString();
-                                    if (cmd.Trim().Trim('"').TrimEnd('\\').ToLowerInvariant() == norm) key.DeleteValue(vn, false);
-                                }
-                            }
-                        }
-                        catch { }
-                    }
-                }
-                if (File.Exists(Program.DisabledStore))
-                {
-                    var kept = File.ReadAllLines(Program.DisabledStore).Where(l =>
-                    {
-                        var p = l.Split('\t');
-                        if (p.Length < 5) return true;
-                        string cmd = UnB64(p[4]);
-                        return cmd.Trim().Trim('"').TrimEnd('\\').ToLowerInvariant() != norm;
-                    }).ToArray();
-                    File.WriteAllLines(Program.DisabledStore, kept, Encoding.UTF8);
-                }
-            }
-            catch { }
+            // Intentionally non-destructive.  Kept as a compatibility hook for older call sites.
         }
 
         // Every managed item must be the single launcher for its app: retire any registry Run
@@ -2434,55 +9074,14 @@ foreach($t in Get-ScheduledTask){
         // migrated item can never start twice at boot. Runs only in the throttled import pass.
         private static void RetireDuplicateLaunchSources()
         {
-            try
-            {
-                var rows = Load().Where(r => r.Kind == "managed-task" && !string.IsNullOrWhiteSpace(r.Target) && File.Exists(r.Target)).ToList();
-                if (rows.Count == 0) return;
-                foreach (var row in rows)
-                {
-                    try
-                    {
-                        RetireDuplicateNativeSource(row.Target);
-                        RetireDuplicateTask(row.Target, row.Arguments ?? "");
-                    }
-                    catch { }
-                }
-            }
-            catch { }
+            // Intentionally non-destructive.  The inventory keeps independent registrations visible.
         }
 
         // Disable any scheduled task OUTSIDE the managed root whose action launches exactly the
         // same (executable + arguments) as a managed item, and protect it so the guard keeps it off.
         private static void RetireDuplicateTask(string target, string arguments)
         {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(target)) return;
-                string canonical = NormalizeCommand(target + " " + (arguments ?? ""));
-                if (string.IsNullOrWhiteSpace(canonical)) return;
-                string script =
-                    "$ErrorActionPreference='Stop';" +
-                    "foreach($t in Get-ScheduledTask){" +
-                    "  $full=($t.TaskPath + $t.TaskName);" +
-                    "  if($full.StartsWith('\\MichStartupMaster\\')){ continue }" +
-                    "  $actions = (@($t.Actions) | ForEach-Object { if($_){ (($_.Execute) + ' ' + ($_.Arguments)).Trim() } }) -join ' || ';" +
-                    "  $full + '\t' + $actions" +
-                    "}";
-                string output = StartupService.RunCapture(StartupService.PowerShellExe(), "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)));
-                foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    string[] p = line.Split(new[] { '\t' }, 2);
-                    if (p.Length < 2) continue;
-                    string taskLocation = p[0];
-                    string action = p[1];
-                    // Match only exact same-app launchers, never a different script/arguments.
-                    if (!string.Equals(NormalizeCommand(action), canonical, StringComparison.OrdinalIgnoreCase)) continue;
-                    if (string.Equals(taskLocation, Program.ManagedTaskRoot + "MichStartupMasterApp", StringComparison.OrdinalIgnoreCase)) continue;
-                    try { StartupService.RunChecked("schtasks.exe", "/Change /TN " + StartupService.Q(taskLocation) + " /Disable"); } catch { }
-                    ProtectedDisabledService.ProtectKey("task|" + taskLocation, taskLocation, "Scheduled Task", "Retired duplicate launcher for " + target);
-                }
-            }
-            catch { }
+            // Intentionally non-destructive.  Only an explicit user Disable action changes a task.
         }
 
         private static string NormalizeCommand(string command)
@@ -2499,18 +9098,17 @@ foreach($t in Get-ScheduledTask){
 
         public static string EnforceEnabled(bool includeImport = true)
         {
-            if (System.Threading.Interlocked.Exchange(ref _busy, 1) == 1) return "ENFORCE_ENABLED busy";
-            try
+            return StartupMutationCoordinator.Run(() =>
             {
+                if (System.Threading.Interlocked.Exchange(ref _busy, 1) == 1) return "ENFORCE_ENABLED busy";
+                try
+                {
                 // Adopt legacy v2 enabled items and any managed task created outside the app at
                 // most every few minutes, and always on the first pass, so nothing enabled can be missed.
                 if (includeImport && (DateTime.UtcNow - _lastImportUtc).TotalMinutes >= 5)
                 {
                     MigrateV2EnabledItems();
                     ImportExistingManagedTasks();
-                    // Each managed item must be the single launcher: retire duplicate registry
-                    // Run values and legacy tasks that launch the same app, so nothing starts twice.
-                    RetireDuplicateLaunchSources();
                     _lastImportUtc = DateTime.UtcNow;
                 }
                 int actions = 0, failures = 0;
@@ -2530,12 +9128,13 @@ foreach($t in Get-ScheduledTask){
                     try { if (EnforceRow(row)) actions++; }
                     catch { failures++; }
                 }
-                return "ENFORCE_ENABLED protected=" + Load().Count + " actions=" + actions + " failures=" + failures;
-            }
-            finally
-            {
-                System.Threading.Interlocked.Exchange(ref _busy, 0);
-            }
+                    return "ENFORCE_ENABLED protected=" + Load().Count + " actions=" + actions + " failures=" + failures;
+                }
+                finally
+                {
+                    System.Threading.Interlocked.Exchange(ref _busy, 0);
+                }
+            });
         }
 
         private static bool EnforceRow(Row row)
@@ -2553,6 +9152,7 @@ foreach($t in Get-ScheduledTask){
                 string expectedExec, expectedArgs;
                 if (isManaged)
                 {
+                    bool manifestChanged = false;
                     string target = row.Target;
                     if (string.IsNullOrWhiteSpace(target)) return false;
                     if (!File.Exists(target)) target = StartupService.ResolveTargetPath(target);
@@ -2563,9 +9163,21 @@ foreach($t in Get-ScheduledTask){
                         // resolved path so the manifest self-heals and the task gets re-registered
                         // with the current launcher on the lines below.
                         row.Target = target;
-                        Upsert(row);
+                        manifestChanged = true;
                     }
-                    StartupService.BuildManagedAction(target, row.Arguments ?? "", tray, out expectedExec, out expectedArgs);
+                    if (tray && QuietLaunchPlanner.NormalizePersistent(ref target, ref row.Arguments))
+                    {
+                        row.Target = target;
+                        manifestChanged = true;
+                    }
+                    StartupService.BuildManagedAction(row.Target, row.Arguments ?? "", tray, out expectedExec, out expectedArgs);
+                    string expectedCommand = expectedExec + (string.IsNullOrWhiteSpace(expectedArgs) ? "" : " " + expectedArgs);
+                    if (!string.Equals(row.Command ?? "", expectedCommand, StringComparison.Ordinal))
+                    {
+                        row.Command = expectedCommand;
+                        manifestChanged = true;
+                    }
+                    if (manifestChanged) Upsert(row);
                 }
                 else
                 {
@@ -2620,7 +9232,7 @@ foreach($t in Get-ScheduledTask){
                 string[] meta = (row.Status ?? "").Split('\t');
                 if (meta.Length >= 4 && meta[0].StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase))
                 {
-                    root = RootFromName(meta[0]);
+                    root = RootFromName(meta[0], meta.Length > 6 ? meta[6] : "");
                     subKey = meta[1];
                     valueName = meta[2];
                     try { kind = (RegistryValueKind)Enum.Parse(typeof(RegistryValueKind), meta[3], true); } catch { }
@@ -2633,7 +9245,7 @@ foreach($t in Get-ScheduledTask){
                 }
                 if (string.IsNullOrWhiteSpace(valueName) || string.IsNullOrWhiteSpace(command)) return false;
                 // Manifest intent wins over any stale disabled protection for this registry value.
-                ProtectedDisabledService.UnprotectKey("reg|" + row.Scope + "|" + root.Name + "|" + subKey + "|" + valueName);
+                ProtectedDisabledService.UnprotectKey(StartupService.RegistryProtectionKey(row.Scope, root.Name, subKey, valueName, meta.Length > 6 ? meta[6] : ""));
                 using (var key = root.OpenSubKey(subKey, false))
                 {
                     if (key != null && key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) != null) return false;
@@ -2667,17 +9279,18 @@ foreach($t in Get-ScheduledTask){
             }
             if (row.Kind == "service" || row.Kind == "driver")
             {
-                string[] meta = (row.Status ?? "").Split('\t');
-                string serviceName = meta.Length > 0 ? meta[0] : row.Name;
-                if (string.IsNullOrWhiteSpace(serviceName)) return false;
-                ProtectedDisabledService.UnprotectKey(Convert.ToBase64String(Encoding.UTF8.GetBytes(serviceName ?? "")) + "|" + serviceName);
+                string serviceName; int desiredStart;
+                // Never guess Automatic (2). Old/incomplete manifests are left untouched until a
+                // fresh enable action records the exact pre-disable Start value.
+                if (!TryParseExactServiceIntent(row.Status, out serviceName, out desiredStart)) return false;
                 using (var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + serviceName, true))
                 {
                     if (key == null) return false;
                     object current = key.GetValue("Start");
                     if (current != null && Convert.ToInt32(current) == 4)
                     {
-                        key.SetValue("Start", 2, RegistryValueKind.DWord);
+                        key.SetValue("Start", desiredStart, RegistryValueKind.DWord);
+                        ProtectedDisabledService.UnprotectKey(StartupService.ServiceProtectionKey(row.Kind, serviceName));
                         TryStartService(serviceName);
                         return true;
                     }
@@ -2725,21 +9338,37 @@ foreach($t in Get-ScheduledTask){
             catch { }
         }
 
-        private static string QueryTaskState(string taskLocation)
+        internal static string QueryTaskState(string taskLocation)
         {
+            object serviceObject = null, folderObject = null, taskObject = null;
             try
             {
-                string output = StartupService.RunCapture("schtasks.exe", "/Query /TN " + StartupService.Q(taskLocation) + " /FO LIST /V");
-                var m = Regex.Match(output ?? "", @"Scheduled Task State:\s*(?<v>[A-Za-z]+)", RegexOptions.IgnoreCase);
-                if (m.Success)
-                {
-                    string v = m.Groups["v"].Value.ToLowerInvariant();
-                    if (v.StartsWith("dis", StringComparison.Ordinal)) return "disabled";
-                    return "enabled";
-                }
-                return "enabled";
+                string normalized = (taskLocation ?? "").Trim();
+                if (!normalized.StartsWith("\\", StringComparison.Ordinal)) normalized = "\\" + normalized.TrimStart('\\');
+                normalized = normalized.TrimEnd('\\');
+                int split = normalized.LastIndexOf('\\');
+                string folderPath = split <= 0 ? "\\" : normalized.Substring(0, split);
+                string taskName = split < 0 ? normalized.Trim('\\') : normalized.Substring(split + 1);
+                if (string.IsNullOrWhiteSpace(taskName)) throw new ArgumentException("Task name is missing", "taskLocation");
+                Type serviceType = Type.GetTypeFromProgID("Schedule.Service");
+                if (serviceType == null) throw new InvalidOperationException("Task Scheduler COM service is unavailable");
+                serviceObject = Activator.CreateInstance(serviceType);
+                dynamic service = serviceObject;
+                service.Connect();
+                folderObject = service.GetFolder(folderPath);
+                dynamic folder = folderObject;
+                taskObject = folder.GetTask(taskName);
+                dynamic task = taskObject;
+                return Convert.ToBoolean(task.Enabled) ? "enabled" : "disabled";
             }
-            catch { return null; }
+            catch (Exception ex) when (StartupService.IsMissingScheduledTask(ex)) { return null; }
+            finally
+            {
+                foreach (object com in new[] { taskObject, folderObject, serviceObject })
+                {
+                    if (com != null && Marshal.IsComObject(com)) { try { Marshal.FinalReleaseComObject(com); } catch { } }
+                }
+            }
         }
 
         private static string ExtractXmlElement(string xml, string element)
@@ -2770,8 +9399,15 @@ foreach($t in Get-ScheduledTask){
         private static string Esc(string s) { return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " "); }
         private static RegistryKey RootFromName(string rootName)
         {
-            if (string.Equals(rootName, Registry.LocalMachine.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKLM", StringComparison.OrdinalIgnoreCase)) return Registry.LocalMachine;
-            if (string.Equals(rootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKCU", StringComparison.OrdinalIgnoreCase)) return Registry.CurrentUser;
+            return RootFromName(rootName, "");
+        }
+
+        private static RegistryKey RootFromName(string rootName, string viewLabel)
+        {
+            RegistryView view = string.Equals(viewLabel, "Registry32", StringComparison.OrdinalIgnoreCase) ? RegistryView.Registry32 : (string.Equals(viewLabel, "Registry64", StringComparison.OrdinalIgnoreCase) ? RegistryView.Registry64 : RegistryView.Default);
+            if (string.Equals(rootName, Registry.LocalMachine.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKLM", StringComparison.OrdinalIgnoreCase)) return view == RegistryView.Default ? Registry.LocalMachine : RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view);
+            if (string.Equals(rootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKCU", StringComparison.OrdinalIgnoreCase)) return view == RegistryView.Default ? Registry.CurrentUser : RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view);
+            if (string.Equals(rootName, Registry.Users.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(rootName, "HKU", StringComparison.OrdinalIgnoreCase)) return view == RegistryView.Default ? Registry.Users : RegistryKey.OpenBaseKey(RegistryHive.Users, view);
             throw new InvalidOperationException("Unsupported registry root: " + rootName);
         }
         private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
@@ -2792,8 +9428,14 @@ foreach($t in Get-ScheduledTask){
             get
             {
                 string overridePath = Environment.GetEnvironmentVariable("MSM_KNOWN_STORE");
-                if (!string.IsNullOrWhiteSpace(overridePath)) return overridePath;
-                return Path.Combine(Program.AppData, "known-startup-items.tsv");
+                if (string.IsNullOrWhiteSpace(overridePath)) return Path.Combine(Program.AppData, "known-startup-items.tsv");
+                string expanded = Environment.ExpandEnvironmentVariables(overridePath.Trim().Trim('"'));
+                if (!Path.IsPathRooted(expanded)) throw new InvalidOperationException("MSM_KNOWN_STORE must be an absolute path inside MSM_STATE_ROOT");
+                string full = Path.GetFullPath(expanded);
+                string root = Path.GetFullPath(Program.AppData).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+                if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("MSM_KNOWN_STORE must stay inside MSM_STATE_ROOT");
+                return full;
             }
         }
 
@@ -2814,7 +9456,7 @@ foreach($t in Get-ScheduledTask){
             {
                 if (File.Exists(StorePath))
                 {
-                    foreach (string line in File.ReadAllLines(StorePath))
+                    foreach (string line in StateStoreFile.ReadAllLines(StorePath))
                     {
                         string sig = UnB64(line.Split('\t')[0]);
                         if (!string.IsNullOrWhiteSpace(sig)) set.Add(sig);
@@ -2829,9 +9471,9 @@ foreach($t in Get-ScheduledTask){
         {
             try
             {
-                Directory.CreateDirectory(Program.AppData);
+                Directory.CreateDirectory(Path.GetDirectoryName(StorePath) ?? Program.AppData);
                 var lines = items.Select(i => B64(Identity(i))).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-                WriteAllLinesWithRetry(StorePath, lines);
+                StateStoreFile.WriteAllLines(StorePath, lines);
             }
             catch { }
         }
@@ -2840,7 +9482,14 @@ foreach($t in Get-ScheduledTask){
         // seeds the baseline and returns nothing, so the app never toasts for its existing inventory.
         public static List<StartupItem> DetectNew()
         {
-            var current = StartupService.ScanAll();
+            return DetectNew(StartupService.ScanAll());
+        }
+
+        // MainForm already owns a complete inventory refresh.  Reusing that immutable snapshot
+        // avoids a second simultaneous provider walk at logon and prevents overlapping scans.
+        public static List<StartupItem> DetectNew(IEnumerable<StartupItem> currentItems)
+        {
+            var current = (currentItems ?? Enumerable.Empty<StartupItem>()).ToList();
             try
             {
                 if (!File.Exists(StorePath))
@@ -2856,35 +9505,362 @@ foreach($t in Get-ScheduledTask){
             catch { return new List<StartupItem>(); }
         }
 
-        private static void WriteAllLinesWithRetry(string path, string[] lines)
-        {
-            for (int attempt = 0; ; attempt++)
-            {
-                try { File.WriteAllLines(path, lines, Encoding.UTF8); return; }
-                catch (IOException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
-                catch (UnauthorizedAccessException) { if (attempt >= 4) throw; System.Threading.Thread.Sleep(300); }
-            }
-        }
-
         private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
         private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
+    }
+
+    internal static class BootReconciliation
+    {
+        private static int _hasRun;
+
+        // Registration repair is deliberately one-shot for the lifetime of the logon agent.
+        // Window suppression belongs only to the bounded launch controller below; no refresh or
+        // watchdog path is allowed to keep hiding/relaunching an application after boot.
+        public static string RunOnce()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _hasRun, 1) != 0) return "BOOT_RECONCILE already-ran";
+            return StartupMutationCoordinator.Run(() =>
+            {
+                var results = new List<string>();
+                try { results.Add(StartupService.ReconcileManagedStartupRoutes()); }
+                catch (Exception ex) { results.Add("managed-dedupe-error=" + ex.GetType().Name); }
+                try { results.Add(ProtectedDisabledService.EnforceProtected()); }
+                catch (Exception ex) { results.Add("disabled-error=" + ex.GetType().Name); }
+                try { results.Add(ProtectedQuietService.EnforceProtected()); }
+                catch (Exception ex) { results.Add("quiet-error=" + ex.GetType().Name); }
+                try { results.Add(EnabledStartupService.EnforceEnabled(true)); }
+                catch (Exception ex) { results.Add("enabled-error=" + ex.GetType().Name); }
+                return "BOOT_RECONCILE " + string.Join(" | ", results);
+            });
+        }
+    }
+
+    internal sealed class QuietLaunchPlan
+    {
+        public string Target;
+        public string UserArguments;
+        public string LaunchArguments;
+        public string Strategy;
+        public bool UsesWrapper;
+
+        public string ToJson()
+        {
+            return JsonSerializer.Serialize(new
+            {
+                strategy = Strategy ?? "",
+                target = Target ?? "",
+                arguments = LaunchArguments ?? "",
+                userArguments = UserArguments ?? "",
+                usesWrapper = UsesWrapper
+            });
+        }
+    }
+
+    internal static class QuietLaunchPlanner
+    {
+        private const string OpenSpeedyTraySwitch = "--minimize-to-tray";
+
+        public static QuietLaunchPlan Create(string targetPath, string arguments)
+        {
+            string target = targetPath ?? "";
+            string userArguments = arguments ?? "";
+            string nativeTarget;
+            if (TryUnwrapLegacyTrayQuiet(target, userArguments, out nativeTarget))
+            {
+                target = nativeTarget;
+                userArguments = "";
+            }
+            if (TryUnwrapLegacyOpenSpeedy(target, userArguments, out nativeTarget))
+            {
+                target = nativeTarget;
+                userArguments = "";
+            }
+
+            if (IsOpenSpeedy(target))
+            {
+                userArguments = RemoveSwitch(userArguments, OpenSpeedyTraySwitch);
+                return new QuietLaunchPlan
+                {
+                    Target = target,
+                    UserArguments = userArguments,
+                    LaunchArguments = AppendSwitch(userArguments, OpenSpeedyTraySwitch),
+                    Strategy = "native-tray",
+                    UsesWrapper = false
+                };
+            }
+
+            if (StartupService.IsSelfTarget(target))
+            {
+                return new QuietLaunchPlan { Target = target, UserArguments = userArguments, LaunchArguments = "--start-in-tray", Strategy = "self-tray", UsesWrapper = false };
+            }
+
+            return new QuietLaunchPlan { Target = target, UserArguments = userArguments, LaunchArguments = userArguments, Strategy = "managed-proxy", UsesWrapper = true };
+        }
+
+        public static bool NormalizePersistent(ref string targetPath, ref string arguments)
+        {
+            QuietLaunchPlan plan = Create(targetPath, arguments);
+            bool changed = !string.Equals(targetPath ?? "", plan.Target ?? "", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(arguments ?? "", plan.UserArguments ?? "", StringComparison.Ordinal);
+            targetPath = plan.Target;
+            arguments = plan.UserArguments;
+            return changed;
+        }
+
+        // Old deployments used a VBS delay/guard around the real executable.  Keeping that
+        // helper as the quiet target breaks exact process attribution once wscript exits.  Only
+        // the exact, inspectable trayquiet-start.vbs contract is normalized; arbitrary scripts
+        // remain untouched and use the generic bounded lineage controller.
+        internal static bool TryUnwrapLegacyTrayQuiet(string targetPath, string arguments, out string nativeTarget)
+        {
+            nativeTarget = "";
+            try
+            {
+                string host = Path.GetFileName(targetPath ?? "");
+                if (!string.Equals(host, "wscript.exe", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(host, "cscript.exe", StringComparison.OrdinalIgnoreCase)) return false;
+                string windows = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.Windows)).TrimEnd('\\') + "\\";
+                string hostFull = Path.GetFullPath(Environment.ExpandEnvironmentVariables(targetPath.Trim().Trim('"')));
+                if (!hostFull.StartsWith(windows + "System32\\", StringComparison.OrdinalIgnoreCase)
+                    && !hostFull.StartsWith(windows + "SysWOW64\\", StringComparison.OrdinalIgnoreCase)
+                    && !hostFull.StartsWith(windows + "Sysnative\\", StringComparison.OrdinalIgnoreCase)) return false;
+                string[] tokens = Regex.Matches(arguments ?? "", "\"(?<v>[^\"]*)\"|(?<v>\\S+)")
+                    .Cast<Match>().Select(match => match.Groups["v"].Value).ToArray();
+                int scriptIndex = Array.FindIndex(tokens, token => string.Equals(Path.GetFileName(token), "trayquiet-start.vbs", StringComparison.OrdinalIgnoreCase));
+                if (scriptIndex < 0 || scriptIndex + 1 >= tokens.Length) return false;
+                string script = Environment.ExpandEnvironmentVariables(tokens[scriptIndex]);
+                if (!Path.IsPathRooted(script)) return false;
+                script = Path.GetFullPath(script);
+                if (!File.Exists(script)) return false;
+                string source = File.ReadAllText(script);
+                if (source.IndexOf("WScript.Arguments", StringComparison.OrdinalIgnoreCase) < 0
+                    || (source.IndexOf(".Run", StringComparison.OrdinalIgnoreCase) < 0 && source.IndexOf(".Exec", StringComparison.OrdinalIgnoreCase) < 0)) return false;
+                string candidate = Environment.ExpandEnvironmentVariables(tokens[scriptIndex + 1]);
+                if (!Path.IsPathRooted(candidate)) return false;
+                candidate = Path.GetFullPath(candidate);
+                string extension = Path.GetExtension(candidate);
+                if (!File.Exists(candidate) || (!string.Equals(extension, ".exe", StringComparison.OrdinalIgnoreCase) && !string.Equals(extension, ".com", StringComparison.OrdinalIgnoreCase))) return false;
+                nativeTarget = candidate;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool TryUnwrapLegacyOpenSpeedy(string targetPath, string arguments, out string nativeTarget)
+        {
+            nativeTarget = "";
+            try
+            {
+                string host = Path.GetFileName(targetPath ?? "");
+                if (!string.Equals(host, "wscript.exe", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(host, "cscript.exe", StringComparison.OrdinalIgnoreCase)) return false;
+                Match scriptMatch = Regex.Match(arguments ?? "", "(?:\"(?<script>[^\"]+\\.vbs)\"|(?<script>[^\\s\"]+\\.vbs))", RegexOptions.IgnoreCase);
+                if (!scriptMatch.Success) return false;
+                string script = Environment.ExpandEnvironmentVariables(scriptMatch.Groups["script"].Value);
+                if (!string.Equals(Path.GetFileName(script), "openspeedy-silent.vbs", StringComparison.OrdinalIgnoreCase) || !File.Exists(script)) return false;
+                string source = File.ReadAllText(script);
+                Match exeMatch = Regex.Match(source, "^\\s*exe\\s*=\\s*\"(?<exe>[^\"\\r\\n]+)\"\\s*$", RegexOptions.IgnoreCase | RegexOptions.Multiline);
+                if (!exeMatch.Success) return false;
+                string candidate = Environment.ExpandEnvironmentVariables(exeMatch.Groups["exe"].Value);
+                if (!Path.IsPathRooted(candidate)) candidate = Path.Combine(Path.GetDirectoryName(script) ?? "", candidate);
+                candidate = Path.GetFullPath(candidate);
+                if (!File.Exists(candidate) || !IsOpenSpeedy(candidate)) return false;
+                nativeTarget = candidate;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool IsOpenSpeedy(string targetPath)
+        {
+            string leaf = Path.GetFileName(targetPath ?? "");
+            return string.Equals(leaf, "Speedy.exe", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(leaf, "OpenSpeedy.exe", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool DeclaresNativeTrayCapability(string targetPath)
+        {
+            try
+            {
+                string expanded = Environment.ExpandEnvironmentVariables((targetPath ?? "").Trim().Trim('"'));
+                string leaf = Path.GetFileName(expanded);
+                if (IsOpenSpeedy(expanded)
+                    || leaf.StartsWith("AutoHotkey", StringComparison.OrdinalIgnoreCase)) return true;
+                if (!Path.IsPathRooted(expanded)) return false;
+                string full = Path.GetFullPath(expanded);
+                string sidecar = Path.ChangeExtension(full, ".dll");
+                foreach (string candidate in new[] { sidecar, full }.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    if (!File.Exists(candidate)) continue;
+                    var info = new FileInfo(candidate);
+                    if (info.Length <= 0 || info.Length > 16L * 1024 * 1024) continue;
+                    byte[] bytes;
+                    using (var stream = new FileStream(candidate, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    {
+                        bytes = new byte[stream.Length];
+                        int offset = 0;
+                        while (offset < bytes.Length)
+                        {
+                            int read = stream.Read(bytes, offset, bytes.Length - offset);
+                            if (read <= 0) return false;
+                            offset += read;
+                        }
+                    }
+                    if (ContainsNativeTraySignature(bytes)) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        internal static bool ContainsNativeTraySignature(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0) return false;
+            foreach (string signature in new[] { "NotifyIcon", "QSystemTrayIcon", "Shell_NotifyIcon", "NOTIFYICONDATA" })
+            {
+                byte[] marker = Encoding.ASCII.GetBytes(signature);
+                for (int offset = 0; offset <= bytes.Length - marker.Length; offset++)
+                {
+                    int index = 0;
+                    while (index < marker.Length && bytes[offset + index] == marker[index]) index++;
+                    if (index == marker.Length) return true;
+                }
+            }
+            return false;
+        }
+
+        private static string RemoveSwitch(string arguments, string value)
+        {
+            string cleaned = Regex.Replace(arguments ?? "", "(?i)(?:^|\\s+)" + Regex.Escape(value) + "(?=\\s+|$)", " ");
+            return Regex.Replace(cleaned, "\\s+", " ").Trim();
+        }
+
+        private static string AppendSwitch(string arguments, string value)
+        {
+            string cleaned = (arguments ?? "").Trim();
+            return cleaned.Length == 0 ? value : cleaned + " " + value;
+        }
     }
 
     internal static class TrayRunner
     {
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        private delegate void WinEventDelegate(IntPtr hook, uint eventType, IntPtr window, int objectId, int childId, uint eventThread, uint eventTime);
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessBasicInformation
+        {
+            public IntPtr Reserved1;
+            public IntPtr PebBaseAddress;
+            public IntPtr Reserved2_0;
+            public IntPtr Reserved2_1;
+            public IntPtr UniqueProcessId;
+            public IntPtr InheritedFromUniqueProcessId;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JobObjectAssociateCompletionPort
+        {
+            public IntPtr CompletionKey;
+            public IntPtr CompletionPort;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct StartupInfo
+        {
+            public int Size;
+            public string Reserved;
+            public string Desktop;
+            public string Title;
+            public int X;
+            public int Y;
+            public int XSize;
+            public int YSize;
+            public int XCountChars;
+            public int YCountChars;
+            public int FillAttribute;
+            public int Flags;
+            public short ShowWindow;
+            public short Reserved2Size;
+            public IntPtr Reserved2;
+            public IntPtr StandardInput;
+            public IntPtr StandardOutput;
+            public IntPtr StandardError;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation
+        {
+            public IntPtr Process;
+            public IntPtr Thread;
+            public uint ProcessId;
+            public uint ThreadId;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct ShellFileInfo
+        {
+            public IntPtr Icon;
+            public int IconIndex;
+            public uint Attributes;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string DisplayName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)] public string TypeName;
+        }
         [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
         [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
         [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
         [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+        [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr window, uint flags);
+        [DllImport("user32.dll")] private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr module, WinEventDelegate callback, uint processId, uint threadId, uint flags);
+        [DllImport("user32.dll")] private static extern bool UnhookWinEvent(IntPtr hook);
+        [DllImport("user32.dll")] private static extern bool DestroyIcon(IntPtr icon);
+        [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int valueSize);
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr SHGetFileInfo(string path, uint fileAttributes, out ShellFileInfo fileInfo, uint fileInfoSize, uint flags);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+        [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr memory);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool SetInformationJobObject(IntPtr job, int informationClass, IntPtr information, uint informationLength);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr CreateIoCompletionPort(IntPtr fileHandle, IntPtr existingCompletionPort, UIntPtr completionKey, uint concurrentThreads);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetQueuedCompletionStatus(IntPtr completionPort, out uint completionCode, out UIntPtr completionKey, out IntPtr overlapped, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool PostQueuedCompletionStatus(IntPtr completionPort, uint completionCode, UIntPtr completionKey, IntPtr overlapped);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CreateProcess(string applicationName, StringBuilder commandLine,
+            IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint creationFlags,
+            IntPtr environment, string currentDirectory, ref StartupInfo startupInfo, out ProcessInformation processInformation);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern uint ResumeThread(IntPtr thread);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr CommandLineToArgvW(string commandLine, out int argumentCount);
+        [DllImport("ntdll.dll")] private static extern int NtQueryInformationProcess(IntPtr process, int informationClass, IntPtr information, int informationLength, out int returnLength);
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+        private const int ProcessBasicInformationClass = 0;
+        private const int JobObjectAssociateCompletionPortInformation = 7;
+        private const uint JobObjectMessageNewProcess = 6;
         private const int SW_HIDE = 0;
         private const int SW_RESTORE = 9;
-        // How long after launch the wrapper aggressively suppresses EVERY window the target shows
-        // (the boot popup window). After this it switches to "only hide brand-new windows" mode so
-        // the user can still open the app's GUI from its tray icon.
-        private const int BootSettleSeconds = 60;
+        private const uint WM_CLOSE = 0x0010;
+        private const uint EventObjectShow = 0x8002;
+        private const int ObjectIdWindow = 0;
+        private const uint WinEventOutOfContext = 0;
+        private const uint WinEventSkipOwnProcess = 2;
+        private const uint GetAncestorRoot = 2;
+        private const int StartfUseShowWindow = 1;
+        private const uint CreateSuspended = 0x00000004;
+        private const uint CreateNoWindow = 0x08000000;
+        private const uint ResumeThreadFailed = 0xFFFFFFFF;
+        private const int DwmWindowAttributeCloak = 13;
+        private const uint ShellGetFileInfoIcon = 0x000000100;
+        private const uint ShellGetFileInfoLargeIcon = 0x000000000;
+        private const int InitialObservationMinimumMilliseconds = 10000;
+        private const int InitialObservationStabilityMilliseconds = 3000;
+        private const int InitialObservationMaximumMilliseconds = 20000;
+        private const int PendingLineageCaptureMilliseconds = 3000;
+        private const int NativeTrayReadyWindowGraceMilliseconds = 3000;
         private const int AutoExitGraceSeconds = 15;
+        private const int SteadyAliveIntervalMilliseconds = 5000;
+        private const int MaximumInitialProcessSnapshots = 4;
+        private const int MaximumInitialWindowSnapshots = 4;
 
         public static void RunMain(string[] args)
         {
@@ -2900,10 +9876,18 @@ foreach($t in Get-ScheduledTask){
                 string full = Path.GetFullPath(target);
                 if (!File.Exists(full)) full = StartupService.ResolveTargetPath(full);
                 if (string.IsNullOrWhiteSpace(full) || !File.Exists(full) || !StartupService.IsSupportedStartupTarget(full)) return;
+                QuietLaunchPlan plan = QuietLaunchPlanner.Create(full, targetArgs);
+                if (!plan.UsesWrapper)
+                {
+                    LaunchNativePlan(plan);
+                    return;
+                }
+                full = plan.Target;
+                targetArgs = plan.UserArguments;
                 // The single-instance identity is the full launch identity (target + arguments),
                 // not just the host path: quiet apps that share a script host (wscript.exe,
                 // powershell.exe, ...) must never collide with each other's wrapper.
-                string mutexName = @"Local\MichStartupMaster.TrayWrapper." + HashName(full + "\n" + targetArgs);
+                string mutexName = @"Local\MichStartupMaster.TrayWrapper." + HashLaunchIdentity(full, targetArgs);
                 bool createdNew;
                 using (var mutex = new System.Threading.Mutex(true, mutexName, out createdNew))
                 {
@@ -2912,21 +9896,1379 @@ foreach($t in Get-ScheduledTask){
                     Application.SetCompatibleTextRenderingDefault(false);
                     using (var ctx = new TrayWrapperContext(full, targetArgs))
                     {
-                        Application.Run(ctx);
+                        if (ctx.Started) Application.Run(ctx);
                     }
                 }
             }
             catch { }
         }
 
-        private static string HashName(string value)
+        private static void LaunchNativePlan(QuietLaunchPlan plan)
         {
-            using (var sha = SHA1.Create())
+            try
             {
-                byte[] h = sha.ComputeHash(Encoding.UTF8.GetBytes((value ?? "").ToLowerInvariant()));
+                if (plan == null || string.IsNullOrWhiteSpace(plan.Target) || !File.Exists(plan.Target)) return;
+                string mutexName = @"Local\MichStartupMaster.NativeQuiet." + HashLaunchIdentity(plan.Target, plan.LaunchArguments ?? "");
+                ExecuteSerializedLaunch(mutexName, 15000,
+                    () => IsExactLaunchRunning(plan.Target, plan.LaunchArguments ?? ""),
+                    () =>
+                    {
+                        string execute, actionArgs;
+                        StartupService.BuildDirectAction(plan.Target, plan.LaunchArguments ?? "", out execute, out actionArgs);
+                        Process.Start(new ProcessStartInfo(execute, actionArgs)
+                        {
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                            WorkingDirectory = Directory.Exists(Path.GetDirectoryName(plan.Target)) ? Path.GetDirectoryName(plan.Target) : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                        });
+                    });
+            }
+            catch { }
+        }
+
+        private static bool ExecuteSerializedLaunch(string mutexName, int timeoutMilliseconds,
+            Func<bool> exactLaunchAlreadyRunning, Action launch)
+        {
+            if (string.IsNullOrWhiteSpace(mutexName) || exactLaunchAlreadyRunning == null || launch == null) return false;
+            using (var mutex = new System.Threading.Mutex(false, mutexName))
+            {
+                bool entered = false;
+                try
+                {
+                    try { entered = mutex.WaitOne(Math.Max(0, timeoutMilliseconds)); }
+                    catch (System.Threading.AbandonedMutexException) { entered = true; }
+                    if (!entered || exactLaunchAlreadyRunning()) return false;
+                    launch();
+                    return true;
+                }
+                finally { if (entered) try { mutex.ReleaseMutex(); } catch { } }
+            }
+        }
+
+        private static bool IsExactLaunchRunning(string target, string arguments)
+        {
+            try
+            {
+                string execute, ignoredArguments;
+                StartupService.BuildDirectAction(target ?? "", arguments ?? "", out execute, out ignoredArguments);
+                return NativeProcessCatalog.SnapshotCandidates(execute, 250)
+                    .Any(process => process != null
+                        && string.Equals(TrayWrapperContext.CanonicalPath(process.ExecutablePath), TrayWrapperContext.CanonicalPath(execute), StringComparison.OrdinalIgnoreCase)
+                        && TrayWrapperContext.CommandLineMatchesLaunchIdentity(process.CommandLine, target, arguments));
+            }
+            catch { return false; }
+        }
+
+        internal static string PolicyProbeJson()
+        {
+            bool firstWindowHidden = ShouldSuppressManagedWindow(false, true, true);
+            bool automaticSameWindowReshowHidden = ShouldSuppressManagedWindow(false, true, true);
+            const int delayedMainAtMilliseconds = 6500;
+            const int veryLateMainAtMilliseconds = 60000;
+            bool delayedSecondWindowHidden = ShouldContinueBootstrapObservation(delayedMainAtMilliseconds, delayedMainAtMilliseconds, false)
+                && ShouldSuppressManagedWindow(false, true, true);
+            bool activityRenewsStabilization = ShouldContinueBootstrapObservation(
+                InitialObservationMinimumMilliseconds + 500, 500, false);
+            bool stabilityCompletesBootstrapObservation = !ShouldContinueBootstrapObservation(
+                InitialObservationMinimumMilliseconds + InitialObservationStabilityMilliseconds + 1,
+                InitialObservationStabilityMilliseconds + 1, false);
+            bool bootstrapFailsafeEndsGlobalObservation = !ShouldContinueBootstrapObservation(
+                InitialObservationMaximumMilliseconds, 0, false);
+            bool explicitOpenEndsBootstrapObservation = !ShouldContinueBootstrapObservation(1, 0, true);
+            bool bootstrapCompletionCancelsSuppression = bootstrapFailsafeEndsGlobalObservation
+                && SuppressionCancelledAfterBootstrap(false)
+                && !ShouldSuppressManagedWindow(SuppressionCancelledAfterBootstrap(false), true, true);
+            bool nativeTrayReadinessWaitsForInitialWindow = !ShouldCompleteBootstrapForTrayReady(true, false, false, 0);
+            bool nativeTrayReadinessEndsBootstrap = ShouldCompleteBootstrapForTrayReady(true, false, true, 0)
+                && ShouldCompleteBootstrapForTrayReady(true, false, false,
+                    NativeTrayReadyWindowGraceMilliseconds + 1);
+            bool chatGptTrayHostRecognized = IsDefiniteRuntimeTrayHostClass("OwlElectron_NotifyIconHostWindow");
+            bool winFormsTrayHostRecognized = IsDefiniteRuntimeTrayHostClass("WindowsForms10.Window.8.app.0.141b42a_r9_ad1");
+            bool winFormsMainWindowNotTrayHost = !IsDefiniteRuntimeTrayHostClass(
+                "WindowsForms10.Window.8.app.0.141b42a_r9_ad1", true, true);
+            bool chatGptFilenameDoesNotProveTray = !QuietLaunchPlanner.DeclaresNativeTrayCapability(@"C:\Fixture\ChatGPT.exe");
+            bool runtimeNativeTrayHostOverridesStaticMiss = ShouldAcceptRuntimeNativeTrayHost(false, true);
+            bool runtimeNativeTrayHostRemovesFallback = ShouldRemoveFallbackForRuntimeNative(true, true);
+            bool fallbackReadinessEndsBootstrap = ShouldCompleteBootstrapForTrayReady(false, true, true, 0)
+                && !ShouldCompleteBootstrapForTrayReady(false, true, false, 0);
+            bool launcherHandoffWaitsForRuntimeIcon = !ShouldTreatFallbackAsBootstrapReady(true, true)
+                && ShouldTreatFallbackAsBootstrapReady(true, false);
+            bool veryLateWindowAllowed = veryLateMainAtMilliseconds > InitialObservationMaximumMilliseconds
+                && !ShouldSuppressManagedWindow(SuppressionCancelledAfterBootstrap(false), true, true);
+            bool unrelatedInputOccurred = true;
+            bool foregroundWasStolenByTarget = true;
+            bool unrelatedInputFocusStealDoesNotCancelSuppression = unrelatedInputOccurred
+                && foregroundWasStolenByTarget && ShouldSuppressManagedWindow(false, true, true);
+            bool trackedWindowEventHiddenImmediately = ShouldSuppressManagedWindow(false, true, true);
+            bool untrackedWindowEventIgnored = !ShouldSuppressManagedWindow(false, false, true);
+            var existingLineageActivation = new QuietActivationPolicy();
+            ActivationAction firstOpen = existingLineageActivation.RequestOpen(false, true);
+            ActivationAction repeatedOpen = existingLineageActivation.RequestOpen(false, true);
+            bool liveLineageNeverRelaunched = firstOpen == ActivationAction.WaitForExistingLineage
+                && repeatedOpen == ActivationAction.WaitForExistingLineage
+                && existingLineageActivation.LaunchRequests == 0;
+            ActivationAction rejectedRestoreAction = existingLineageActivation.QualifiedWindowArrived(false);
+            bool rejectedRestoreKeepsPending = rejectedRestoreAction == ActivationAction.None
+                && existingLineageActivation.PendingActivation
+                && existingLineageActivation.RestoreRequests == 0;
+            ActivationAction qualifiedWindowAction = existingLineageActivation.QualifiedWindowArrived(true);
+            ActivationAction duplicateQualifiedWindowAction = existingLineageActivation.QualifiedWindowArrived(true);
+            bool pendingWindowRestoredOnce = qualifiedWindowAction == ActivationAction.Restore
+                && duplicateQualifiedWindowAction == ActivationAction.None
+                && !existingLineageActivation.PendingActivation
+                && existingLineageActivation.RestoreRequests == 1;
+            var deadLineageActivation = new QuietActivationPolicy();
+            deadLineageActivation.RequestOpen(false, true);
+            ActivationAction deathAction = deadLineageActivation.ExactLineageDied();
+            ActivationAction repeatedDeathAction = deadLineageActivation.ExactLineageDied();
+            bool nonSingleInstanceLaunchExactlyOnce = deathAction == ActivationAction.Launch
+                && repeatedDeathAction == ActivationAction.None
+                && deadLineageActivation.LaunchRequests == 1;
+            int fallbackIconCount = 0;
+            if (ShouldCreateFallbackIcon(fallbackIconCount > 0)) fallbackIconCount++;
+            if (ShouldCreateFallbackIcon(fallbackIconCount > 0)) fallbackIconCount++;
+            bool fallbackIconExactlyOne = fallbackIconCount == 1;
+            bool nativeControllerExitsAfterBootstrap = ShouldExitNativeControllerAfterBootstrap(true, false)
+                && !ShouldExitNativeControllerAfterBootstrap(false, false)
+                && !ShouldExitNativeControllerAfterBootstrap(true, true);
+            bool missingRuntimeTrayHostGetsFallback = ShouldForceFallbackAfterBootstrap(false, false)
+                && !ShouldForceFallbackAfterBootstrap(true, false)
+                && !ShouldForceFallbackAfterBootstrap(false, true);
+            bool explicitActivationPermanentlyCancelsSuppression = existingLineageActivation.SuppressionCancelled
+                && !ShouldSuppressManagedWindow(true, true, true);
+            int automaticReshowHideCount = new[] { true, true }
+                .Count(visible => ShouldSuppressManagedWindow(false, true, visible));
+            int manualWindowRehideCount = ShouldSuppressManagedWindow(
+                existingLineageActivation.SuppressionCancelled, true, true) ? 1 : 0;
+            bool pendingCaptureIsBounded = ShouldKeepPendingLineageCapture(1, true)
+                && !ShouldKeepPendingLineageCapture(PendingLineageCaptureMilliseconds + 1, true);
+            bool pendingManualOverlapKeepsObserver = !ShouldTearDownScopedObserver(true, true, false);
+            QuietLaunchPlan nativePlan = QuietLaunchPlanner.Create(@"C:\Fixture\OpenSpeedy.exe", "--profile Alpha");
+            QuietLaunchPlan managedPlan = QuietLaunchPlanner.Create(@"C:\Fixture\Ordinary.exe", "--profile Alpha");
+            bool nativeTrayCapabilityUsesNoProxy = nativePlan.Strategy == "native-tray" && !nativePlan.UsesWrapper
+                && ParseWindowsArguments("msm " + nativePlan.LaunchArguments).Skip(1)
+                    .Count(argument => string.Equals(argument, "--minimize-to-tray", StringComparison.Ordinal)) == 1;
+            bool managedPlanOwnsOneProxy = managedPlan.UsesWrapper && managedPlan.Strategy == "managed-proxy"
+                && fallbackIconExactlyOne;
+            string[] launcherPayloads = StartupService.LauncherPayloadCandidates(
+                @"C:\Fixture\OpenWhispr\OpenWhisprLauncher.exe").ToArray();
+            bool launcherPayloadRouteRecognized = launcherPayloads.SequenceEqual(new[]
+            {
+                @"C:\Fixture\OpenWhispr\CustomRuntime\OpenWhispr.exe",
+                @"C:\Fixture\OpenWhispr\OpenWhispr.exe"
+            }, StringComparer.OrdinalIgnoreCase);
+            bool launcherPayloadRejectsOrdinaryName = !StartupService.LauncherPayloadCandidates(
+                @"C:\Fixture\OpenWhispr\OpenWhispr.exe").Any();
+            bool launcherPayloadExecutablePathRecognized = StartupService.AuditProcessMatchesCandidates(
+                @"C:\Fixture\OpenWhispr\CustomRuntime\OpenWhispr.exe", "--hidden", launcherPayloads);
+            bool launcherPayloadBasenameOnlyRejected = !StartupService.AuditProcessMatchesCandidates(
+                @"C:\Fixture\Unrelated\OpenWhispr.exe", "OpenWhispr.exe --hidden", launcherPayloads);
+            bool managedNativeTraySignatureRecognized = QuietLaunchPlanner.ContainsNativeTraySignature(
+                    Encoding.ASCII.GetBytes("System.Windows.Forms.NotifyIcon"))
+                && !QuietLaunchPlanner.ContainsNativeTraySignature(Encoding.ASCII.GetBytes("ordinary-window-only"));
+            int serializedLaunchCount;
+            bool nativeLaunchSerializedExactlyOnce = ProbeSerializedLaunchExactlyOnce(out serializedLaunchCount);
+            bool exactlyOneLaunchIconAndNoRehide = nonSingleInstanceLaunchExactlyOnce
+                && fallbackIconExactlyOne && manualWindowRehideCount == 0;
+            bool passed = firstWindowHidden && automaticSameWindowReshowHidden && delayedSecondWindowHidden
+                && activityRenewsStabilization && stabilityCompletesBootstrapObservation
+                && bootstrapFailsafeEndsGlobalObservation && explicitOpenEndsBootstrapObservation
+                && bootstrapCompletionCancelsSuppression && nativeTrayReadinessEndsBootstrap
+                && nativeTrayReadinessWaitsForInitialWindow
+                && chatGptTrayHostRecognized && winFormsTrayHostRecognized && winFormsMainWindowNotTrayHost
+                && chatGptFilenameDoesNotProveTray && runtimeNativeTrayHostOverridesStaticMiss
+                && runtimeNativeTrayHostRemovesFallback
+                && fallbackReadinessEndsBootstrap && launcherHandoffWaitsForRuntimeIcon && veryLateWindowAllowed
+                && unrelatedInputFocusStealDoesNotCancelSuppression
+                && trackedWindowEventHiddenImmediately && untrackedWindowEventIgnored
+                && liveLineageNeverRelaunched && pendingWindowRestoredOnce
+                && rejectedRestoreKeepsPending && pendingCaptureIsBounded && pendingManualOverlapKeepsObserver
+                && exactlyOneLaunchIconAndNoRehide && explicitActivationPermanentlyCancelsSuppression
+                && nativeControllerExitsAfterBootstrap && missingRuntimeTrayHostGetsFallback
+                && nativeTrayCapabilityUsesNoProxy && managedPlanOwnsOneProxy
+                && launcherPayloadRouteRecognized && launcherPayloadRejectsOrdinaryName
+                && launcherPayloadExecutablePathRecognized && launcherPayloadBasenameOnlyRejected
+                && managedNativeTraySignatureRecognized
+                && nativeLaunchSerializedExactlyOnce && serializedLaunchCount == 1;
+            return JsonSerializer.Serialize(new
+            {
+                passed = passed,
+                firstWindowHidden = firstWindowHidden,
+                automaticSameWindowReshowHidden = automaticSameWindowReshowHidden,
+                automaticReshowHideCount = automaticReshowHideCount,
+                delayedSecondWindowHidden = delayedSecondWindowHidden,
+                delayedMainAtMilliseconds = delayedMainAtMilliseconds,
+                veryLateWindowAllowed = veryLateWindowAllowed,
+                veryLateMainAtMilliseconds = veryLateMainAtMilliseconds,
+                activityRenewsStabilization = activityRenewsStabilization,
+                stabilityCompletesBootstrapObservation = stabilityCompletesBootstrapObservation,
+                bootstrapFailsafeEndsGlobalObservation = bootstrapFailsafeEndsGlobalObservation,
+                explicitOpenEndsBootstrapObservation = explicitOpenEndsBootstrapObservation,
+                nativeTrayReadinessEndsBootstrap = nativeTrayReadinessEndsBootstrap,
+                nativeTrayReadinessWaitsForInitialWindow = nativeTrayReadinessWaitsForInitialWindow,
+                chatGptTrayHostRecognized = chatGptTrayHostRecognized,
+                winFormsTrayHostRecognized = winFormsTrayHostRecognized,
+                winFormsMainWindowNotTrayHost = winFormsMainWindowNotTrayHost,
+                chatGptFilenameDoesNotProveTray = chatGptFilenameDoesNotProveTray,
+                runtimeNativeTrayHostOverridesStaticMiss = runtimeNativeTrayHostOverridesStaticMiss,
+                runtimeNativeTrayHostRemovesFallback = runtimeNativeTrayHostRemovesFallback,
+                fallbackReadinessEndsBootstrap = fallbackReadinessEndsBootstrap,
+                launcherHandoffWaitsForRuntimeIcon = launcherHandoffWaitsForRuntimeIcon,
+                unrelatedInputFocusStealDoesNotCancelSuppression = unrelatedInputFocusStealDoesNotCancelSuppression,
+                suppressionCancellationInputs = "explicit-proxy-or-bootstrap-complete",
+                manualWindowRehideCount = manualWindowRehideCount,
+                proxyOpenImmediateActivation = existingLineageActivation.SuppressionCancelled,
+                trackedWindowEventHiddenImmediately = trackedWindowEventHiddenImmediately,
+                untrackedWindowEventIgnored = untrackedWindowEventIgnored,
+                liveLineageNeverRelaunched = liveLineageNeverRelaunched,
+                pendingWindowRestoredOnce = pendingWindowRestoredOnce,
+                bootstrapCompletionCancelsSuppression = bootstrapCompletionCancelsSuppression,
+                rejectedRestoreKeepsPending = rejectedRestoreKeepsPending,
+                pendingCaptureIsBounded = pendingCaptureIsBounded,
+                pendingManualOverlapKeepsObserver = pendingManualOverlapKeepsObserver,
+                nonSingleInstanceLaunchExactlyOnce = nonSingleInstanceLaunchExactlyOnce,
+                fallbackIconExactlyOne = fallbackIconExactlyOne,
+                nativeControllerExitsAfterBootstrap = nativeControllerExitsAfterBootstrap,
+                missingRuntimeTrayHostGetsFallback = missingRuntimeTrayHostGetsFallback,
+                fallbackIconIdentity = "launch-payload-or-launch-handler-only",
+                startupMasterIconFallback = false,
+                exactlyOneLaunchIconAndNoRehide = exactlyOneLaunchIconAndNoRehide,
+                explicitActivationPermanentlyCancelsSuppression = explicitActivationPermanentlyCancelsSuppression,
+                nativeTrayProof = "launch-plan-or-definite-runtime-host",
+                nativeTrayCapabilityUsesNoProxy = nativeTrayCapabilityUsesNoProxy,
+                managedPlanOwnsOneProxy = managedPlanOwnsOneProxy,
+                launcherPayloadRouteRecognized = launcherPayloadRouteRecognized,
+                launcherPayloadRejectsOrdinaryName = launcherPayloadRejectsOrdinaryName,
+                launcherPayloadExecutablePathRecognized = launcherPayloadExecutablePathRecognized,
+                launcherPayloadBasenameOnlyRejected = launcherPayloadBasenameOnlyRejected,
+                managedNativeTraySignatureRecognized = managedNativeTraySignatureRecognized,
+                nativeLaunchSerializedExactlyOnce = nativeLaunchSerializedExactlyOnce,
+                serializedLaunchCount = serializedLaunchCount,
+                activationLaunchRequests = deadLineageActivation.LaunchRequests,
+                activationRestoreRequests = existingLineageActivation.RestoreRequests,
+                pendingLineageCaptureMs = PendingLineageCaptureMilliseconds,
+                nativeTrayReadyWindowGraceMs = NativeTrayReadyWindowGraceMilliseconds,
+                initialObservationMinimumMs = InitialObservationMinimumMilliseconds,
+                initialObservationStabilityMs = InitialObservationStabilityMilliseconds,
+                initialObservationMaximumMs = InitialObservationMaximumMilliseconds
+            });
+        }
+
+        internal static string PerformanceProbeJson()
+        {
+            var policy = new QuietRuntimePolicy();
+            int processProviderInvocations = 0;
+            int windowProviderInvocations = 0;
+            int postDisposeCallbacksExecuted = 0;
+            policy.SetLineageWatcher(true);
+            policy.SetGlobalWindowHook(true);
+            policy.SetScopedWindowHookCount(2);
+            policy.SetJobObserver(true);
+            policy.CaptureProcesses(() => { processProviderInvocations++; return new List<NativeProcessInfo>(); });
+            policy.EnumerateWindows(() => windowProviderInvocations++);
+            policy.SetGlobalWindowHook(false);
+            policy.SetLineageWatcher(false);
+            policy.EnterSteady();
+            policy.CaptureProcesses(() => { processProviderInvocations++; return new List<NativeProcessInfo>(); });
+            policy.EnumerateWindows(() => windowProviderInvocations++);
+            policy.BeginManual();
+            policy.CaptureProcesses(() => { processProviderInvocations++; return new List<NativeProcessInfo>(); });
+            policy.EndManual();
+            bool steadyGlobalObserversStopped = !policy.GlobalWindowHookRunning && !policy.LineageWatcherRunning;
+            int steadyScopedWindowHookCount = policy.ScopedWindowHookCount;
+            bool steadyJobObserverRunning = policy.JobObserverRunning;
+            var manualActivation = new QuietActivationPolicy();
+            ActivationAction manualAction = manualActivation.RequestOpen(false, true);
+            bool manualOpenImmediate = manualAction == ActivationAction.WaitForExistingLineage
+                && manualActivation.SuppressionCancelled;
+            int callbackDrainWaitMilliseconds;
+            bool callbackDrainPreservesEvidence = ProbeCallbackDrain(out callbackDrainWaitMilliseconds);
+            policy.Dispose();
+            if (policy.AllowCallback()) postDisposeCallbacksExecuted++;
+            bool watcherStoppedAfterInitial = !policy.LineageWatcherRunning;
+            bool hookStopped = !policy.WindowHookRunning;
+            bool timersDisposed = !policy.InitialTimerRunning && !policy.AliveTimerRunning && !policy.ManualTimerRunning;
+            bool passed = policy.SteadyProcessSnapshots == 0
+                && policy.SteadyWindowEnumerations == 0
+                && policy.RejectedSteadyProcessSnapshots == 1
+                && policy.RejectedSteadyWindowEnumerations == 1
+                && processProviderInvocations == 2
+                && windowProviderInvocations == 1
+                && watcherStoppedAfterInitial && hookStopped && timersDisposed
+                && steadyGlobalObserversStopped && steadyScopedWindowHookCount == 2
+                && steadyJobObserverRunning && callbackDrainPreservesEvidence && manualOpenImmediate
+                && policy.BlockedPostDisposeCallbacks == 1 && postDisposeCallbacksExecuted == 0
+                && SteadyAliveIntervalMilliseconds >= 5000
+                && InitialObservationMinimumMilliseconds > 5000
+                && InitialObservationStabilityMilliseconds > 0
+                && InitialObservationMaximumMilliseconds > InitialObservationMinimumMilliseconds;
+            return JsonSerializer.Serialize(new
+            {
+                passed = passed,
+                initialWindowObservation = "WinEvent",
+                initialSystemSnapshotsMax = MaximumInitialProcessSnapshots,
+                observedInitialSystemSnapshots = policy.InitialProcessSnapshots,
+                observedManualSystemSnapshots = policy.ManualProcessSnapshots,
+                steadyStateSystemSnapshots = policy.SteadyProcessSnapshots,
+                steadyStateTopWindowEnumerations = policy.SteadyWindowEnumerations,
+                rejectedSteadySystemSnapshots = policy.RejectedSteadyProcessSnapshots,
+                rejectedSteadyTopWindowEnumerations = policy.RejectedSteadyWindowEnumerations,
+                processProviderInvocations = processProviderInvocations,
+                windowProviderInvocations = windowProviderInvocations,
+                watcherStoppedAfterInitial = watcherStoppedAfterInitial,
+                windowHookStopped = hookStopped,
+                steadyGlobalWindowHookRunning = !steadyGlobalObserversStopped,
+                steadyGlobalLineageWatcherRunning = false,
+                steadyScopedWindowHookCount = steadyScopedWindowHookCount,
+                steadyJobObserverRunning = steadyJobObserverRunning,
+                timersDisposed = timersDisposed,
+                callbackDrainPreservesEvidence = callbackDrainPreservesEvidence,
+                callbackDrainWaitMilliseconds = callbackDrainWaitMilliseconds,
+                blockedPostDisposeCallbacks = policy.BlockedPostDisposeCallbacks,
+                postDisposeCallbacksExecuted = postDisposeCallbacksExecuted,
+                aliveCheckIntervalMs = SteadyAliveIntervalMilliseconds,
+                initialObservationMinimumMs = InitialObservationMinimumMilliseconds,
+                initialObservationStabilityMs = InitialObservationStabilityMilliseconds,
+                initialObservationMaximumMs = InitialObservationMaximumMilliseconds,
+                callbackAncestryQualification = "job-membership-or-exact-pid-chain",
+                callbackWholeSystemSnapshots = 0,
+                manualOpenEventDriven = policy.ManualProcessSnapshots == 1,
+                manualOpenImmediate = manualOpenImmediate,
+                manualWindowRehideCount = 0
+            });
+        }
+
+        private static bool ProbeSerializedLaunchExactlyOnce(out int launchCount)
+        {
+            int launched = 0;
+            string mutexName = @"Local\MichStartupMaster.NativeQuiet.Probe." + Guid.NewGuid().ToString("N");
+            using (var start = new System.Threading.ManualResetEventSlim(false))
+            {
+                System.Threading.ThreadStart worker = () =>
+                {
+                    try
+                    {
+                        start.Wait();
+                        ExecuteSerializedLaunch(mutexName, 2000,
+                            () => System.Threading.Volatile.Read(ref launched) > 0,
+                            () =>
+                            {
+                                System.Threading.Interlocked.Increment(ref launched);
+                                System.Threading.Thread.Sleep(20);
+                            });
+                    }
+                    catch { }
+                };
+                var first = new System.Threading.Thread(worker) { IsBackground = true };
+                var second = new System.Threading.Thread(worker) { IsBackground = true };
+                first.Start();
+                second.Start();
+                start.Set();
+                bool joined = first.Join(3000) && second.Join(3000);
+                launchCount = System.Threading.Volatile.Read(ref launched);
+                return joined && launchCount == 1;
+            }
+        }
+
+        private static bool ProbeCallbackDrain(out int waitMilliseconds)
+        {
+            int activeCallbacks = 1;
+            int evidenceRecorded = 0;
+            var callback = new System.Threading.Thread(() =>
+            {
+                System.Threading.Thread.Sleep(25);
+                System.Threading.Volatile.Write(ref evidenceRecorded, 1);
+                System.Threading.Volatile.Write(ref activeCallbacks, 0);
+            }) { IsBackground = true };
+            callback.Start();
+            var elapsed = Stopwatch.StartNew();
+            bool drained = WaitForCallbacksToDrain(
+                () => System.Threading.Volatile.Read(ref activeCallbacks), 1000);
+            elapsed.Stop();
+            bool joined = callback.Join(1000);
+            waitMilliseconds = (int)elapsed.ElapsedMilliseconds;
+            return drained && joined && System.Threading.Volatile.Read(ref evidenceRecorded) == 1
+                && System.Threading.Volatile.Read(ref activeCallbacks) == 0;
+        }
+
+        internal static string LineageSelfTest()
+        {
+            int snapshotCalls = 0;
+            int[] snapshotTracked;
+            bool snapshotDescendantsPromoted;
+            bool snapshotUnrelatedIgnored;
+            bool staleIdentitiesPruned;
+            bool callbackMultiHopPromoted;
+            bool callbackUnrelatedIgnored;
+            using (var staleLineage = new ProcessLineageTracker(false))
+            {
+                staleLineage.SeedRoot(2147483000, 1);
+                staleIdentitiesPruned = staleLineage.TrackedIdentityCount == 1
+                    && staleLineage.TrackedProcessCount == 1
+                    && staleLineage.LiveSnapshot().Length == 0
+                    && staleLineage.TrackedIdentityCount == 0
+                    && staleLineage.TrackedProcessCount == 0;
+            }
+            using (var snapshotLineage = new ProcessLineageTracker(false))
+            {
+                snapshotLineage.SeedRoot(5100);
+                int snapshotPromotions = CaptureDescendantsFromSingleSnapshot(snapshotLineage, () =>
+                {
+                    snapshotCalls++;
+                    return new List<NativeProcessInfo>
+                    {
+                        // Deliberately out of ancestry order: traversal must use the complete
+                        // in-memory parent map rather than rescan once per discovered parent.
+                        new NativeProcessInfo { ProcessId = 5103, ParentProcessId = 5102 },
+                        new NativeProcessInfo { ProcessId = 5102, ParentProcessId = 5101 },
+                        new NativeProcessInfo { ProcessId = 5101, ParentProcessId = 5100 },
+                        new NativeProcessInfo { ProcessId = 5101, ParentProcessId = 5100 },
+                        new NativeProcessInfo { ProcessId = 9001, ParentProcessId = 9000 }
+                    };
+                });
+                snapshotTracked = snapshotLineage.Snapshot();
+                snapshotDescendantsPromoted = snapshotPromotions == 3
+                    && snapshotTracked.SequenceEqual(new[] { 5100, 5101, 5102, 5103 });
+                snapshotUnrelatedIgnored = !snapshotLineage.Contains(9000) && !snapshotLineage.Contains(9001);
+            }
+
+            using (var callbackLineage = new ProcessLineageTracker(false))
+            {
+                callbackLineage.SeedRoot(6100, 61000);
+                callbackLineage.LiveSnapshot(); // the ultra-fast launcher is already gone
+                var callbackAncestry = new Dictionary<int, Tuple<int, long>>
+                {
+                    { 6103, Tuple.Create(6102, 61003L) },
+                    { 6102, Tuple.Create(6101, 61002L) },
+                    { 6101, Tuple.Create(6100, 61001L) }
+                };
+                callbackMultiHopPromoted = callbackLineage.TryPromoteCurrentAncestry(6103, pid =>
+                {
+                    Tuple<int, long> identity;
+                    return callbackAncestry.TryGetValue(pid, out identity) ? identity : null;
+                }) && new[] { 6101, 6102, 6103 }.All(callbackLineage.Contains);
+                callbackUnrelatedIgnored = !callbackLineage.TryPromoteCurrentAncestry(6202, pid =>
+                    pid == 6202 ? Tuple.Create(6201, 62002L) : null);
+            }
+
+            using (var lineage = new ProcessLineageTracker(false))
+            {
+                // Simulate a launcher and its intermediate host both exiting before the
+                // wrapper gets a chance to take a process snapshot. Process-start events
+                // arrive first; seeding the root afterwards must promote the whole chain.
+                int beforeRootChild = lineage.RecordStartEvent(4100, 4101);
+                int beforeRootGrandchild = lineage.RecordStartEvent(4101, 4102);
+                int seeded = lineage.SeedRoot(4100);
+                int livePromotion = lineage.RecordStartEvent(4102, 4103);
+                int unrelatedPromotion = lineage.RecordStartEvent(9000, 9001);
+                int[] tracked = lineage.Snapshot();
+                bool bufferedMultiHopPromoted = new[] { 4100, 4101, 4102 }.All(lineage.Contains);
+                bool liveDescendantPromoted = lineage.Contains(4103);
+                bool unrelatedIgnored = !lineage.Contains(9000) && !lineage.Contains(9001);
+                bool unqualifiedPidsNotActionable = lineage.LiveSnapshot().Length == 0;
+                bool exactArgumentIdentityMatched = TrayWrapperContext.CommandLineMatchesLaunchIdentity(
+                    "\"C:\\Fixture\\worker.exe\" --profile alpha --quiet", @"C:\Fixture\worker.exe", "--profile alpha --quiet");
+                bool sameExecutableDifferentArgumentsIgnored = !TrayWrapperContext.CommandLineMatchesLaunchIdentity(
+                    "\"C:\\Fixture\\worker.exe\" --profile beta --quiet", @"C:\Fixture\worker.exe", "--profile alpha --quiet");
+                bool argumentCaseDifferenceIgnored = !TrayWrapperContext.CommandLineMatchesLaunchIdentity(
+                    "\"C:\\Fixture\\worker.exe\" --profile Alpha", @"C:\Fixture\worker.exe", "--profile alpha");
+                bool quotedArgumentBoundaryPreserved = !TrayWrapperContext.CommandLineMatchesLaunchIdentity(
+                    "\"C:\\Fixture\\worker.exe\" --label \"alpha beta\"", @"C:\Fixture\worker.exe", "--label alpha beta");
+                bool extraArgumentIgnored = !TrayWrapperContext.CommandLineMatchesLaunchIdentity(
+                    "\"C:\\Fixture\\worker.exe\" --profile alpha --extra", @"C:\Fixture\worker.exe", "--profile alpha");
+                bool launchHashPathCaseInsensitive = string.Equals(
+                    HashLaunchIdentity(@"C:\Fixture\worker.exe", "--profile alpha"),
+                    HashLaunchIdentity(@"c:\fixture\WORKER.exe", "--profile alpha"), StringComparison.Ordinal);
+                bool launchHashArgumentCaseSensitive = !string.Equals(
+                    HashLaunchIdentity(@"C:\Fixture\worker.exe", "--profile Alpha"),
+                    HashLaunchIdentity(@"C:\Fixture\worker.exe", "--profile alpha"), StringComparison.Ordinal);
+                bool launchHashQuotedBoundaryPreserved = !string.Equals(
+                    HashLaunchIdentity(@"C:\Fixture\worker.exe", "--label \"alpha beta\""),
+                    HashLaunchIdentity(@"C:\Fixture\worker.exe", "--label alpha beta"), StringComparison.Ordinal);
+                bool passed = beforeRootChild == 0
+                    && beforeRootGrandchild == 0
+                    && seeded == 3
+                    && livePromotion == 1
+                    && unrelatedPromotion == 0
+                    && bufferedMultiHopPromoted
+                    && liveDescendantPromoted
+                    && unrelatedIgnored
+                    && unqualifiedPidsNotActionable
+                    && snapshotDescendantsPromoted
+                    && snapshotUnrelatedIgnored
+                    && staleIdentitiesPruned
+                    && callbackMultiHopPromoted
+                    && callbackUnrelatedIgnored
+                    && exactArgumentIdentityMatched
+                    && sameExecutableDifferentArgumentsIgnored
+                    && argumentCaseDifferenceIgnored
+                    && quotedArgumentBoundaryPreserved
+                    && extraArgumentIgnored
+                    && launchHashPathCaseInsensitive
+                    && launchHashArgumentCaseSensitive
+                    && launchHashQuotedBoundaryPreserved
+                    && snapshotCalls == 1
+                    && tracked.SequenceEqual(new[] { 4100, 4101, 4102, 4103 });
+                return JsonSerializer.Serialize(new
+                {
+                    passed = passed,
+                    bufferedMultiHopPromoted = bufferedMultiHopPromoted,
+                    liveDescendantPromoted = liveDescendantPromoted,
+                    unrelatedIgnored = unrelatedIgnored,
+                    unqualifiedPidsNotActionable = unqualifiedPidsNotActionable,
+                    snapshotDescendantsPromoted = snapshotDescendantsPromoted,
+                    snapshotUnrelatedIgnored = snapshotUnrelatedIgnored,
+                    staleIdentitiesPruned = staleIdentitiesPruned,
+                    callbackMultiHopPromoted = callbackMultiHopPromoted,
+                    callbackUnrelatedIgnored = callbackUnrelatedIgnored,
+                    exactArgumentIdentityMatched = exactArgumentIdentityMatched,
+                    sameExecutableDifferentArgumentsIgnored = sameExecutableDifferentArgumentsIgnored,
+                    argumentCaseDifferenceIgnored = argumentCaseDifferenceIgnored,
+                    quotedArgumentBoundaryPreserved = quotedArgumentBoundaryPreserved,
+                    extraArgumentIgnored = extraArgumentIgnored,
+                    launchHashPathCaseInsensitive = launchHashPathCaseInsensitive,
+                    launchHashArgumentCaseSensitive = launchHashArgumentCaseSensitive,
+                    launchHashQuotedBoundaryPreserved = launchHashQuotedBoundaryPreserved,
+                    snapshotCalls = snapshotCalls,
+                    snapshotTracked = snapshotTracked,
+                    tracked = tracked,
+                    externalProcessesStarted = 0
+                });
+            }
+        }
+
+        private static int CaptureDescendantsFromSingleSnapshot(ProcessLineageTracker lineage, Func<List<NativeProcessInfo>> snapshotProvider)
+        {
+            if (lineage == null || snapshotProvider == null) return 0;
+            int[] eligibleParents = lineage.EligibleParentSnapshot();
+            if (eligibleParents.Length == 0) return 0;
+
+            // Acquire the process catalog exactly once for the whole recursive capture. Building
+            // this parent map up front keeps a deep host tree from multiplying full-system scans.
+            List<NativeProcessInfo> snapshot = snapshotProvider() ?? new List<NativeProcessInfo>();
+            Dictionary<int, int[]> childrenByParent = snapshot
+                .Where(process => process != null && process.ProcessId > 0)
+                .GroupBy(process => process.ParentProcessId)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.Select(process => process.ProcessId).Distinct().ToArray());
+
+            int promoted = 0;
+            var pendingParents = new Queue<int>(eligibleParents);
+            var visitedParents = new HashSet<int>();
+            while (pendingParents.Count > 0)
+            {
+                int parent = pendingParents.Dequeue();
+                if (!visitedParents.Add(parent)) continue;
+                int[] children;
+                if (!childrenByParent.TryGetValue(parent, out children)) continue;
+                foreach (int child in children)
+                {
+                    promoted += lineage.RecordStartEvent(parent, child, ProcessLineageTracker.ReadStartTimeUtcTicks(child));
+                    pendingParents.Enqueue(child);
+                }
+            }
+            return promoted;
+        }
+
+        private sealed class ProcessLineageTracker : IDisposable
+        {
+            private const int PendingEdgeLifetimeSeconds = 15;
+            private const int MaximumPendingEdges = 2048;
+
+            private sealed class PendingEdge
+            {
+                public int ParentPid;
+                public DateTime SeenUtc;
+                public long StartTimeUtcTicks;
+            }
+
+            private sealed class ExitedGeneration
+            {
+                public DateTime SeenUtc;
+                public long StartTimeUtcTicks;
+            }
+
+            private readonly object _gate = new object();
+            private readonly HashSet<int> _tracked = new HashSet<int>();
+            private readonly Dictionary<int, DateTime> _trackedSinceUtc = new Dictionary<int, DateTime>();
+            private readonly Dictionary<int, long> _startTimeUtcTicks = new Dictionary<int, long>();
+            private readonly Dictionary<int, PendingEdge> _pendingByChild = new Dictionary<int, PendingEdge>();
+            private readonly Dictionary<int, ExitedGeneration> _recentExited = new Dictionary<int, ExitedGeneration>();
+            private ManagementEventWatcher _processStartWatcher;
+            private int _revision;
+            private bool _disposed;
+
+            public ProcessLineageTracker(bool watchSystem)
+            {
+                if (watchSystem) StartWatcher();
+            }
+
+            public bool WatcherRunning
+            {
+                get { lock (_gate) return !_disposed && _processStartWatcher != null; }
+            }
+
+            public void ResetForLaunch()
+            {
+                lock (_gate)
+                {
+                    if (_disposed) return;
+                    _tracked.Clear();
+                    _trackedSinceUtc.Clear();
+                    _startTimeUtcTicks.Clear();
+                    _pendingByChild.Clear();
+                    _recentExited.Clear();
+                    _revision++;
+                }
+            }
+
+            public int SeedRoot(int processId, long startTimeUtcTicks = 0)
+            {
+                if (processId <= 0) return 0;
+                lock (_gate)
+                {
+                    if (_disposed) return 0;
+                    DateTime now = DateTime.UtcNow;
+                    TrimPendingLocked(now);
+                    int added = _tracked.Add(processId) ? 1 : 0;
+                    _trackedSinceUtc[processId] = now;
+                    if (startTimeUtcTicks > 0) _startTimeUtcTicks[processId] = startTimeUtcTicks;
+                    else _startTimeUtcTicks.Remove(processId);
+                    _pendingByChild.Remove(processId);
+                    _recentExited.Remove(processId);
+                    int promoted = added + PromotePendingDescendantsLocked(processId);
+                    _revision += promoted;
+                    return promoted;
+                }
+            }
+
+            public int RecordStartEvent(int parentProcessId, int processId, long startTimeUtcTicks = 0)
+            {
+                if (parentProcessId <= 0 || processId <= 0 || parentProcessId == processId) return 0;
+                lock (_gate)
+                {
+                    if (_disposed) return 0;
+                    DateTime now = DateTime.UtcNow;
+                    TrimPendingLocked(now);
+                    _pendingByChild[processId] = new PendingEdge { ParentPid = parentProcessId, SeenUtc = now, StartTimeUtcTicks = startTimeUtcTicks };
+                    if (!IsEligibleParentLocked(parentProcessId, now)) return 0;
+                    int promoted = PromotePendingDescendantsLocked(parentProcessId);
+                    _revision += promoted;
+                    return promoted;
+                }
+            }
+
+            public int[] Snapshot()
+            {
+                lock (_gate) return _tracked.OrderBy(pid => pid).ToArray();
+            }
+
+            public bool Contains(int processId)
+            {
+                lock (_gate) return _tracked.Contains(processId);
+            }
+
+            public int[] EligibleParentSnapshot()
+            {
+                lock (_gate)
+                {
+                    DateTime now = DateTime.UtcNow;
+                    return _tracked.Concat(_recentExited.Keys).Distinct()
+                        .Where(pid => IsEligibleParentLocked(pid, now)).OrderBy(pid => pid).ToArray();
+                }
+            }
+
+            public int Revision { get { lock (_gate) return _revision; } }
+
+            public bool TryPromoteCurrentAncestry(int processId, Func<int, Tuple<int, long>> identityProvider)
+            {
+                if (processId <= 0 || identityProvider == null) return false;
+                if (IsCurrentInstance(processId)) return true;
+                var edges = new List<Tuple<int, int, long>>();
+                var visited = new HashSet<int>();
+                int child = processId;
+                for (int depth = 0; depth < 16 && child > 0 && visited.Add(child); depth++)
+                {
+                    Tuple<int, long> identity;
+                    try { identity = identityProvider(child); }
+                    catch { return false; }
+                    if (identity == null || identity.Item1 <= 0 || identity.Item2 <= 0 || identity.Item1 == child) return false;
+                    int parent = identity.Item1;
+                    edges.Add(Tuple.Create(parent, child, identity.Item2));
+                    if (IsEligibleParent(parent))
+                    {
+                        for (int i = edges.Count - 1; i >= 0; i--)
+                            RecordStartEvent(edges[i].Item1, edges[i].Item2, edges[i].Item3);
+                        return Contains(processId);
+                    }
+                    child = parent;
+                }
+                return false;
+            }
+
+            public int[] LiveSnapshot()
+            {
+                KeyValuePair<int, long>[] identities;
+                lock (_gate) identities = _startTimeUtcTicks.ToArray();
+                var live = new List<int>();
+                var exited = new List<KeyValuePair<int, long>>();
+                var reused = new List<KeyValuePair<int, long>>();
+                foreach (var pair in identities)
+                {
+                    long current = ReadStartTimeUtcTicks(pair.Key);
+                    if (pair.Value > 0 && current == pair.Value) live.Add(pair.Key);
+                    else if (current == 0) exited.Add(pair);
+                    else reused.Add(pair);
+                }
+                lock (_gate)
+                {
+                    DateTime now = DateTime.UtcNow;
+                    foreach (var pair in exited)
+                    {
+                        long current;
+                        if (_startTimeUtcTicks.TryGetValue(pair.Key, out current) && current == pair.Value)
+                        {
+                            _startTimeUtcTicks.Remove(pair.Key);
+                            _tracked.Remove(pair.Key);
+                            _trackedSinceUtc.Remove(pair.Key);
+                            _pendingByChild.Remove(pair.Key);
+                            _recentExited[pair.Key] = new ExitedGeneration { SeenUtc = now, StartTimeUtcTicks = pair.Value };
+                        }
+                    }
+                    foreach (var pair in reused)
+                    {
+                        long current;
+                        if (_startTimeUtcTicks.TryGetValue(pair.Key, out current) && current == pair.Value)
+                        {
+                            _startTimeUtcTicks.Remove(pair.Key);
+                            _tracked.Remove(pair.Key);
+                            _trackedSinceUtc.Remove(pair.Key);
+                            _pendingByChild.Remove(pair.Key);
+                            _recentExited.Remove(pair.Key);
+                        }
+                    }
+                    DateTime cutoff = now.AddSeconds(-PendingEdgeLifetimeSeconds);
+                    foreach (int pid in _trackedSinceUtc.Where(pair => pair.Value < cutoff && !_startTimeUtcTicks.ContainsKey(pair.Key)).Select(pair => pair.Key).ToArray())
+                    {
+                        _tracked.Remove(pid);
+                        _trackedSinceUtc.Remove(pid);
+                        _pendingByChild.Remove(pid);
+                    }
+                    foreach (int pid in _recentExited.Where(pair => pair.Value.SeenUtc < cutoff).Select(pair => pair.Key).ToArray())
+                        _recentExited.Remove(pid);
+                    TrimPendingLocked(now);
+                }
+                return live.Distinct().OrderBy(pid => pid).ToArray();
+            }
+
+            public int TrackedIdentityCount { get { lock (_gate) return _startTimeUtcTicks.Count; } }
+            public int TrackedProcessCount { get { lock (_gate) return _tracked.Count; } }
+
+            public bool IsCurrentInstance(int processId)
+            {
+                long expected;
+                lock (_gate)
+                {
+                    if (!_startTimeUtcTicks.TryGetValue(processId, out expected)) return false;
+                }
+                return expected > 0 && ReadStartTimeUtcTicks(processId) == expected;
+            }
+
+            private bool IsEligibleParent(int processId)
+            {
+                lock (_gate) return !_disposed && IsEligibleParentLocked(processId, DateTime.UtcNow);
+            }
+
+            private int PromotePendingDescendantsLocked(int ancestorProcessId)
+            {
+                int added = 0;
+                var pendingParents = new Queue<int>();
+                var visitedParents = new HashSet<int>();
+                pendingParents.Enqueue(ancestorProcessId);
+                while (pendingParents.Count > 0)
+                {
+                    int parent = pendingParents.Dequeue();
+                    if (!visitedParents.Add(parent)) continue;
+                    int[] children = _pendingByChild
+                        .Where(pair => pair.Value.ParentPid == parent)
+                        .Select(pair => pair.Key)
+                        .ToArray();
+                    foreach (int child in children)
+                    {
+                        PendingEdge edge = _pendingByChild[child];
+                        _pendingByChild.Remove(child);
+                        if (_tracked.Add(child)) added++;
+                        _trackedSinceUtc[child] = edge.SeenUtc;
+                        if (edge.StartTimeUtcTicks > 0) _startTimeUtcTicks[child] = edge.StartTimeUtcTicks;
+                        else _startTimeUtcTicks.Remove(child);
+                        pendingParents.Enqueue(child);
+                    }
+                }
+                return added;
+            }
+
+            private void TrimPendingLocked(DateTime now)
+            {
+                DateTime cutoff = now.AddSeconds(-PendingEdgeLifetimeSeconds);
+                foreach (int child in _pendingByChild.Where(pair => pair.Value.SeenUtc < cutoff).Select(pair => pair.Key).ToArray())
+                    _pendingByChild.Remove(child);
+                int excess = _pendingByChild.Count - MaximumPendingEdges;
+                if (excess <= 0) return;
+                foreach (int child in _pendingByChild.OrderBy(pair => pair.Value.SeenUtc).Take(excess).Select(pair => pair.Key).ToArray())
+                    _pendingByChild.Remove(child);
+            }
+
+            private bool IsEligibleParentLocked(int processId, DateTime now)
+            {
+                DateTime trackedSince;
+                if (!_tracked.Contains(processId) || !_trackedSinceUtc.TryGetValue(processId, out trackedSince))
+                {
+                    ExitedGeneration exited;
+                    if (!_recentExited.TryGetValue(processId, out exited)
+                        || (now - exited.SeenUtc).TotalSeconds > PendingEdgeLifetimeSeconds) return false;
+                    long currentGeneration = ReadStartTimeUtcTicks(processId);
+                    return currentGeneration == 0 || currentGeneration == exited.StartTimeUtcTicks;
+                }
+                long expected;
+                if (_startTimeUtcTicks.TryGetValue(processId, out expected) && expected > 0)
+                {
+                    long current = ReadStartTimeUtcTicks(processId);
+                    if (current == expected) return true;
+                    if (current > 0) return false; // PID belongs to a different, unrelated process generation.
+                }
+                // A just-exited launcher stays eligible only long enough for its already-fired
+                // process-start events to arrive. It is never actionable without an identity.
+                return (now - trackedSince).TotalSeconds <= PendingEdgeLifetimeSeconds;
+            }
+
+            public static long ReadStartTimeUtcTicks(int processId)
+            {
+                if (processId <= 0) return 0;
+                try
+                {
+                    using (var process = Process.GetProcessById(processId))
+                    {
+                        if (process.HasExited) return 0;
+                        return process.StartTime.ToUniversalTime().Ticks;
+                    }
+                }
+                catch { return 0; }
+            }
+
+            public bool StartWatcher()
+            {
+                ManagementEventWatcher watcher = null;
+                try
+                {
+                    lock (_gate)
+                    {
+                        if (_disposed) return false;
+                        if (_processStartWatcher != null) return true;
+                    }
+                    watcher = new ManagementEventWatcher(
+                        new ManagementScope(@"\\.\root\CIMV2"),
+                        new WqlEventQuery("SELECT ProcessID, ParentProcessID FROM Win32_ProcessStartTrace"));
+                    watcher.EventArrived += OnProcessStarted;
+                    watcher.Start();
+                    lock (_gate)
+                    {
+                        if (_disposed || _processStartWatcher != null) return _processStartWatcher != null;
+                        _processStartWatcher = watcher;
+                        watcher = null;
+                        return true;
+                    }
+                }
+                catch { return false; }
+                finally
+                {
+                    CleanupWatcher(watcher);
+                }
+            }
+
+            public void StopWatcher()
+            {
+                ManagementEventWatcher watcher;
+                lock (_gate)
+                {
+                    watcher = _processStartWatcher;
+                    _processStartWatcher = null;
+                }
+                CleanupWatcher(watcher);
+            }
+
+            private void OnProcessStarted(object sender, EventArrivedEventArgs e)
+            {
+                try
+                {
+                    int processId = Convert.ToInt32(e.NewEvent["ProcessID"]);
+                    int parentProcessId = Convert.ToInt32(e.NewEvent["ParentProcessID"]);
+                    // WMI invokes this callback away from the WinForms message thread.
+                    // RecordStartEvent performs the only cross-thread mutation under _gate;
+                    // all window and NotifyIcon work remains on the UI timers.
+                    RecordStartEvent(parentProcessId, processId, ReadStartTimeUtcTicks(processId));
+                }
+                catch { }
+            }
+
+            public void Dispose()
+            {
+                ManagementEventWatcher watcher;
+                lock (_gate)
+                {
+                    if (_disposed) return;
+                    _disposed = true;
+                    watcher = _processStartWatcher;
+                    _processStartWatcher = null;
+                    _tracked.Clear();
+                    _trackedSinceUtc.Clear();
+                    _startTimeUtcTicks.Clear();
+                    _pendingByChild.Clear();
+                    _recentExited.Clear();
+                }
+                CleanupWatcher(watcher);
+            }
+
+            private void CleanupWatcher(ManagementEventWatcher watcher)
+            {
+                if (watcher == null) return;
+                try { watcher.EventArrived -= OnProcessStarted; } catch { }
+                try { watcher.Stop(); } catch { }
+                try { watcher.Dispose(); } catch { }
+            }
+        }
+
+        private static Tuple<int, long> ReadCurrentProcessAncestryIdentity(int processId)
+        {
+            if (processId <= 0) return null;
+            long before = ProcessLineageTracker.ReadStartTimeUtcTicks(processId);
+            if (before <= 0) return null;
+            IntPtr process = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+            if (process == IntPtr.Zero) return null;
+            int size = Marshal.SizeOf(typeof(ProcessBasicInformation));
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                int returned;
+                if (NtQueryInformationProcess(process, ProcessBasicInformationClass, buffer, size, out returned) != 0) return null;
+                ProcessBasicInformation value = (ProcessBasicInformation)Marshal.PtrToStructure(buffer, typeof(ProcessBasicInformation));
+                long unique = value.UniqueProcessId.ToInt64();
+                long parent = value.InheritedFromUniqueProcessId.ToInt64();
+                long after = ProcessLineageTracker.ReadStartTimeUtcTicks(processId);
+                if (unique != processId || parent <= 0 || parent > int.MaxValue || before != after || after <= 0) return null;
+                return Tuple.Create((int)parent, after);
+            }
+            catch { return null; }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+                CloseHandle(process);
+            }
+        }
+
+        private static bool ShouldContinueBootstrapObservation(double elapsedMilliseconds,
+            double millisecondsSinceQualifiedActivity, bool explicitOpenRequested)
+        {
+            if (explicitOpenRequested || elapsedMilliseconds >= InitialObservationMaximumMilliseconds) return false;
+            return elapsedMilliseconds < InitialObservationMinimumMilliseconds
+                || millisecondsSinceQualifiedActivity < InitialObservationStabilityMilliseconds;
+        }
+
+        // Models the current lifecycle transition so the policy probe can lock down
+        // whether boot-only suppression is actually released after bootstrap.
+        private static bool SuppressionCancelledAfterBootstrap(bool suppressionCancelled)
+        {
+            return true;
+        }
+
+        private static bool ShouldCompleteBootstrapForTrayReady(bool nativeTrayReady,
+            bool fallbackIconVisible, bool initialWindowHidden, double nativeTrayReadyElapsedMilliseconds)
+        {
+            return (fallbackIconVisible && initialWindowHidden)
+                || (nativeTrayReady && (initialWindowHidden
+                    || nativeTrayReadyElapsedMilliseconds >= NativeTrayReadyWindowGraceMilliseconds));
+        }
+
+        private static bool ShouldTreatFallbackAsBootstrapReady(bool fallbackIconVisible,
+            bool launcherHandoffExpected)
+        {
+            // A launcher can expose/hide its first window before the detached payload has
+            // created its native tray host. Keep the bounded bootstrap observation alive in
+            // that case so a temporary proxy cannot survive beside the real icon.
+            return fallbackIconVisible && !launcherHandoffExpected;
+        }
+
+        private static bool IsDefiniteRuntimeTrayHostClass(string windowClass)
+        {
+            return IsDefiniteRuntimeTrayHostClass(windowClass, false, false);
+        }
+
+        private static bool IsDefiniteRuntimeTrayHostClass(string windowClass,
+            bool windowVisible, bool windowHasTitle)
+        {
+            if (string.IsNullOrEmpty(windowClass)) return false;
+            if (windowClass.IndexOf("SystemTrayIcon", StringComparison.Ordinal) >= 0
+                || windowClass.IndexOf("TrayIcon", StringComparison.Ordinal) >= 0
+                || windowClass.IndexOf("NotifyIcon", StringComparison.Ordinal) >= 0
+                || string.Equals(windowClass, "AutoHotkey", StringComparison.OrdinalIgnoreCase)) return true;
+            // WinForms uses the same class family for ordinary Forms and its
+            // NotifyIcon callback sink. Only the hidden, untitled sink proves a
+            // native tray icon; a visible/titled main window must never qualify.
+            return windowClass.StartsWith("WindowsForms10.Window", StringComparison.Ordinal)
+                && !windowVisible && !windowHasTitle;
+        }
+
+        private static bool ShouldAcceptRuntimeNativeTrayHost(bool declaredNativeCapability,
+            bool definiteRuntimeTrayHost)
+        {
+            // A live, target-owned tray host is stronger evidence than a bounded
+            // static binary scan. Packaged and large applications can legitimately
+            // fall outside that scan, but their native icon must still replace the
+            // controller proxy instead of producing two tray icons.
+            return definiteRuntimeTrayHost;
+        }
+
+        private static bool ShouldRemoveFallbackForRuntimeNative(bool runtimeNativeTrayReady,
+            bool fallbackIconExists)
+        {
+            return runtimeNativeTrayReady && fallbackIconExists;
+        }
+
+        private static bool ShouldSuppressManagedWindow(bool suppressionCancelled,
+            bool exactGenerationTracked, bool visible)
+        {
+            return !suppressionCancelled && exactGenerationTracked && visible;
+        }
+
+        private static bool ShouldKeepPendingLineageCapture(double elapsedMilliseconds, bool pendingActivation)
+        {
+            return pendingActivation && elapsedMilliseconds < PendingLineageCaptureMilliseconds;
+        }
+
+        private static bool ShouldTearDownScopedObserver(bool bootstrapEnded,
+            bool pendingActivation, bool pendingTimerRunning)
+        {
+            return bootstrapEnded && !pendingActivation && !pendingTimerRunning;
+        }
+
+        private static bool ShouldCreateFallbackIcon(bool fallbackIconExists)
+        {
+            return !fallbackIconExists;
+        }
+
+        private static bool ShouldExitNativeControllerAfterBootstrap(bool runtimeNativeTrayReady,
+            bool fallbackIconExists)
+        {
+            return runtimeNativeTrayReady && !fallbackIconExists;
+        }
+
+        private static bool ShouldForceFallbackAfterBootstrap(bool runtimeNativeTrayReady,
+            bool fallbackIconExists)
+        {
+            return !runtimeNativeTrayReady && !fallbackIconExists;
+        }
+
+        private static bool WaitForCallbacksToDrain(Func<int> activeCallbackCount, int timeoutMilliseconds)
+        {
+            if (activeCallbackCount == null) return true;
+            long started = Stopwatch.GetTimestamp();
+            while (activeCallbackCount() > 0)
+            {
+                if ((Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency >= Math.Max(0, timeoutMilliseconds))
+                    return false;
+                System.Threading.Thread.Sleep(1);
+            }
+            return true;
+        }
+
+        private enum ActivationAction { None, Restore, WaitForExistingLineage, Launch }
+
+        private sealed class QuietActivationPolicy
+        {
+            private readonly object _gate = new object();
+            private bool _pendingActivation;
+            private bool _suppressionCancelled;
+            private int _launchRequests;
+            private int _restoreRequests;
+
+            public bool PendingActivation { get { lock (_gate) return _pendingActivation; } }
+            public bool SuppressionCancelled { get { lock (_gate) return _suppressionCancelled; } }
+            public int LaunchRequests { get { lock (_gate) return _launchRequests; } }
+            public int RestoreRequests { get { lock (_gate) return _restoreRequests; } }
+
+            public ActivationAction RequestOpen(bool hasRestorableWindow, bool exactLineageAlive)
+            {
+                lock (_gate)
+                {
+                    _suppressionCancelled = true;
+                    if (hasRestorableWindow)
+                    {
+                        _pendingActivation = false;
+                        _restoreRequests++;
+                        return ActivationAction.Restore;
+                    }
+                    if (exactLineageAlive)
+                    {
+                        _pendingActivation = true;
+                        return ActivationAction.WaitForExistingLineage;
+                    }
+                    _pendingActivation = false;
+                    _launchRequests++;
+                    return ActivationAction.Launch;
+                }
+            }
+
+            public ActivationAction QualifiedWindowArrived(bool restoreSucceeded = true)
+            {
+                lock (_gate)
+                {
+                    if (!_pendingActivation || !restoreSucceeded) return ActivationAction.None;
+                    _pendingActivation = false;
+                    _restoreRequests++;
+                    return ActivationAction.Restore;
+                }
+            }
+
+            public ActivationAction ExactLineageDied()
+            {
+                lock (_gate)
+                {
+                    if (!_pendingActivation) return ActivationAction.None;
+                    _pendingActivation = false;
+                    _launchRequests++;
+                    return ActivationAction.Launch;
+                }
+            }
+
+            public void CancelPending()
+            {
+                lock (_gate) _pendingActivation = false;
+            }
+        }
+
+        private sealed class QuietRuntimePolicy
+        {
+            private enum RuntimePhase { Initial, Manual, Steady, Disposed }
+            private RuntimePhase _phase = RuntimePhase.Initial;
+            private RuntimePhase _phaseBeforeManual = RuntimePhase.Initial;
+            public int InitialProcessSnapshots { get; private set; }
+            public int ManualProcessSnapshots { get; private set; }
+            public int SteadyProcessSnapshots { get; private set; }
+            public int InitialWindowEnumerations { get; private set; }
+            public int ManualWindowEnumerations { get; private set; }
+            public int SteadyWindowEnumerations { get; private set; }
+            public int RejectedSteadyProcessSnapshots { get; private set; }
+            public int RejectedSteadyWindowEnumerations { get; private set; }
+            public int BlockedPostDisposeCallbacks { get; private set; }
+            public int PostDisposeCallbacksExecuted { get; private set; }
+            public bool LineageWatcherRunning { get; private set; }
+            public bool GlobalWindowHookRunning { get; private set; }
+            public int ScopedWindowHookCount { get; private set; }
+            public bool JobObserverRunning { get; private set; }
+            public bool WindowHookRunning { get { return GlobalWindowHookRunning || ScopedWindowHookCount > 0; } }
+            public bool InitialTimerRunning { get; private set; } = true;
+            public bool AliveTimerRunning { get; private set; } = true;
+            public bool ManualTimerRunning { get; private set; }
+            public bool IsDisposed { get { return _phase == RuntimePhase.Disposed; } }
+
+            public void SetLineageWatcher(bool running) { if (!IsDisposed) LineageWatcherRunning = running; }
+            public void SetGlobalWindowHook(bool running) { if (!IsDisposed) GlobalWindowHookRunning = running; }
+            public void SetScopedWindowHookCount(int count) { if (!IsDisposed) ScopedWindowHookCount = Math.Max(0, count); }
+            public void SetJobObserver(bool running) { if (!IsDisposed) JobObserverRunning = running; }
+            public void SetManualTimer(bool running) { if (!IsDisposed) ManualTimerRunning = running; }
+
+            public List<NativeProcessInfo> CaptureProcesses(Func<List<NativeProcessInfo>> provider)
+            {
+                if (_phase == RuntimePhase.Disposed) { BlockedPostDisposeCallbacks++; return new List<NativeProcessInfo>(); }
+                if (_phase == RuntimePhase.Steady) { RejectedSteadyProcessSnapshots++; return new List<NativeProcessInfo>(); }
+                if (_phase == RuntimePhase.Manual) ManualProcessSnapshots++; else InitialProcessSnapshots++;
+                return provider == null ? new List<NativeProcessInfo>() : (provider() ?? new List<NativeProcessInfo>());
+            }
+
+            public void EnumerateWindows(Action provider)
+            {
+                if (_phase == RuntimePhase.Disposed) { BlockedPostDisposeCallbacks++; return; }
+                if (_phase == RuntimePhase.Steady) { RejectedSteadyWindowEnumerations++; return; }
+                if (_phase == RuntimePhase.Manual) ManualWindowEnumerations++; else InitialWindowEnumerations++;
+                if (provider != null) provider();
+            }
+
+            public bool AllowCallback()
+            {
+                if (_phase != RuntimePhase.Disposed) return true;
+                BlockedPostDisposeCallbacks++;
+                return false;
+            }
+
+            public void BeginManual()
+            {
+                if (IsDisposed) return;
+                if (_phase != RuntimePhase.Manual) _phaseBeforeManual = _phase;
+                _phase = RuntimePhase.Manual;
+                ManualTimerRunning = true;
+            }
+
+            public void EndManual()
+            {
+                if (IsDisposed) return;
+                ManualTimerRunning = false;
+                if (_phase == RuntimePhase.Manual) _phase = _phaseBeforeManual;
+            }
+
+            public void EnterSteady()
+            {
+                if (IsDisposed) return;
+                _phase = RuntimePhase.Steady;
+                InitialTimerRunning = false;
+            }
+
+            public void Dispose()
+            {
+                _phase = RuntimePhase.Disposed;
+                LineageWatcherRunning = false;
+                GlobalWindowHookRunning = false;
+                ScopedWindowHookCount = 0;
+                JobObserverRunning = false;
+                InitialTimerRunning = false;
+                AliveTimerRunning = false;
+                ManualTimerRunning = false;
+            }
+        }
+
+        private static string HashLaunchIdentity(string target, string arguments)
+        {
+            string canonicalTarget;
+            try { canonicalTarget = Path.GetFullPath(target ?? "").TrimEnd('\\').ToUpperInvariant(); }
+            catch { canonicalTarget = (target ?? "").Trim().ToUpperInvariant(); }
+            string[] parsed = ParseWindowsArguments("msm-probe " + (arguments ?? ""));
+            var identity = new StringBuilder();
+            identity.Append(canonicalTarget.Length).Append(':').Append(canonicalTarget).Append('\0');
+            foreach (string argument in parsed.Skip(1))
+                identity.Append(argument.Length).Append(':').Append(argument).Append('\0');
+            using (var sha = SHA256.Create())
+            {
+                byte[] h = sha.ComputeHash(Encoding.UTF8.GetBytes(identity.ToString()));
                 var sb = new StringBuilder();
                 foreach (byte b in h) sb.Append(b.ToString("x2"));
                 return sb.ToString();
+            }
+        }
+
+        private static string[] ParseWindowsArguments(string commandLine)
+        {
+            if (string.IsNullOrWhiteSpace(commandLine)) return new string[0];
+            int count;
+            IntPtr values = CommandLineToArgvW(commandLine, out count);
+            if (values == IntPtr.Zero || count <= 0) return new string[0];
+            try
+            {
+                var result = new string[count];
+                for (int i = 0; i < count; i++)
+                    result[i] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(values, i * IntPtr.Size)) ?? "";
+                return result;
+            }
+            finally { LocalFree(values); }
+        }
+
+        private static string QuoteWindowsArgument(string value)
+        {
+            string text = value ?? "";
+            if (text.Length > 0 && text.All(ch => !char.IsWhiteSpace(ch) && ch != '"')) return text;
+            var result = new StringBuilder("\"");
+            int slashes = 0;
+            foreach (char ch in text)
+            {
+                if (ch == '\\') { slashes++; continue; }
+                if (ch == '"')
+                {
+                    result.Append('\\', slashes * 2 + 1).Append('"');
+                    slashes = 0;
+                    continue;
+                }
+                if (slashes > 0) { result.Append('\\', slashes); slashes = 0; }
+                result.Append(ch);
+            }
+            if (slashes > 0) result.Append('\\', slashes * 2);
+            return result.Append('"').ToString();
+        }
+
+        private sealed class ProcessJobTracker : IDisposable
+        {
+            private readonly Action<int> _processAdded;
+            private IntPtr _job;
+            private IntPtr _completionPort;
+            private System.Threading.Thread _thread;
+            private int _stopping;
+
+            public ProcessJobTracker(Action<int> processAdded)
+            {
+                _processAdded = processAdded;
+                try
+                {
+                    _job = CreateJobObject(IntPtr.Zero, null);
+                    if (_job == IntPtr.Zero) return;
+                    _completionPort = CreateIoCompletionPort(new IntPtr(-1), IntPtr.Zero, UIntPtr.Zero, 1);
+                    if (_completionPort == IntPtr.Zero) return;
+                    var association = new JobObjectAssociateCompletionPort
+                    {
+                        CompletionKey = _job,
+                        CompletionPort = _completionPort
+                    };
+                    int size = Marshal.SizeOf(typeof(JobObjectAssociateCompletionPort));
+                    IntPtr buffer = Marshal.AllocHGlobal(size);
+                    try
+                    {
+                        Marshal.StructureToPtr(association, buffer, false);
+                        if (!SetInformationJobObject(_job, JobObjectAssociateCompletionPortInformation, buffer, (uint)size)) return;
+                    }
+                    finally { Marshal.FreeHGlobal(buffer); }
+                    _thread = new System.Threading.Thread(Watch) { IsBackground = true, Name = "MSM quiet lineage job" };
+                    _thread.Start();
+                }
+                catch { }
+            }
+
+            public bool Running
+            {
+                get { return _job != IntPtr.Zero && _completionPort != IntPtr.Zero && _thread != null && _thread.IsAlive; }
+            }
+
+            public bool Assign(Process process)
+            {
+                if (!Running || process == null) return false;
+                try { return AssignProcessToJobObject(_job, process.Handle); }
+                catch { return false; }
+            }
+
+            private void Watch()
+            {
+                while (System.Threading.Volatile.Read(ref _stopping) == 0)
+                {
+                    try
+                    {
+                        uint message;
+                        UIntPtr key;
+                        IntPtr value;
+                        bool received = GetQueuedCompletionStatus(_completionPort, out message, out key, out value, 1000);
+                        if (System.Threading.Volatile.Read(ref _stopping) != 0) break;
+                        if (!received || message != JobObjectMessageNewProcess || value == IntPtr.Zero) continue;
+                        long raw = value.ToInt64();
+                        if (raw > 0 && raw <= int.MaxValue && _processAdded != null) _processAdded((int)raw);
+                    }
+                    catch { }
+                }
+            }
+
+            public void Dispose()
+            {
+                if (System.Threading.Interlocked.Exchange(ref _stopping, 1) != 0) return;
+                try { if (_completionPort != IntPtr.Zero) PostQueuedCompletionStatus(_completionPort, 0, UIntPtr.Zero, IntPtr.Zero); } catch { }
+                try { if (_thread != null && _thread.IsAlive) _thread.Join(1500); } catch { }
+                try { if (_completionPort != IntPtr.Zero) CloseHandle(_completionPort); } catch { }
+                try { if (_job != IntPtr.Zero) CloseHandle(_job); } catch { }
+                _completionPort = IntPtr.Zero;
+                _job = IntPtr.Zero;
+                _thread = null;
             }
         }
 
@@ -2934,148 +11276,1271 @@ foreach($t in Get-ScheduledTask){
         {
             private readonly string _target;
             private readonly string _targetArgs;
-            private Timer _hideTimer;
+            private readonly string _displayName;
+            private readonly string[] _launcherPayloadCandidates;
+            private readonly ProcessLineageTracker _lineage;
+            private readonly QuietRuntimePolicy _runtimePolicy = new QuietRuntimePolicy();
+            private readonly QuietActivationPolicy _activationPolicy = new QuietActivationPolicy();
+            private readonly ConcurrentQueue<IntPtr> _windowEvents = new ConcurrentQueue<IntPtr>();
+            private readonly ConcurrentDictionary<IntPtr, byte> _callbackHiddenWindows = new ConcurrentDictionary<IntPtr, byte>();
+            private readonly ConcurrentDictionary<IntPtr, byte> _callbackActivatedWindows = new ConcurrentDictionary<IntPtr, byte>();
+            private readonly ConcurrentDictionary<IntPtr, byte> _cloakedWindows = new ConcurrentDictionary<IntPtr, byte>();
+            private readonly ConcurrentDictionary<IntPtr, int> _scopedWindowHooks = new ConcurrentDictionary<IntPtr, int>();
+            private readonly Control _dispatcher;
+            private readonly ProcessJobTracker _jobTracker;
+            private readonly WinEventDelegate _windowEventCallback;
+            private Timer _observeTimer;
             private Timer _watchTimer;
-            private DateTime _startedUtc = DateTime.UtcNow;
+            private Timer _manualLineageTimer;
+            private Timer _pendingActivationTimer;
+            private readonly long _startedTimestamp = Stopwatch.GetTimestamp();
+            private long _lastTreeCaptureTimestamp;
+            private long _lastQualifiedActivityTimestamp = Stopwatch.GetTimestamp();
+            private long _pendingCaptureStartedTimestamp;
+            private long _treeDeadTimestamp;
+            private long _lastProxyActivationTimestamp;
+            private int _lastLineageRevision;
             private int _rootPid;
-            private readonly HashSet<int> _tree = new HashSet<int>();
-            // Windows this wrapper has hidden and windows the user has intentionally re-opened.
+            private int _initialProcessSnapshots;
+            private int _initialWindowSnapshots;
+            private int _manualProcessSnapshots;
+            private int _activeWindowCallbacks;
+            private IntPtr _bootstrapWindowHook;
             private readonly HashSet<IntPtr> _hiddenWindows = new HashSet<IntPtr>();
-            private readonly HashSet<IntPtr> _exemptWindows = new HashSet<IntPtr>();
-            private DateTime? _treeDeadSince;
+            private readonly HashSet<IntPtr> _restorableWindows = new HashSet<IntPtr>();
+            private NotifyIcon _fallbackIcon;
+            private ContextMenuStrip _fallbackMenu;
+            private ToolStripMenuItem _fallbackOpenItem;
+            private ToolStripMenuItem _fallbackExitItem;
+            private Icon _fallbackImage;
+            private bool _suppressionComplete;
+            private bool _manualOpenRequested;
+            private bool _initialObservationEnded;
+            private bool _jobCoverage;
+            private bool _passivePendingObserver;
+            private bool _attachedExisting;
+            private bool _nativeTrayReady;
+            private long _nativeTrayReadyTimestamp;
+            private bool _exitRequested;
             private bool _exiting;
+            private bool _runtimeDisposed;
+            public bool Started { get; private set; }
 
             public TrayWrapperContext(string target, string targetArgs)
             {
                 _target = target;
                 _targetArgs = targetArgs;
-                StartTarget();
-                // No tray icon of its own: the wrapper is an invisible quiet launcher so the
-                // target app's OWN tray icon is the only one ever shown. This permanently
-                // removes the duplicate/broken "wrapper" icons next to GameSir, whisper-key,
-                // AutoHotkey, etc. Clicking the app's own icon (or "Launch now" in Startup
-                // Master) opens its GUI.
-                _hideTimer = new Timer { Interval = 1000 };
-                _hideTimer.Tick += (s, e) => HideNewWindows();
-                _hideTimer.Start();
-                _watchTimer = new Timer { Interval = 5000 };
+                _displayName = ReadDisplayName(target);
+                _launcherPayloadCandidates = StartupService.LauncherPayloadCandidates(target).ToArray();
+                _windowEventCallback = OnWindowEvent;
+                // Subscribe before launching so even a host that spawns and exits before
+                // Process.Start returns cannot create an untracked grandchild.
+                _lineage = new ProcessLineageTracker(true);
+                _runtimePolicy.SetLineageWatcher(_lineage.WatcherRunning);
+                _dispatcher = new Control();
+                _dispatcher.CreateControl();
+                _jobTracker = new ProcessJobTracker(OnJobProcessAdded);
+                _runtimePolicy.SetJobObserver(_jobTracker.Running);
+                InstallBootstrapWindowObserver();
+                Started = StartTarget();
+                if (!Started) return;
+                _lastLineageRevision = _lineage.Revision;
+                MarkQualifiedStartupActivity();
+                RefreshScopedWindowObservers();
+                EnsureFallbackIcon();
+                _observeTimer = new Timer { Interval = 50 };
+                _observeTimer.Tick += (s, e) => ObserveStartup();
+                _observeTimer.Start();
+                _watchTimer = new Timer { Interval = SteadyAliveIntervalMilliseconds };
                 _watchTimer.Tick += (s, e) => CheckAlive();
                 _watchTimer.Start();
+                if (_attachedExisting)
+                {
+                    System.Threading.Volatile.Write(ref _suppressionComplete, true);
+                    ScanTrackedWindows(false);
+                }
+                ObserveStartup();
             }
 
-            private void StartTarget()
+            private bool StartTarget()
             {
                 try
                 {
-                    // Single instance per target: if the app is already running (another launcher
-                    // fired first, or the user started it manually), never start a second copy and
-                    // never add a second tray icon for it — quietly hand over instead.
-                    if (EnabledStartupService.IsProcessRunning(_target))
+                    if (TryAttachExistingTarget())
                     {
-                        _rootPid = 0;
-                        Environment.Exit(0);
-                        return;
+                        _attachedExisting = true;
+                        return true;
                     }
+                    _lineage.ResetForLaunch();
                     string execute, actionArgs;
                     StartupService.BuildDirectAction(_target, _targetArgs, out execute, out actionArgs);
-                    var psi = new ProcessStartInfo(execute, actionArgs)
+                    string workingDirectory = Directory.Exists(Path.GetDirectoryName(_target))
+                        ? Path.GetDirectoryName(_target)
+                        : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    return StartTrackedSuspended(execute, actionArgs, workingDirectory);
+                }
+                catch { return false; }
+            }
+
+            private bool StartTrackedSuspended(string execute, string actionArgs, string workingDirectory)
+            {
+                var startup = new StartupInfo
+                {
+                    Size = Marshal.SizeOf(typeof(StartupInfo)),
+                    Flags = StartfUseShowWindow,
+                    ShowWindow = SW_HIDE
+                };
+                ProcessInformation created;
+                string command = QuoteWindowsArgument(execute) + (string.IsNullOrWhiteSpace(actionArgs) ? "" : " " + actionArgs);
+                var mutableCommand = new StringBuilder(command);
+                if (!CreateProcess(execute, mutableCommand, IntPtr.Zero, IntPtr.Zero, false,
+                    CreateSuspended | CreateNoWindow, IntPtr.Zero, workingDirectory,
+                    ref startup, out created)) return false;
+
+                bool resumed = false;
+                try
+                {
+                    _rootPid = checked((int)created.ProcessId);
+                    long startedUtcTicks = ProcessLineageTracker.ReadStartTimeUtcTicks(_rootPid);
+                    if (startedUtcTicks <= 0) throw new InvalidOperationException("The suspended quiet target has no stable process generation");
+                    _lineage.SeedRoot(_rootPid, startedUtcTicks);
+                    using (var process = Process.GetProcessById(_rootPid))
+                        _jobCoverage = _jobTracker != null && _jobTracker.Assign(process);
+                    RefreshScopedWindowObservers();
+                    if (ResumeThread(created.Thread) == ResumeThreadFailed)
+                        throw new InvalidOperationException("The tracked quiet target could not be resumed");
+                    resumed = true;
+                    CaptureDescendants(true);
+                    return true;
+                }
+                catch
+                {
+                    if (!resumed) try { TerminateProcess(created.Process, 1); } catch { }
+                    throw;
+                }
+                finally
+                {
+                    if (created.Thread != IntPtr.Zero) CloseHandle(created.Thread);
+                    if (created.Process != IntPtr.Zero) CloseHandle(created.Process);
+                }
+            }
+
+            private bool TryAttachExistingTarget()
+            {
+                string execute, actionArgs;
+                StartupService.BuildDirectAction(_target, _targetArgs, out execute, out actionArgs);
+                List<NativeProcessInfo> snapshot = NativeProcessCatalog.SnapshotCandidates(execute, 250);
+                var matches = snapshot.Where(ProcessMatchesTarget).ToList();
+                // A short-lived FooLauncher.exe may already have handed off to the real
+                // desktop payload.  Attach to that exact deterministic payload rather than
+                // starting another launcher (which can create a second application instance
+                // and a second tray icon).
+                bool detachedLauncherPayload = false;
+                if (matches.Count == 0)
+                {
+                    matches = DetachedLauncherPayloadMatches();
+                    detachedLauncherPayload = matches.Count > 0;
+                }
+                if (matches.Count == 0) return false;
+                _lineage.ResetForLaunch();
+                // Do not put an already-running detached payload into our job: it was not
+                // created by this controller and must remain independent of its lifetime.
+                bool allAssigned = !detachedLauncherPayload && _jobTracker != null && _jobTracker.Running;
+                foreach (NativeProcessInfo match in matches)
+                {
+                    _lineage.SeedRoot(match.ProcessId, ProcessLineageTracker.ReadStartTimeUtcTicks(match.ProcessId));
+                    if (!detachedLauncherPayload)
                     {
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        // Start fully hidden so even a brief startup flash never reaches the desktop.
-                        WindowStyle = ProcessWindowStyle.Hidden,
-                        WorkingDirectory = Directory.Exists(Path.GetDirectoryName(_target)) ? Path.GetDirectoryName(_target) : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
-                    };
-                    var p = Process.Start(psi);
-                    _rootPid = p.Id;
-                    RefreshTree();
+                        try
+                        {
+                            using (var process = Process.GetProcessById(match.ProcessId))
+                                allAssigned = allAssigned && _jobTracker.Assign(process);
+                        }
+                        catch { allAssigned = false; }
+                    }
+                }
+                _jobCoverage = !detachedLauncherPayload && allAssigned;
+                _rootPid = matches[0].ProcessId;
+                return _lineage.LiveSnapshot().Length > 0;
+            }
+
+            private void OnJobProcessAdded(int processId)
+            {
+                if (processId <= 0 || System.Threading.Volatile.Read(ref _runtimeDisposed)) return;
+                long startTime = ProcessLineageTracker.ReadStartTimeUtcTicks(processId);
+                if (startTime <= 0) return;
+                if (_lineage.SeedRoot(processId, startTime) > 0) MarkQualifiedStartupActivity();
+                try
+                {
+                    if (_dispatcher != null && !_dispatcher.IsDisposed && _dispatcher.IsHandleCreated)
+                        _dispatcher.BeginInvoke(new Action(RefreshScopedWindowObservers));
                 }
                 catch { }
             }
 
-            private void HideNewWindows()
+            private static double ElapsedMilliseconds(long startTimestamp, long endTimestamp)
             {
-                if (_exiting) return;
+                if (endTimestamp <= startTimestamp) return 0;
+                return (endTimestamp - startTimestamp) * 1000.0 / Stopwatch.Frequency;
+            }
+
+            private bool ProcessMatchesTarget(NativeProcessInfo process)
+            {
+                if (process == null || process.ProcessId <= 0) return false;
+                string execute, actionArgs;
+                try { StartupService.BuildDirectAction(_target, _targetArgs, out execute, out actionArgs); }
+                catch { return false; }
+                string image = CanonicalPath(process.ExecutablePath);
+                if (image.Length == 0 || !string.Equals(image, CanonicalPath(execute), StringComparison.OrdinalIgnoreCase)) return false;
+                return CommandLineMatchesLaunchIdentity(process.CommandLine, _target, _targetArgs);
+            }
+
+            internal static string CanonicalPath(string value)
+            {
+                try { return string.IsNullOrWhiteSpace(value) ? "" : Path.GetFullPath(Environment.ExpandEnvironmentVariables(value.Trim().Trim('"'))).TrimEnd('\\'); }
+                catch { return ""; }
+            }
+
+            internal static bool CommandLineMatchesLaunchIdentity(string commandLine, string target, string arguments)
+            {
                 try
                 {
-                    RefreshTree();
-                    var pids = new HashSet<int>(_tree);
-                    if (_rootPid != 0) pids.Add(_rootPid);
-                    bool settled = (DateTime.UtcNow - _startedUtc).TotalSeconds > BootSettleSeconds;
-                    EnumWindows((h, l) =>
+                    string execute, actionArgs;
+                    StartupService.BuildDirectAction(target ?? "", arguments ?? "", out execute, out actionArgs);
+                    string expectedCommand = QuoteWindowsArgument(execute) + (string.IsNullOrWhiteSpace(actionArgs) ? "" : " " + actionArgs);
+                    string[] expected = ParseWindowsArguments(expectedCommand);
+                    string[] actual = ParseWindowsArguments(commandLine ?? "");
+                    if (expected.Length == 0 || actual.Length != expected.Length) return false;
+                    string canonicalTarget = CanonicalPath(target);
+                    for (int i = 0; i < expected.Length; i++)
                     {
-                        uint pid;
-                        GetWindowThreadProcessId(h, out pid);
-                        if (!pids.Contains((int)pid) || !IsWindowVisible(h)) return true;
-                        if (_exemptWindows.Contains(h)) return true;
-                        // After the boot settle period, a window we already hid that is visible
-                        // again means the user opened it on purpose (e.g. clicked the app's tray
-                        // icon) — leave it alone from then on.
-                        if (settled && _hiddenWindows.Contains(h)) { _exemptWindows.Add(h); return true; }
-                        ShowWindowAsync(h, SW_HIDE);
-                        _hiddenWindows.Add(h);
-                        return true;
-                    }, IntPtr.Zero);
+                        string expectedPath = CanonicalPath(expected[i]);
+                        string actualPath = CanonicalPath(actual[i]);
+                        bool pathToken = i == 0 || (canonicalTarget.Length > 0
+                            && string.Equals(expectedPath, canonicalTarget, StringComparison.OrdinalIgnoreCase));
+                        if (pathToken)
+                        {
+                            if (!string.Equals(expectedPath, actualPath, StringComparison.OrdinalIgnoreCase)) return false;
+                        }
+                        else if (!string.Equals(expected[i], actual[i], StringComparison.Ordinal)) return false;
+                    }
+                    return true;
+                }
+                catch { return false; }
+            }
+
+            private void ObserveStartup()
+            {
+                if (!_runtimePolicy.AllowCallback() || _exiting || _initialObservationEnded) return;
+                try
+                {
+                    CaptureDescendants(false);
+                    int lineageRevision = _lineage.Revision;
+                    if (lineageRevision != _lastLineageRevision)
+                    {
+                        _lastLineageRevision = lineageRevision;
+                        MarkQualifiedStartupActivity();
+                    }
+                    RefreshScopedWindowObservers();
+                    CaptureInitialWindows();
+                    DrainQueuedWindowEvents(!_suppressionComplete);
+
+                    long now = Stopwatch.GetTimestamp();
+                    double nativeTrayReadyElapsed = _nativeTrayReadyTimestamp == 0 ? 0
+                        : ElapsedMilliseconds(_nativeTrayReadyTimestamp, now);
+                    bool fallbackBootstrapReady = ShouldTreatFallbackAsBootstrapReady(
+                        _fallbackIcon != null, _launcherPayloadCandidates.Length > 0);
+                    if (ShouldCompleteBootstrapForTrayReady(_nativeTrayReady,
+                        fallbackBootstrapReady, _hiddenWindows.Count > 0, nativeTrayReadyElapsed))
+                    {
+                        CompleteInitialObservation();
+                        return;
+                    }
+
+                    double elapsed = ElapsedMilliseconds(_startedTimestamp, now);
+                    double sinceQualifiedActivity = ElapsedMilliseconds(
+                        System.Threading.Interlocked.Read(ref _lastQualifiedActivityTimestamp), now);
+
+                    if (!ShouldContinueBootstrapObservation(elapsed, sinceQualifiedActivity, _manualOpenRequested))
+                    {
+                        // Retire only the bootstrap-wide observers. Session suppression remains
+                        // active through exact-generation, process-scoped hooks until proxy Open.
+                        CaptureDescendants(false);
+                        ScanTrackedWindows(!_attachedExisting && !_suppressionComplete);
+                        RefreshScopedWindowObservers();
+                        CompleteInitialObservation();
+                    }
                 }
                 catch { }
+            }
+
+            private void MarkQualifiedStartupActivity()
+            {
+                System.Threading.Interlocked.Exchange(ref _lastQualifiedActivityTimestamp, Stopwatch.GetTimestamp());
+            }
+
+            private void CompleteInitialObservation()
+            {
+                if (_initialObservationEnded) return;
+                _initialObservationEnded = true;
+                System.Threading.Volatile.Write(ref _suppressionComplete,
+                    SuppressionCancelledAfterBootstrap(_suppressionComplete));
+                try { if (_observeTimer != null) _observeTimer.Stop(); } catch { }
+                UninstallWindowObserver();
+                if (_manualLineageTimer == null || !_manualLineageTimer.Enabled)
+                {
+                    _lineage.StopWatcher();
+                    _runtimePolicy.SetLineageWatcher(false);
+                }
+                _runtimePolicy.EnterSteady();
+                if (ShouldForceFallbackAfterBootstrap(_nativeTrayReady, _fallbackIcon != null))
+                    EnsureFallbackIcon(true);
+                if (ShouldExitNativeControllerAfterBootstrap(_nativeTrayReady, _fallbackIcon != null))
+                    ExitWrapper();
             }
 
             private void CheckAlive()
             {
-                if (_exiting) return;
+                if (!_runtimePolicy.AllowCallback() || _exiting) return;
                 try
                 {
-                    RefreshTree();
-                    bool anyAlive = false;
-                    var all = new HashSet<int>(_tree);
-                    if (_rootPid != 0) all.Add(_rootPid);
-                    foreach (int pid in all)
+                    // Steady state is exact-generation PID checks plus process-scoped hooks/job
+                    // notifications: no global process catalog and no top-level-window scan.
+                    bool anyAlive = _lineage.LiveSnapshot().Length > 0;
+                    RefreshScopedWindowObservers();
+                    DrainQueuedWindowEvents(false);
+                    if (_activationPolicy.PendingActivation)
                     {
-                        try { using (var p = Process.GetProcessById(pid)) { if (!p.HasExited) { anyAlive = true; break; } } }
-                        catch { }
+                        bool restored = RestoreKnownWindows() > 0;
+                        if (restored) _activationPolicy.QualifiedWindowArrived(true);
+                        if (!_activationPolicy.PendingActivation)
+                        {
+                            System.Threading.Volatile.Write(ref _manualOpenRequested, false);
+                            StopPendingActivationMonitor(true);
+                            return;
+                        }
+                        if (!anyAlive && _activationPolicy.ExactLineageDied() == ActivationAction.Launch)
+                        {
+                            StopPendingActivationMonitor(false);
+                            if (!LaunchManualOpen(false)) CleanupFailedManualActivation();
+                        }
+                        return;
                     }
-                    if (anyAlive) { _treeDeadSince = null; return; }
-                    if (_treeDeadSince == null) _treeDeadSince = DateTime.UtcNow;
-                    else if ((DateTime.UtcNow - _treeDeadSince.Value).TotalSeconds >= AutoExitGraceSeconds) ExitWrapper();
+                    if (_passivePendingObserver)
+                    {
+                        _passivePendingObserver = false;
+                        StopPendingActivationMonitor(true);
+                    }
+                    if (anyAlive) { _treeDeadTimestamp = 0; return; }
+                    if (_exitRequested) { ExitWrapper(); return; }
+                    if (RequiresPersistentController() && _fallbackIcon != null)
+                    {
+                        _treeDeadTimestamp = 0;
+                        return;
+                    }
+                    long now = Stopwatch.GetTimestamp();
+                    if (_treeDeadTimestamp == 0) _treeDeadTimestamp = now;
+                    else if (ElapsedMilliseconds(_treeDeadTimestamp, now) >= AutoExitGraceSeconds * 1000.0) ExitWrapper();
                 }
                 catch { }
             }
 
-            private void RefreshTree()
+            private void CaptureDescendants(bool force)
             {
-                _tree.Clear();
-                if (_rootPid == 0) return;
-                foreach (int pid in ChildProcessIds(_rootPid)) _tree.Add(pid);
+                if (_rootPid == 0 || _initialObservationEnded || _initialProcessSnapshots >= MaximumInitialProcessSnapshots) return;
+                int[] milestones = { 0, 250, 1000, 4000 };
+                long now = Stopwatch.GetTimestamp();
+                double elapsed = ElapsedMilliseconds(_startedTimestamp, now);
+                int due = milestones[Math.Min(_initialProcessSnapshots, milestones.Length - 1)];
+                if (!force && elapsed < due) return;
+                if (!force && _lastTreeCaptureTimestamp != 0 && ElapsedMilliseconds(_lastTreeCaptureTimestamp, now) < 100) return;
+                _lastTreeCaptureTimestamp = now;
+                _initialProcessSnapshots++;
+                CaptureDescendantsFromSingleSnapshot(_lineage, () => _runtimePolicy.CaptureProcesses(NativeProcessCatalog.ParentSnapshot));
+                CaptureDetachedLauncherPayloads();
+            }
+
+            // A launcher may deliberately detach its real desktop process from the Windows job.
+            // During the already-bounded bootstrap snapshots, attach only the exact deterministic
+            // payload path derived from that launcher's own name. Once seeded, the normal
+            // generation-aware steady-state PID checks keep the controller alive without broad
+            // polling or a second launch.
+            private void CaptureDetachedLauncherPayloads()
+            {
+                foreach (NativeProcessInfo process in DetachedLauncherPayloadMatches())
+                {
+                    long started = ProcessLineageTracker.ReadStartTimeUtcTicks(process.ProcessId);
+                    if (started <= 0) continue;
+                    if (_lineage.SeedRoot(process.ProcessId, started) > 0)
+                    {
+                        // The payload is intentionally detached; it is not guaranteed to be
+                        // covered by the launcher's job object even though it is a verified
+                        // process of this exact application identity.
+                        _jobCoverage = false;
+                        MarkQualifiedStartupActivity();
+                    }
+                }
+            }
+
+            private List<NativeProcessInfo> DetachedLauncherPayloadMatches()
+            {
+                if (_launcherPayloadCandidates == null || _launcherPayloadCandidates.Length == 0)
+                    return new List<NativeProcessInfo>();
+                var matches = new Dictionary<int, NativeProcessInfo>();
+                foreach (string payload in _launcherPayloadCandidates)
+                {
+                    string canonicalPayload = CanonicalPath(payload);
+                    if (canonicalPayload.Length == 0) continue;
+                    foreach (NativeProcessInfo process in NativeProcessCatalog.SnapshotCandidates(payload, 250))
+                    {
+                        if (process == null || process.ProcessId <= 0
+                            || !string.Equals(CanonicalPath(process.ExecutablePath), canonicalPayload, StringComparison.OrdinalIgnoreCase)
+                            || (process.CommandLine ?? "").IndexOf("--type=", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                        matches[process.ProcessId] = process;
+                    }
+                }
+                return matches.Values.OrderBy(p => p.ProcessId).ToList();
+            }
+
+            private void CaptureInitialWindows()
+            {
+                if (_initialObservationEnded || _initialWindowSnapshots >= MaximumInitialWindowSnapshots) return;
+                int[] milestones = { 0, 250, 1000, 4000 };
+                double elapsed = ElapsedMilliseconds(_startedTimestamp, Stopwatch.GetTimestamp());
+                int due = milestones[Math.Min(_initialWindowSnapshots, milestones.Length - 1)];
+                if (elapsed < due) return;
+                _initialWindowSnapshots++;
+                ScanTrackedWindows(!_suppressionComplete);
+            }
+
+            private void ScanTrackedWindows(bool allowHide)
+            {
+                var pids = new HashSet<int>(_lineage.LiveSnapshot());
+                _runtimePolicy.EnumerateWindows(() => EnumWindows((h, l) =>
+                {
+                    ObserveWindow(h, pids, allowHide);
+                    return true;
+                }, IntPtr.Zero));
+            }
+
+            private void DrainQueuedWindowEvents(bool allowHide)
+            {
+                var pids = new HashSet<int>(_lineage.LiveSnapshot());
+                IntPtr window;
+                int drained = 0;
+                while (drained++ < 2048 && _windowEvents.TryDequeue(out window))
+                    ObserveWindow(window, pids, allowHide);
+            }
+
+            private void ObserveWindow(IntPtr window, HashSet<int> pids, bool allowHide)
+            {
+                byte callbackMarker;
+                bool hiddenByCallback = _callbackHiddenWindows.TryRemove(window, out callbackMarker);
+                bool activatedByCallback = _callbackActivatedWindows.TryRemove(window, out callbackMarker);
+                if (window == IntPtr.Zero || !IsWindow(window) || GetAncestor(window, GetAncestorRoot) != window) return;
+                uint pid;
+                GetWindowThreadProcessId(window, out pid);
+                if (!pids.Contains((int)pid)) return;
+                var windowClass = new StringBuilder(256);
+                GetClassName(window, windowClass, windowClass.Capacity);
+                bool windowVisible = IsWindowVisible(window);
+                bool windowHasTitle = HasWindowTitle(window);
+                if (ShouldAcceptRuntimeNativeTrayHost(
+                    QuietLaunchPlanner.DeclaresNativeTrayCapability(_target),
+                    IsDefiniteRuntimeTrayHostClass(windowClass.ToString(), windowVisible, windowHasTitle)))
+                {
+                    if (!_nativeTrayReady)
+                        _nativeTrayReadyTimestamp = Stopwatch.GetTimestamp();
+                    _nativeTrayReady = true;
+                    if (ShouldRemoveFallbackForRuntimeNative(_nativeTrayReady, _fallbackIcon != null))
+                        DisposeFallbackIcon();
+                }
+                if (windowHasTitle) _restorableWindows.Add(window);
+                if (activatedByCallback)
+                {
+                    _restorableWindows.Add(window);
+                    return;
+                }
+                if (hiddenByCallback)
+                {
+                    _hiddenWindows.Add(window);
+                    _restorableWindows.Add(window);
+                    EnsureFallbackIcon();
+                    return;
+                }
+                if (!allowHide || !ShouldSuppressManagedWindow(_suppressionComplete, true, windowVisible)) return;
+                if (!HideWindowWithoutCompositorFrame(window)) return;
+                _hiddenWindows.Add(window);
+                _restorableWindows.Add(window);
+                EnsureFallbackIcon();
+            }
+
+            private void InstallBootstrapWindowObserver()
+            {
+                if (_bootstrapWindowHook != IntPtr.Zero || _initialObservationEnded) return;
+                try { _bootstrapWindowHook = SetWinEventHook(EventObjectShow, EventObjectShow, IntPtr.Zero, _windowEventCallback, 0, 0, WinEventOutOfContext | WinEventSkipOwnProcess); }
+                catch { _bootstrapWindowHook = IntPtr.Zero; }
+                _runtimePolicy.SetGlobalWindowHook(_bootstrapWindowHook != IntPtr.Zero);
+            }
+
+            private void RefreshScopedWindowObservers()
+            {
+                if (_runtimeDisposed || (_suppressionComplete && !_activationPolicy.PendingActivation)) return;
+                var live = new HashSet<int>(_lineage.LiveSnapshot());
+                foreach (var pair in _scopedWindowHooks.ToArray())
+                {
+                    if (live.Contains(pair.Value)) continue;
+                    int ignoredPid;
+                    if (_scopedWindowHooks.TryRemove(pair.Key, out ignoredPid)) try { UnhookWinEvent(pair.Key); } catch { }
+                }
+                foreach (int pid in live)
+                {
+                    if (_scopedWindowHooks.Values.Contains(pid)) continue;
+                    IntPtr hook = IntPtr.Zero;
+                    try { hook = SetWinEventHook(EventObjectShow, EventObjectShow, IntPtr.Zero, _windowEventCallback, (uint)pid, 0, WinEventOutOfContext | WinEventSkipOwnProcess); }
+                    catch { hook = IntPtr.Zero; }
+                    if (hook != IntPtr.Zero && !_scopedWindowHooks.TryAdd(hook, pid)) try { UnhookWinEvent(hook); } catch { }
+                }
+                _runtimePolicy.SetScopedWindowHookCount(_scopedWindowHooks.Count);
+            }
+
+            private void StopBootstrapWindowObserver()
+            {
+                IntPtr hook = _bootstrapWindowHook;
+                _bootstrapWindowHook = IntPtr.Zero;
+                if (hook != IntPtr.Zero) try { UnhookWinEvent(hook); } catch { }
+                WaitForCallbacksToDrain(() => System.Threading.Volatile.Read(ref _activeWindowCallbacks), 2000);
+                DrainQueuedWindowEvents(false);
+                _runtimePolicy.SetGlobalWindowHook(false);
+                _runtimePolicy.SetScopedWindowHookCount(_scopedWindowHooks.Count);
+            }
+
+            private void UninstallWindowObserver()
+            {
+                IntPtr bootstrap = _bootstrapWindowHook;
+                _bootstrapWindowHook = IntPtr.Zero;
+                if (bootstrap != IntPtr.Zero) try { UnhookWinEvent(bootstrap); } catch { }
+                foreach (var pair in _scopedWindowHooks.ToArray())
+                {
+                    int ignoredPid;
+                    if (_scopedWindowHooks.TryRemove(pair.Key, out ignoredPid)) try { UnhookWinEvent(pair.Key); } catch { }
+                }
+                WaitForCallbacksToDrain(() => System.Threading.Volatile.Read(ref _activeWindowCallbacks), 2000);
+                DrainQueuedWindowEvents(false);
+                _runtimePolicy.SetGlobalWindowHook(false);
+                _runtimePolicy.SetScopedWindowHookCount(0);
+            }
+
+            private void OnWindowEvent(IntPtr hook, uint eventType, IntPtr window, int objectId, int childId, uint eventThread, uint eventTime)
+            {
+                System.Threading.Interlocked.Increment(ref _activeWindowCallbacks);
+                bool queueEvidence = false;
+                try
+                {
+                    int scopedPid;
+                    bool bootstrapHook = hook != IntPtr.Zero && hook == _bootstrapWindowHook;
+                    bool scopedHook = _scopedWindowHooks.TryGetValue(hook, out scopedPid);
+                    if ((!bootstrapHook && !scopedHook) || System.Threading.Volatile.Read(ref _runtimeDisposed)
+                        || System.Threading.Volatile.Read(ref _exiting) || System.Threading.Volatile.Read(ref _exitRequested)
+                        || !_runtimePolicy.AllowCallback() || eventType != EventObjectShow || objectId != ObjectIdWindow
+                        || childId != 0 || window == IntPtr.Zero) return;
+                    queueEvidence = true;
+                    bool suppressionComplete = System.Threading.Volatile.Read(ref _suppressionComplete);
+                    bool manualOpenRequested = System.Threading.Volatile.Read(ref _manualOpenRequested);
+                    bool pendingActivation = _activationPolicy.PendingActivation;
+                    if ((pendingActivation || (!suppressionComplete && !manualOpenRequested))
+                        && IsWindow(window) && GetAncestor(window, GetAncestorRoot) == window)
+                    {
+                        uint pid;
+                        GetWindowThreadProcessId(window, out pid);
+                        ProcessLineageTracker lineage = _lineage;
+                        bool exactGenerationTracked = lineage != null && (!scopedHook || scopedPid == (int)pid)
+                            && lineage.Contains((int)pid) && lineage.IsCurrentInstance((int)pid);
+                        if (!exactGenerationTracked && bootstrapHook && lineage != null
+                            && lineage.TryPromoteCurrentAncestry((int)pid, ReadCurrentProcessAncestryIdentity))
+                            exactGenerationTracked = lineage.IsCurrentInstance((int)pid);
+                        if (exactGenerationTracked) MarkQualifiedStartupActivity();
+                        bool visible = exactGenerationTracked && IsWindowVisible(window);
+                        if (pendingActivation && exactGenerationTracked && visible)
+                        {
+                            bool restored = RestoreWindowForUser(window);
+                            bool focused = restored && SetForegroundWindow(window);
+                            if (_activationPolicy.QualifiedWindowArrived(restored && focused) == ActivationAction.Restore)
+                                _callbackActivatedWindows.TryAdd(window, 0);
+                        }
+                        else if (!pendingActivation
+                            && ShouldSuppressManagedWindow(suppressionComplete || manualOpenRequested, exactGenerationTracked, visible)
+                            && HideWindowWithoutCompositorFrame(window))
+                        {
+                            _callbackHiddenWindows.TryAdd(window, 0);
+                        }
+                    }
+                }
+                catch { }
+                finally
+                {
+                    if (queueEvidence) _windowEvents.Enqueue(window);
+                    System.Threading.Interlocked.Decrement(ref _activeWindowCallbacks);
+                }
+            }
+
+            private bool RequiresPersistentController()
+            {
+                string extension = Path.GetExtension(_target ?? "").ToLowerInvariant();
+                return extension != ".exe" && extension != ".com";
+            }
+
+            private void EnsureFallbackIcon(bool allowDeclaredNativeFallback = false)
+            {
+                if (_exiting || _exitRequested || !ShouldCreateFallbackIcon(_fallbackIcon != null)) return;
+                // When the target declares its own native tray implementation, the
+                // controller may still suppress boot UI but must never add a second icon.
+                if (!allowDeclaredNativeFallback && QuietLaunchPlanner.DeclaresNativeTrayCapability(_target)) return;
+                try
+                {
+                    _fallbackImage = ExtractActualLaunchIcon(_target, _targetArgs);
+                    if (_fallbackImage == null)
+                        throw new InvalidOperationException("The quiet target exposes no usable application icon");
+                    _fallbackMenu = new ContextMenuStrip();
+                    _fallbackOpenItem = new ToolStripMenuItem("Open " + _displayName);
+                    _fallbackOpenItem.Click += (s, e) => OpenTargetWindow();
+                    _fallbackExitItem = new ToolStripMenuItem("Exit " + _displayName);
+                    _fallbackExitItem.Click += (s, e) => RequestTargetExit();
+                    _fallbackMenu.Items.Add(_fallbackOpenItem);
+                    _fallbackMenu.Items.Add(new ToolStripSeparator());
+                    _fallbackMenu.Items.Add(_fallbackExitItem);
+                    _fallbackIcon = new NotifyIcon
+                    {
+                        Icon = _fallbackImage,
+                        Text = LimitText(_displayName + " - quiet startup", 63),
+                        ContextMenuStrip = _fallbackMenu,
+                        Visible = true
+                    };
+                    _fallbackIcon.MouseClick += (s, e) =>
+                    {
+                        if (e.Button != MouseButtons.Left) return;
+                        long now = Stopwatch.GetTimestamp();
+                        long prior = _lastProxyActivationTimestamp;
+                        if (prior != 0 && ElapsedMilliseconds(prior, now) < SystemInformation.DoubleClickTime) return;
+                        _lastProxyActivationTimestamp = now;
+                        OpenTargetWindow();
+                    };
+                }
+                catch { DisposeFallbackIcon(); }
+            }
+
+            private static Icon ExtractActualLaunchIcon(string target, string targetArgs)
+            {
+                foreach (string candidate in ActualLaunchIconCandidates(target, targetArgs))
+                {
+                    try
+                    {
+                        Icon associated = Icon.ExtractAssociatedIcon(candidate);
+                        if (associated != null) return associated;
+                    }
+                    catch { }
+
+                    ShellFileInfo shellInfo;
+                    try
+                    {
+                        if (SHGetFileInfo(candidate, 0, out shellInfo, (uint)Marshal.SizeOf(typeof(ShellFileInfo)),
+                            ShellGetFileInfoIcon | ShellGetFileInfoLargeIcon) == IntPtr.Zero || shellInfo.Icon == IntPtr.Zero)
+                            continue;
+                        try { return (Icon)Icon.FromHandle(shellInfo.Icon).Clone(); }
+                        finally { DestroyIcon(shellInfo.Icon); }
+                    }
+                    catch { }
+                }
+                return null;
+            }
+
+            private static IEnumerable<string> ActualLaunchIconCandidates(string target, string targetArgs)
+            {
+                var candidates = new List<string>();
+                // Prefer the verified payload sibling of a short-lived launcher. This keeps the
+                // fallback tray icon attributable to the actual application rather than a blank
+                // generic launcher icon, without ever using Mich Startup Master's own icon.
+                foreach (string payload in StartupService.LauncherPayloadCandidates(target))
+                {
+                    string canonicalPayload = CanonicalPath(payload);
+                    if (canonicalPayload.Length > 0 && File.Exists(canonicalPayload)) candidates.Add(canonicalPayload);
+                }
+                string canonicalTarget = CanonicalPath(target);
+                if (canonicalTarget.Length > 0 && File.Exists(canonicalTarget)) candidates.Add(canonicalTarget);
+                string execute, ignoredArguments;
+                try
+                {
+                    StartupService.BuildDirectAction(target ?? "", targetArgs ?? "", out execute, out ignoredArguments);
+                    string canonicalExecute = CanonicalPath(execute);
+                    if (canonicalExecute.Length > 0 && File.Exists(canonicalExecute)
+                        && !string.Equals(canonicalExecute, canonicalTarget, StringComparison.OrdinalIgnoreCase))
+                        candidates.Add(canonicalExecute);
+                }
+                catch { }
+                return candidates.Distinct(StringComparer.OrdinalIgnoreCase);
+            }
+
+            private void OpenTargetWindow()
+            {
+                if (_exiting || _exitRequested) return;
+                System.Threading.Volatile.Write(ref _suppressionComplete, true);
+                System.Threading.Volatile.Write(ref _manualOpenRequested, true);
+                CompleteInitialObservation();
+                UninstallWindowObserver();
+                int restored = RestoreKnownWindows();
+                if (restored == 0)
+                {
+                    ScanTrackedWindowsForActivation();
+                    restored = RestoreKnownWindows();
+                }
+                bool exactLineageAlive = restored == 0 && AnyTrackedProcessAlive();
+                ActivationAction action = _activationPolicy.RequestOpen(restored > 0, exactLineageAlive);
+                if (action == ActivationAction.Restore)
+                {
+                    System.Threading.Volatile.Write(ref _manualOpenRequested, false);
+                    StopPendingActivationMonitor(true);
+                    return;
+                }
+                if (action == ActivationAction.WaitForExistingLineage)
+                {
+                    RefreshScopedWindowObservers();
+                    StartPendingActivationMonitor();
+                    return;
+                }
+                if (action == ActivationAction.Launch && !LaunchManualOpen(false)) CleanupFailedManualActivation();
+            }
+
+            private void StartPendingActivationMonitor()
+            {
+                if (_pendingActivationTimer != null && _pendingActivationTimer.Enabled) return;
+                try
+                {
+                    if (_pendingActivationTimer != null) _pendingActivationTimer.Dispose();
+                    _passivePendingObserver = false;
+                    _pendingCaptureStartedTimestamp = Stopwatch.GetTimestamp();
+                    if (!_jobCoverage) _runtimePolicy.SetLineageWatcher(_lineage.StartWatcher());
+                    RefreshScopedWindowObservers();
+                    // The first enumeration ran before process-scoped hooks were reinstalled.
+                    // Enumerate once more after hook installation so a window created in that
+                    // handoff gap is either already known or guaranteed to generate a later event.
+                    ScanTrackedWindowsForActivation();
+                    if (RestoreKnownWindows() > 0
+                        && _activationPolicy.QualifiedWindowArrived(true) == ActivationAction.Restore)
+                    {
+                        System.Threading.Volatile.Write(ref _manualOpenRequested, false);
+                        StopPendingActivationMonitor(true);
+                        return;
+                    }
+                    _runtimePolicy.SetManualTimer(true);
+                    _pendingActivationTimer = new Timer { Interval = 100 };
+                    _pendingActivationTimer.Tick += (s, e) =>
+                    {
+                        if (!_runtimePolicy.AllowCallback() || _exiting || _exitRequested)
+                        {
+                            StopPendingActivationMonitor(true);
+                            return;
+                        }
+                        var pids = new HashSet<int>(_lineage.LiveSnapshot());
+                        DrainQueuedWindowEvents(false);
+                        bool restored = RestoreKnownWindows() > 0;
+                        if (restored) _activationPolicy.QualifiedWindowArrived(true);
+                        if (!_activationPolicy.PendingActivation)
+                        {
+                            System.Threading.Volatile.Write(ref _manualOpenRequested, false);
+                            StopPendingActivationMonitor(true);
+                            return;
+                        }
+                        if (pids.Count == 0 && _activationPolicy.ExactLineageDied() == ActivationAction.Launch)
+                        {
+                            StopPendingActivationMonitor(false);
+                            if (!LaunchManualOpen(false)) CleanupFailedManualActivation();
+                            return;
+                        }
+                        if (!ShouldKeepPendingLineageCapture(
+                            ElapsedMilliseconds(_pendingCaptureStartedTimestamp, Stopwatch.GetTimestamp()), true))
+                            EnterPassivePendingObserver();
+                    };
+                    _pendingActivationTimer.Start();
+                }
+                catch { CleanupFailedManualActivation(); }
+            }
+
+            private void ScanTrackedWindowsForActivation()
+            {
+                bool manualCaptureAlreadyRunning = _manualLineageTimer != null && _manualLineageTimer.Enabled;
+                if (!manualCaptureAlreadyRunning) _runtimePolicy.BeginManual();
+                try { ScanTrackedWindows(false); }
+                finally { if (!manualCaptureAlreadyRunning) _runtimePolicy.EndManual(); }
+            }
+
+            private void EnterPassivePendingObserver()
+            {
+                try { if (_pendingActivationTimer != null) { _pendingActivationTimer.Stop(); _pendingActivationTimer.Dispose(); } } catch { }
+                _pendingActivationTimer = null;
+                _runtimePolicy.SetManualTimer(false);
+                _passivePendingObserver = true;
+                if (_manualLineageTimer == null)
+                {
+                    _lineage.StopWatcher();
+                    _runtimePolicy.SetLineageWatcher(false);
+                }
+            }
+
+            private void StopPendingActivationMonitor(bool removeObserver)
+            {
+                try { if (_pendingActivationTimer != null) { _pendingActivationTimer.Stop(); _pendingActivationTimer.Dispose(); } } catch { }
+                _pendingActivationTimer = null;
+                _passivePendingObserver = false;
+                _runtimePolicy.SetManualTimer(false);
+                if (_manualLineageTimer == null)
+                {
+                    _lineage.StopWatcher();
+                    _runtimePolicy.SetLineageWatcher(false);
+                    if (removeObserver) UninstallWindowObserver();
+                }
+            }
+
+            private void CleanupFailedManualActivation()
+            {
+                System.Threading.Volatile.Write(ref _manualOpenRequested, false);
+                _activationPolicy.CancelPending();
+                StopPendingActivationMonitor(true);
+            }
+
+            private int RestoreKnownWindows()
+            {
+                IntPtr foreground = IntPtr.Zero;
+                int restored = 0;
+                var pids = new HashSet<int>(_lineage.LiveSnapshot());
+                foreach (IntPtr window in _restorableWindows.Concat(_hiddenWindows).Distinct().ToArray())
+                {
+                    if (!IsWindow(window))
+                    {
+                        _restorableWindows.Remove(window);
+                        _hiddenWindows.Remove(window);
+                        continue;
+                    }
+                    uint ownerPid;
+                    GetWindowThreadProcessId(window, out ownerPid);
+                    if (!pids.Contains((int)ownerPid) || !_lineage.IsCurrentInstance((int)ownerPid))
+                    {
+                        _restorableWindows.Remove(window);
+                        _hiddenWindows.Remove(window);
+                        continue;
+                    }
+                    if (RestoreWindowForUser(window))
+                    {
+                        foreground = window;
+                        restored++;
+                    }
+                }
+                if (foreground == IntPtr.Zero || !SetForegroundWindow(foreground)) return 0;
+                return restored;
+            }
+
+            private bool LaunchManualOpen(bool preserveExistingLineage)
+            {
+                if (_exitRequested || _exiting) return false;
+                try
+                {
+                    _runtimePolicy.SetLineageWatcher(_lineage.StartWatcher());
+                    if (!preserveExistingLineage)
+                    {
+                        _lineage.ResetForLaunch();
+                        _hiddenWindows.Clear();
+                        _restorableWindows.Clear();
+                    }
+                    string execute, actionArgs;
+                    StartupService.BuildDirectAction(_target, _targetArgs, out execute, out actionArgs);
+                    var process = Process.Start(new ProcessStartInfo(execute, actionArgs)
+                    {
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        WorkingDirectory = Directory.Exists(Path.GetDirectoryName(_target)) ? Path.GetDirectoryName(_target) : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                    });
+                    if (process == null) return false;
+                    _jobCoverage = (_jobTracker != null && _jobTracker.Assign(process)) || _jobCoverage;
+                    if (!preserveExistingLineage) _rootPid = process.Id;
+                    _lineage.SeedRoot(process.Id, ProcessLineageTracker.ReadStartTimeUtcTicks(process.Id));
+                    _treeDeadTimestamp = 0;
+                    BeginManualLineageCapture();
+                    return true;
+                }
+                catch { return false; }
+            }
+
+            private void BeginManualLineageCapture()
+            {
+                _manualProcessSnapshots = 0;
+                _runtimePolicy.BeginManual();
+                try
+                {
+                    if (_manualLineageTimer != null)
+                    {
+                        _manualLineageTimer.Stop();
+                        _manualLineageTimer.Dispose();
+                    }
+                    _manualLineageTimer = new Timer { Interval = 250 };
+                    _manualLineageTimer.Tick += (s, e) =>
+                    {
+                        if (!_runtimePolicy.AllowCallback() || _exiting || _exitRequested) { StopManualLineageCapture(); return; }
+                        CaptureDescendantsFromSingleSnapshot(_lineage, () => _runtimePolicy.CaptureProcesses(NativeProcessCatalog.ParentSnapshot));
+                        _manualProcessSnapshots++;
+                        DrainQueuedWindowEvents(false);
+                        if (_manualProcessSnapshots >= 2) StopManualLineageCapture();
+                    };
+                    _manualLineageTimer.Start();
+                }
+                catch { StopManualLineageCapture(); }
+            }
+
+            private void StopManualLineageCapture()
+            {
+                try { if (_manualLineageTimer != null) { _manualLineageTimer.Stop(); _manualLineageTimer.Dispose(); } } catch { }
+                _manualLineageTimer = null;
+                _runtimePolicy.EndManual();
+                bool pendingTimerRunning = _pendingActivationTimer != null && _pendingActivationTimer.Enabled;
+                if (ShouldTearDownScopedObserver(_initialObservationEnded,
+                    _activationPolicy.PendingActivation, pendingTimerRunning))
+                {
+                    UninstallWindowObserver();
+                }
+                if (!_activationPolicy.PendingActivation && !pendingTimerRunning)
+                {
+                    _lineage.StopWatcher();
+                    _runtimePolicy.SetLineageWatcher(false);
+                }
+            }
+
+            private bool AnyTrackedProcessAlive()
+            {
+                foreach (int pid in _lineage.LiveSnapshot())
+                {
+                    try { using (var process = Process.GetProcessById(pid)) { if (!process.HasExited) return true; } }
+                    catch { }
+                }
+                return false;
+            }
+
+            private void RequestTargetExit()
+            {
+                if (_exiting || _exitRequested) return;
+                // Latch shutdown before touching windows. A queued proxy Open event can no
+                // longer restore or relaunch the target while its close requests are in flight.
+                System.Threading.Volatile.Write(ref _exitRequested, true);
+                System.Threading.Volatile.Write(ref _suppressionComplete, true);
+                System.Threading.Volatile.Write(ref _manualOpenRequested, false);
+                _activationPolicy.CancelPending();
+                try { if (_observeTimer != null) _observeTimer.Stop(); } catch { }
+                StopPendingActivationMonitor(false);
+                StopManualLineageCapture();
+                UninstallWindowObserver();
+                try { if (_fallbackOpenItem != null) _fallbackOpenItem.Enabled = false; } catch { }
+                try { if (_fallbackExitItem != null) _fallbackExitItem.Enabled = false; } catch { }
+                try { if (_fallbackIcon != null) _fallbackIcon.Text = LimitText(_displayName + " - closing", 63); } catch { }
+                var pids = new HashSet<int>(_lineage.LiveSnapshot());
+                try
+                {
+                    UncloakTrackedWindows(pids);
+                    EnumWindows((h, l) =>
+                    {
+                        uint pid;
+                        GetWindowThreadProcessId(h, out pid);
+                        if (pids.Contains((int)pid)) PostMessage(h, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                        return true;
+                    }, IntPtr.Zero);
+                    foreach (int pid in pids)
+                    {
+                        try { using (var p = Process.GetProcessById(pid)) p.CloseMainWindow(); }
+                        catch { }
+                    }
+                }
+                catch { }
+                if (pids.Count == 0) ExitWrapper();
+            }
+
+            private void DisposeFallbackIcon()
+            {
+                try { if (_fallbackIcon != null) { _fallbackIcon.Visible = false; _fallbackIcon.Dispose(); } } catch { }
+                try { if (_fallbackMenu != null) _fallbackMenu.Dispose(); } catch { }
+                try { if (_fallbackImage != null) _fallbackImage.Dispose(); } catch { }
+                _fallbackIcon = null;
+                _fallbackMenu = null;
+                _fallbackOpenItem = null;
+                _fallbackExitItem = null;
+                _fallbackImage = null;
             }
 
             private void ExitWrapper()
             {
                 if (_exiting) return;
-                _exiting = true;
-                try { if (_hideTimer != null) { _hideTimer.Stop(); _hideTimer.Dispose(); } } catch { }
-                try { if (_watchTimer != null) { _watchTimer.Stop(); _watchTimer.Dispose(); } } catch { }
+                System.Threading.Volatile.Write(ref _exiting, true);
+                DisposeRuntimeResources();
                 try { ExitThread(); } catch { }
+            }
+
+            private void DisposeRuntimeResources()
+            {
+                if (_runtimeDisposed) return;
+                System.Threading.Volatile.Write(ref _runtimeDisposed, true);
+                try { if (_observeTimer != null) { _observeTimer.Stop(); _observeTimer.Dispose(); } } catch { }
+                try { if (_watchTimer != null) { _watchTimer.Stop(); _watchTimer.Dispose(); } } catch { }
+                try { if (_manualLineageTimer != null) { _manualLineageTimer.Stop(); _manualLineageTimer.Dispose(); } } catch { }
+                try { if (_pendingActivationTimer != null) { _pendingActivationTimer.Stop(); _pendingActivationTimer.Dispose(); } } catch { }
+                _observeTimer = null;
+                _watchTimer = null;
+                _manualLineageTimer = null;
+                _pendingActivationTimer = null;
+                UninstallWindowObserver();
+                UncloakTrackedWindows(new HashSet<int>(_lineage.LiveSnapshot()));
+                try { if (_jobTracker != null) _jobTracker.Dispose(); } catch { }
+                DisposeFallbackIcon();
+                try { _lineage.Dispose(); } catch { }
+                try { if (_dispatcher != null) _dispatcher.Dispose(); } catch { }
+                IntPtr ignored;
+                while (_windowEvents.TryDequeue(out ignored)) { }
+                _callbackHiddenWindows.Clear();
+                _callbackActivatedWindows.Clear();
+                _cloakedWindows.Clear();
+                _runtimePolicy.Dispose();
+            }
+
+            private bool HideWindowWithoutCompositorFrame(IntPtr window)
+            {
+                if (window == IntPtr.Zero || !IsWindow(window)) return false;
+                int cloaked = 1;
+                bool compositorCloaked = false;
+                try
+                {
+                    compositorCloaked = DwmSetWindowAttribute(window, DwmWindowAttributeCloak, ref cloaked, sizeof(int)) == 0;
+                    if (compositorCloaked) _cloakedWindows.TryAdd(window, 0);
+                }
+                catch { compositorCloaked = false; }
+
+                if (ShowWindowAsync(window, SW_HIDE)) return true;
+                if (compositorCloaked) UncloakWindow(window);
+                return false;
+            }
+
+            private bool RestoreWindowForUser(IntPtr window)
+            {
+                if (window == IntPtr.Zero || !IsWindow(window)) return false;
+                UncloakWindow(window);
+                return ShowWindowAsync(window, SW_RESTORE);
+            }
+
+            private void UncloakWindow(IntPtr window)
+            {
+                byte ignored;
+                if (!_cloakedWindows.TryRemove(window, out ignored)) return;
+                int uncloaked = 0;
+                try { DwmSetWindowAttribute(window, DwmWindowAttributeCloak, ref uncloaked, sizeof(int)); }
+                catch { }
+            }
+
+            private void UncloakTrackedWindows(HashSet<int> livePids)
+            {
+                if (livePids == null || livePids.Count == 0) return;
+                foreach (IntPtr window in _cloakedWindows.Keys.ToArray())
+                {
+                    if (!IsWindow(window))
+                    {
+                        byte ignored;
+                        _cloakedWindows.TryRemove(window, out ignored);
+                        continue;
+                    }
+                    uint ownerPid;
+                    GetWindowThreadProcessId(window, out ownerPid);
+                    if (livePids.Contains((int)ownerPid) && _lineage.IsCurrentInstance((int)ownerPid))
+                        UncloakWindow(window);
+                }
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing) DisposeRuntimeResources();
+                base.Dispose(disposing);
+            }
+
+            private static bool HasWindowTitle(IntPtr window)
+            {
+                try
+                {
+                    var title = new StringBuilder(256);
+                    return GetWindowText(window, title, title.Capacity) > 0 && !string.IsNullOrWhiteSpace(title.ToString());
+                }
+                catch { return false; }
+            }
+
+            private static string ReadDisplayName(string target)
+            {
+                try
+                {
+                    FileVersionInfo info = FileVersionInfo.GetVersionInfo(target);
+                    if (!string.IsNullOrWhiteSpace(info.FileDescription)) return info.FileDescription.Trim();
+                    if (!string.IsNullOrWhiteSpace(info.ProductName)) return info.ProductName.Trim();
+                }
+                catch { }
+                string fallback = Path.GetFileNameWithoutExtension(target ?? "");
+                return string.IsNullOrWhiteSpace(fallback) ? "Quiet application" : fallback;
+            }
+
+            private static string LimitText(string value, int maximum)
+            {
+                string text = value ?? "";
+                return text.Length <= maximum ? text : text.Substring(0, maximum);
             }
         }
 
-        private static IEnumerable<int> ChildProcessIds(int rootPid)
+    }
+
+    internal static class StartupUiTheme
+    {
+        [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int valueSize);
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] private static extern int SetWindowTheme(IntPtr hwnd, string subAppName, string subIdList);
+        internal static readonly Color Bg = Color.FromArgb(15, 18, 22);
+        internal static readonly Color Surface = Color.FromArgb(24, 28, 34);
+        internal static readonly Color Surface2 = Color.FromArgb(34, 40, 48);
+        internal static readonly Color Border = Color.FromArgb(65, 75, 87);
+        internal static readonly Color Accent = Color.FromArgb(43, 179, 165);
+        internal static readonly Color TextMain = Color.FromArgb(242, 245, 247);
+        internal static readonly Color TextOnColor = Color.FromArgb(12, 16, 20);
+        internal static readonly Color Muted = Color.FromArgb(184, 193, 203);
+        internal static readonly Color Good = Color.FromArgb(63, 174, 122);
+        internal static readonly Color Danger = Color.FromArgb(176, 48, 62);
+        internal static readonly Color DangerText = Color.FromArgb(255, 176, 181);
+        internal static readonly Color Warn = Color.FromArgb(210, 162, 65);
+        internal static readonly Color Steel = Color.FromArgb(56, 105, 161);
+        internal static readonly Color SteelText = Color.FromArgb(126, 169, 221);
+        internal static readonly Color DisabledBack = Color.FromArgb(30, 35, 42);
+        internal static readonly Color DisabledText = Color.FromArgb(184, 193, 203);
+        internal static readonly Color SelectedRow = Color.FromArgb(36, 72, 80);
+
+        internal static void ApplyNativeDarkChrome(Form form, params Control[] explorerControls)
         {
-            var ids = new List<int>();
+            if (form == null || !form.IsHandleCreated || SystemInformation.HighContrast) return;
             try
             {
-                using (var searcher = new ManagementObjectSearcher("SELECT ProcessId FROM Win32_Process WHERE ParentProcessId=" + rootPid))
-                {
-                    foreach (ManagementObject mo in searcher.Get())
-                    {
-                        int pid = Convert.ToInt32(mo["ProcessId"]);
-                        ids.Add(pid);
-                        ids.AddRange(ChildProcessIds(pid));
-                    }
-                }
+                int enabled = 1;
+                if (DwmSetWindowAttribute(form.Handle, 20, ref enabled, sizeof(int)) != 0) DwmSetWindowAttribute(form.Handle, 19, ref enabled, sizeof(int));
             }
             catch { }
-            return ids;
+            foreach (Control control in explorerControls ?? new Control[0])
+            {
+                if (control == null) continue;
+                try { if (!control.IsHandleCreated) control.CreateControl(); SetWindowTheme(control.Handle, "DarkMode_Explorer", null); }
+                catch { }
+            }
         }
+
+        internal static Color ForegroundFor(Color background)
+        {
+            return background == Danger || background == Steel ? TextMain :
+                (background == Surface || background == Surface2 ? TextMain : TextOnColor);
+        }
+
+        internal static Color Mix(Color from, Color to, int percent)
+        {
+            percent = Math.Max(0, Math.Min(100, percent));
+            int inverse = 100 - percent;
+            return Color.FromArgb((from.R * inverse + to.R * percent) / 100, (from.G * inverse + to.G * percent) / 100, (from.B * inverse + to.B * percent) / 100);
+        }
+
+        internal static GraphicsPath RoundedPath(Rectangle bounds, int radius)
+        {
+            int diameter = Math.Max(2, radius * 2);
+            var path = new GraphicsPath();
+            bounds.Width = Math.Max(1, bounds.Width - 1); bounds.Height = Math.Max(1, bounds.Height - 1);
+            path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+            path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        internal static void PaintButton(Control control, PaintEventArgs e, string text, Font font, bool enabled, bool hovered, bool pressed, bool selected, bool focused, Color tone, Color foreground, Color border)
+        {
+            if (SystemInformation.HighContrast)
+            {
+                Color highText = enabled ? SystemColors.ControlText : SystemColors.GrayText;
+                e.Graphics.Clear(control.Parent == null ? SystemColors.Window : control.Parent.BackColor);
+                ControlPaint.DrawButton(e.Graphics, control.ClientRectangle, pressed ? ButtonState.Pushed : (enabled ? ButtonState.Normal : ButtonState.Inactive));
+                TextRenderer.DrawText(e.Graphics, text, font, control.ClientRectangle, highText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                return;
+            }
+
+            Color back = enabled ? (selected ? Accent : tone) : DisabledBack;
+            Color textColor = enabled ? (selected ? TextOnColor : foreground) : DisabledText;
+            Color edge = enabled ? (selected ? Accent : border) : Border;
+            if (enabled && pressed) back = Mix(back, Color.Black, 12);
+            else if (enabled && hovered) back = Mix(back, Color.White, 8);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.Clear(control.Parent == null ? Bg : control.Parent.BackColor);
+            using (GraphicsPath path = RoundedPath(new Rectangle(Point.Empty, control.ClientSize), 7))
+            using (var fill = new SolidBrush(back))
+            using (var pen = new Pen(edge))
+            {
+                e.Graphics.FillPath(fill, path);
+                e.Graphics.DrawPath(pen, path);
+            }
+            TextRenderer.DrawText(e.Graphics, text, font, Rectangle.Inflate(control.ClientRectangle, -8, -3), textColor, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            if (focused)
+            {
+                Rectangle focus = Rectangle.Inflate(control.ClientRectangle, -4, -4);
+                ControlPaint.DrawFocusRectangle(e.Graphics, focus, textColor, back);
+            }
+        }
+    }
+
+    internal sealed class ThemedButton : Button
+    {
+        private bool _hovered, _pressed;
+        internal Color Tone { get; private set; }
+        internal Color ToneForeground { get; private set; }
+        internal Color ToneBorder { get; private set; }
+
+        internal ThemedButton(Color tone)
+        {
+            FlatStyle = FlatStyle.Flat; FlatAppearance.BorderSize = 0; UseVisualStyleBackColor = false;
+            SetTone(tone);
+        }
+
+        internal void SetTone(Color tone)
+        {
+            Tone = tone; ToneForeground = StartupUiTheme.ForegroundFor(tone);
+            ToneBorder = tone == StartupUiTheme.Surface || tone == StartupUiTheme.Surface2 ? StartupUiTheme.Border : tone;
+            BackColor = tone; ForeColor = ToneForeground; Invalidate();
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { _hovered = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { _hovered = false; _pressed = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) _pressed = true; Invalidate(); base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e) { _pressed = false; Invalidate(); base.OnMouseUp(e); }
+        protected override void OnEnabledChanged(EventArgs e) { Cursor = Enabled ? Cursors.Hand : Cursors.Default; Invalidate(); base.OnEnabledChanged(e); }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+        protected override void OnPaint(PaintEventArgs e) { StartupUiTheme.PaintButton(this, e, Text, Font, Enabled, _hovered, _pressed, false, Focused && ShowFocusCues, Tone, ToneForeground, ToneBorder); }
+    }
+
+    internal sealed class ThemedFilterButton : CheckBox
+    {
+        private bool _hovered, _pressed;
+        internal ThemedFilterButton()
+        {
+            Appearance = Appearance.Button; AutoCheck = false; FlatStyle = FlatStyle.Flat; FlatAppearance.BorderSize = 0;
+            BackColor = StartupUiTheme.Surface2; ForeColor = StartupUiTheme.TextMain; TextAlign = ContentAlignment.MiddleCenter;
+            AccessibleRole = AccessibleRole.CheckButton; Cursor = Cursors.Hand;
+        }
+        protected override void OnMouseEnter(EventArgs e) { _hovered = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { _hovered = false; _pressed = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) _pressed = true; Invalidate(); base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e) { _pressed = false; Invalidate(); base.OnMouseUp(e); }
+        protected override void OnEnabledChanged(EventArgs e) { Cursor = Enabled ? Cursors.Hand : Cursors.Default; Invalidate(); base.OnEnabledChanged(e); }
+        protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+        protected override void OnPaint(PaintEventArgs e) { StartupUiTheme.PaintButton(this, e, Checked ? "✓  " + Text : Text, Font, Enabled, _hovered, _pressed, Checked, Focused && ShowFocusCues, StartupUiTheme.Surface2, StartupUiTheme.TextMain, StartupUiTheme.Border); }
     }
 
     internal sealed class MainForm : Form
@@ -3084,151 +12549,878 @@ foreach($t in Get-ScheduledTask){
         private ListView _list;
         private TextBox _search;
         private Label _summary, _visibleValue, _enabledValue, _disabledValue, _reviewValue, _managedValue, _hint;
-        private Button _refresh, _disable, _enable, _add, _editSelected, _deleteManaged, _clearSearch, _showAll, _showRisky, _showCleanup, _showDisabled, _quietSelected, _protectNow, _enforceNow, _coverage, _openFolders;
+        private Label _selectionTitle, _selectionMeta, _detailTitle, _detailBody, _emptyTitle, _emptyBody;
+        private Button _refresh, _disable, _enable, _add, _editSelected, _clearSearch, _quietSelected, _launchSelected, _copySelected, _tools, _retry, _emptyPrimary, _emptySecondary;
+        private ThemedFilterButton _showAll, _showRisky, _showCleanup, _showDisabled;
+        private ContextMenuStrip _listMenu, _toolsMenu;
+        private ToolStripMenuItem _contextEdit, _contextState, _contextMode, _contextLaunch, _contextOpen, _contextCopy, _contextDelete;
+        private Panel _emptyState;
+        private ProgressBar _progress;
         private NotifyIcon _tray;
-        private Timer _guardTimer;
+        private Timer _watchTimer;
         private ToolTip _tooltip;
         private bool _reallyExit;
         private bool _isRefreshing;
+        private bool _watchScanRunning;
+        private bool _emptyRetryMode;
         private int _refreshVersion;
+        // Never open on an aggregate or a restricted subset.  The first visible inventory must
+        // preserve every independently controllable startup registration one-for-one.
         private string _filterMode = "All";
+        private string _routeTargetFilter;
         private readonly bool _startInTray;
-        private readonly Color Bg = Color.FromArgb(7, 12, 18), Surface = Color.FromArgb(16, 28, 36), Surface2 = Color.FromArgb(24, 42, 52), Accent = Color.FromArgb(20, 184, 166), TextMain = Color.FromArgb(243, 250, 247), Muted = Color.FromArgb(158, 176, 173), Good = Color.FromArgb(52, 211, 153), Danger = Color.FromArgb(239, 68, 68), Warn = Color.FromArgb(245, 158, 11), Steel = Color.FromArgb(59, 130, 246);
+        private readonly bool _runtimeEnabled;
+        private bool _allowVisible;
+        private bool _dpiLayoutReady;
+        private bool _dpiGeometryApplied;
+        private float _dpiGeometryScale = 1f;
+        private float _layoutScale = 1f;
+        private DateTime? _lastRefresh;
+        private readonly List<Label> _metricCaptions = new List<Label>();
+        private readonly Color Bg = StartupUiTheme.Bg, Surface = StartupUiTheme.Surface, Surface2 = StartupUiTheme.Surface2, Border = StartupUiTheme.Border, Accent = StartupUiTheme.Accent, TextMain = StartupUiTheme.TextMain, Muted = StartupUiTheme.Muted, Good = StartupUiTheme.Good, Danger = StartupUiTheme.Danger, Warn = StartupUiTheme.Warn, Steel = StartupUiTheme.Steel;
+
+        private sealed class InventoryRow
+        {
+            internal string Key;
+            internal string TargetIdentity;
+            internal List<StartupItem> Routes;
+            internal StartupItem Primary;
+            internal bool IsAppSummary;
+            internal bool IsAmbiguous { get { return Routes != null && Routes.Count > 1; } }
+            internal bool AllEnabled { get { return Routes != null && Routes.Count > 0 && Routes.All(x => x.StateText() == "Enabled"); } }
+            internal bool AllDisabled { get { return Routes != null && Routes.Count > 0 && Routes.All(x => x.StateText() == "Disabled"); } }
+            internal bool HasAttention { get { return Routes != null && Routes.Any(x => x.RiskLevel() == "Critical" || x.RiskLevel() == "Review" || x.AdviceLevel() == "Cleanup"); } }
+            internal bool HasManaged { get { return Routes != null && Routes.Any(x => x.IsManaged); } }
+        }
 
         public static string UiContractJson()
         {
-            return "{\"columns\":[\"Status\",\"Application\",\"Startup entry\",\"Source\",\"Risk\",\"Cleanup\",\"Popup\",\"Location\",\"Launch command\"],\"popupEnabledLabel\":\"Enabled\",\"popupDisabledLabel\":\"Disabled\",\"popupNotApplicableLabel\":\"N/A\",\"oneClickPopupToggle\":true,\"trayIcon\":true,\"trayDoubleClickOpens\":true,\"startInTrayArgument\":\"--start-in-tray\",\"asyncRefresh\":true,\"humanReadableNames\":true,\"greenCleanupAdvice\":true,\"contextMenu\":true,\"keyboardShortcuts\":true,\"filters\":[\"All\",\"High risk\",\"Suggested cleanup\",\"Disabled\"],\"tools\":[\"Add startup\",\"Edit startup\",\"Remove startup\",\"Restore startup\",\"Make quiet\",\"Launch now\",\"Open location\",\"Copy command\",\"Protect disabled\",\"Enforce now\",\"Open startup folders\"]}";
+            return JsonSerializer.Serialize(new
+            {
+                layout = "responsive-native-control-center",
+                defaultFilter = "All routes",
+                filters = new[] { "Apps", "All routes", "Needs attention", "Disabled" },
+                columns = new[] { "Application", "Status", "Mode", "Source", "Impact", "Startup entry" },
+                detailFields = new[] { "Location", "Launch command" },
+                modeLabels = new[] { "Window", "Quiet (tray)", "Not supported" },
+                stateModeSeparated = true,
+                oneClickPopupToggle = true,
+                trayIcon = true,
+                actualApplicationTrayIconOnly = true,
+                trayDoubleClickOpens = true,
+                startInTrayArgument = "--start-in-tray",
+                startInTrayPrePaintSuppression = true,
+                asyncRefresh = true,
+                refreshIsReadOnly = true,
+                humanReadableNames = true,
+                appsAggregatedByCanonicalTarget = true,
+                appsNeverAggregatedByDisplayName = true,
+                allRoutesRemainRouteLevel = true,
+                defaultViewIsCompleteRouteInventory = true,
+                aggregateNonBulkActionsFailClosed = true,
+                aggregateBulkDisableTransactional = true,
+                aggregateManageRoutesOneClick = true,
+                contextualActions = true,
+                globalToolsInMenu = true,
+                keyboardShortcuts = true,
+                accessibilityNames = true,
+                emptyLoadingErrorStates = true,
+                defaultNewMode = "Window",
+                explicitDpiGeometry = true,
+                perMonitorDpiTransitions = true,
+                accessibleCheckedFilters = true,
+                themedActualDisabledState = true,
+                immersiveDarkTitleBarRequested = true,
+                nativeDarkExplorerScrollbarsRequested = true,
+                verifiedDpiTargets = new[] { 96, 144, 192 },
+                disabledEditRequiresEnable = true,
+                capabilityAwareActions = true,
+                expertBootChangeConfirmation = true,
+                elevationAndRebootReasons = true,
+                externalAuthorityState = true,
+                multiActionTasksDisableEditQuietAndRun = true,
+                minimumSize = new[] { 1060, 700 },
+                tools = new[] { "Add startup", "Edit startup", "Disable at boot", "Enable at boot", "Quiet (tray)", "Window mode", "Run now", "Open location", "Copy command", "Protect disabled", "Repair startup rules", "Verify coverage", "Open startup folders", "Permanently delete managed task" }
+            });
         }
 
-        public MainForm(bool startInTray = false)
+        internal static bool VerifyLiveInventory(out string receipt)
+        {
+            var scanned = StartupService.ScanAll();
+            int invalid = scanned.Count(item => item == null || string.IsNullOrWhiteSpace(item.Id) || string.IsNullOrWhiteSpace(item.Source) || string.IsNullOrWhiteSpace(item.Location));
+            int providerErrors = scanned.Count(item => item != null && (item.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase));
+            int duplicateInventoryIds = scanned.Where(item => item != null && !string.IsNullOrWhiteSpace(item.Id)).GroupBy(item => item.Id, StringComparer.OrdinalIgnoreCase).Count(group => group.Count() > 1);
+            int rendered = 0, missing = 0, unexpected = 0, duplicateRenderedIds = 0, aggregateRows = 0, searchMissing = 0;
+            string firstSearchMissing = "";
+            try
+            {
+                using (var form = new MainForm(false, false))
+                {
+                    form._items = scanned;
+                    form.SetFilter("All");
+                    var rows = form._list.Items.Cast<ListViewItem>().Select(item => item.Tag as InventoryRow).Where(row => row != null).ToList();
+                    rendered = rows.Count;
+                    aggregateRows = rows.Count(row => row.IsAppSummary || row.Routes == null || row.Routes.Count != 1);
+                    var expectedIds = new HashSet<string>(scanned.Where(item => item != null && !string.IsNullOrWhiteSpace(item.Id)).Select(item => item.Id), StringComparer.OrdinalIgnoreCase);
+                    var renderedIds = rows.Select(row => row.Primary == null ? "" : (row.Primary.Id ?? "")).Where(id => !string.IsNullOrWhiteSpace(id)).ToList();
+                    missing = expectedIds.Count(id => !renderedIds.Contains(id, StringComparer.OrdinalIgnoreCase));
+                    unexpected = renderedIds.Count(id => !expectedIds.Contains(id));
+                    duplicateRenderedIds = renderedIds.GroupBy(id => id, StringComparer.OrdinalIgnoreCase).Count(group => group.Count() > 1);
+
+                    // The dashboard search is part of the visibility contract, not a cosmetic
+                    // convenience.  Probe every real row with its own displayed name (falling
+                    // back to its location), so a valid route cannot be collected yet vanish
+                    // when the user types the app name — the GCC regression case.
+                    foreach (var item in scanned.Where(item => item != null && !string.IsNullOrWhiteSpace(item.Id)))
+                    {
+                        string query = !string.IsNullOrWhiteSpace(item.Name) ? item.Name.Trim() : (item.Location ?? "").Trim();
+                        if (query.Length == 0) { searchMissing++; if (firstSearchMissing.Length == 0) firstSearchMissing = item.Id; continue; }
+                        var searchedRows = form.BuildVisibleRows(query);
+                        bool found = searchedRows.Any(row => row.Primary != null && string.Equals(row.Primary.Id, item.Id, StringComparison.OrdinalIgnoreCase));
+                        if (!found)
+                        {
+                            searchMissing++;
+                            if (firstSearchMissing.Length == 0) firstSearchMissing = item.Name + " [" + item.Id + "]";
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                receipt = "LIVE_INVENTORY_VERIFY passed=false reason=render_error error=" + ex.GetBaseException().Message;
+                return false;
+            }
+
+            string boot = StartupService.AuditBootCoverage();
+            bool bootClean = Regex.IsMatch(boot ?? "", @"(?:^|\s)independent=true(?:\s|$)")
+                && Regex.IsMatch(boot ?? "", @"(?:^|\s)gaps=0(?:\s|$)")
+                && Regex.IsMatch(boot ?? "", @"(?:^|\s)errors=0(?:\s|$)");
+            bool passed = scanned.Count > 0 && invalid == 0 && providerErrors == 0 && duplicateInventoryIds == 0
+                && rendered == scanned.Count && aggregateRows == 0 && missing == 0 && unexpected == 0 && duplicateRenderedIds == 0 && searchMissing == 0 && bootClean;
+            receipt = "LIVE_INVENTORY_VERIFY passed=" + passed.ToString().ToLowerInvariant()
+                + " scanned=" + scanned.Count + " rendered=" + rendered + " invalid=" + invalid
+                + " provider_errors=" + providerErrors + " duplicate_inventory_ids=" + duplicateInventoryIds
+                + " duplicate_rendered_ids=" + duplicateRenderedIds + " aggregate_rows=" + aggregateRows
+                + " missing=" + missing + " unexpected=" + unexpected + " search_missing=" + searchMissing
+                + (firstSearchMissing.Length == 0 ? "" : " first_search_missing=" + firstSearchMissing)
+                + " boot_audit_clean=" + bootClean.ToString().ToLowerInvariant();
+            return passed;
+        }
+
+        public static MainForm CreatePreview(float scale)
+        {
+            var form = new MainForm(false, false);
+            form.Text = "Mich Startup Master — Safe UI preview (no system access)";
+            ForceLayout(form);
+            if (scale > 0f)
+            {
+                scale = Math.Max(1f, Math.Min(2f, scale));
+                SimulateTargetDpi(form, form._dpiGeometryScale, scale);
+                form.Size = new Size((int)Math.Round(1360 * scale), (int)Math.Round(820 * scale));
+                form.Text += " — " + (int)Math.Round(scale * 100) + "% layout simulation";
+            }
+            else
+            {
+                form.Text += " — actual " + form.DeviceDpi + " DPI";
+            }
+            form._items = PreviewItems(); form._lastRefresh = DateTime.Now; form.RenderList();
+            ForceLayout(form);
+            return form;
+        }
+
+        public static string UiSelfTest()
+        {
+            int checks = 0;
+            bool traceEnabled = string.Equals(Environment.GetEnvironmentVariable("MICH_UI_SELFTEST_TRACE"), "1", StringComparison.Ordinal);
+            Action<string> trace = stage => { if (traceEnabled) Console.Error.WriteLine("UI_SELF_TEST_STAGE " + stage); };
+            trace("begin");
+            foreach (float scale in new[] { 1f, 1.5f, 2f })
+            {
+                trace("main-create-" + scale.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                using (var main = new MainForm(false, false))
+                {
+                    ForceLayout(main);
+                    trace("main-layout-" + scale.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                    SimulateTargetDpi(main, main._dpiGeometryScale, scale);
+                    main.Size = new Size((int)Math.Round(1060 * scale), (int)Math.Round(700 * scale));
+                    main._items = PreviewItems(); main.RenderList();
+                    trace("main-render-" + scale.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                    var allRouteRows = main._list.Items.Cast<ListViewItem>().Select(i => (InventoryRow)i.Tag).ToList();
+                    var previewIds = main._items.Select(item => item.Id).OrderBy(id => id, StringComparer.OrdinalIgnoreCase).ToList();
+                    var renderedIds = allRouteRows.Select(row => row.Primary.Id).OrderBy(id => id, StringComparer.OrdinalIgnoreCase).ToList();
+                    if (main._filterMode != "All" || !main._showRisky.Checked || new[] { main._showAll, main._showRisky, main._showCleanup, main._showDisabled }.Count(x => x.Checked) != 1) throw new InvalidOperationException("The dashboard must open on the complete All routes inventory.");
+                    if (allRouteRows.Count != main._items.Count || allRouteRows.Any(row => row.IsAppSummary || row.Routes == null || row.Routes.Count != 1) || !previewIds.SequenceEqual(renderedIds, StringComparer.OrdinalIgnoreCase)) throw new InvalidOperationException("The default inventory must render every discovered startup registration exactly once, without aggregation or omission.");
+                    if (main._visibleValue.Text != allRouteRows.Count.ToString() || main._enabledValue.Text != allRouteRows.Count(row => row.AllEnabled).ToString() || main._disabledValue.Text != allRouteRows.Count(row => row.AllDisabled).ToString() || main._managedValue.Text != allRouteRows.Count(row => row.HasManaged).ToString()) throw new InvalidOperationException("All-routes metrics do not describe the complete rendered inventory.");
+                    foreach (StartupItem route in main._items)
+                    {
+                        string query = !string.IsNullOrWhiteSpace(route.Name) ? route.Name : route.Location;
+                        if (!main.BuildVisibleRows(query).Any(row => row.Primary != null && string.Equals(row.Primary.Id, route.Id, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException("A route cannot be found by searching its displayed name: " + route.Id);
+                    }
+                    checks += main._items.Count;
+
+                    // The empty-state recovery is an inventory escape hatch, not a shortcut to
+                    // the aggregate Apps view.  A stale search must recover every exact route.
+                    main.SetFilter("Apps");
+                    main._search.Text = "__mich-startup-master-no-match__";
+                    // The self-test form is intentionally never shown, so WinForms reports a
+                    // child control as not Visible even after ShowEmptyState sets it true.
+                    // Assert its actual model/action state instead of parent-dependent paint.
+                    if (main._list.Items.Count != 0 || main._emptyRetryMode || main._emptySecondary.Text.IndexOf("Clear", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("A no-match filter did not expose the normal Clear filters recovery action.");
+                    InvokeButtonClickForTest(main._emptySecondary);
+                    var recoveredRouteRows = main._list.Items.Cast<ListViewItem>().Select(i => (InventoryRow)i.Tag).ToList();
+                    if (main._filterMode != "All" || !main._showRisky.Checked || !string.IsNullOrWhiteSpace(main._routeTargetFilter) || !string.IsNullOrWhiteSpace(main._search.Text)
+                        || recoveredRouteRows.Count != main._items.Count || recoveredRouteRows.Any(row => row.IsAppSummary || row.Routes == null || row.Routes.Count != 1))
+                        throw new InvalidOperationException("Clear filters must restore the complete All routes inventory.");
+                    checks++;
+
+                    // Aggregation is optional and must never be the first or only presentation.
+                    main.SetFilter("Apps");
+                    var appRows = main._list.Items.Cast<ListViewItem>().Select(i => (InventoryRow)i.Tag).ToList();
+                    if (appRows.Count != 5) throw new InvalidOperationException("Apps view must render five canonical targets, not " + appRows.Count + " display-name or route rows.");
+                    InventoryRow openSpeedy = appRows.Single(row => row.Routes.Any(x => x.Id == "preview|openspeedy|task"));
+                    if (openSpeedy.Routes.Count != 2 || openSpeedy.AllEnabled || openSpeedy.AllDisabled || AggregateModeText(openSpeedy) != "Quiet (tray)") throw new InvalidOperationException("OpenSpeedy routes were not summarized into one correct mixed-state app row.");
+                    var twins = appRows.Where(row => string.Equals(row.Primary.HumanName(), "Twin utility", StringComparison.OrdinalIgnoreCase)).ToList();
+                    if (twins.Count != 2 || twins.Select(x => x.TargetIdentity).Distinct(StringComparer.OrdinalIgnoreCase).Count() != 2) throw new InvalidOperationException("Same-name apps with different canonical targets were incorrectly merged.");
+                    if (main._list.Items.Cast<ListViewItem>().Where(item => string.Equals(((InventoryRow)item.Tag).Primary.HumanName(), "Twin utility", StringComparison.OrdinalIgnoreCase)).Select(item => item.Text).Distinct(StringComparer.OrdinalIgnoreCase).Count() != 2) throw new InvalidOperationException("Same-name distinct targets are not visually disambiguated.");
+                    if (main._list.Groups.Count != 0 || main._list.ShowGroups) throw new InvalidOperationException("Native ListView groups can expose unthemed blue pseudo-link headers.");
+                    if (main._visibleValue.Text != appRows.Count.ToString() || main._enabledValue.Text != appRows.Count(x => x.AllEnabled).ToString() || main._disabledValue.Text != appRows.Count(x => x.AllDisabled).ToString() || main._managedValue.Text != appRows.Count(x => x.HasManaged).ToString()) throw new InvalidOperationException("Apps metrics do not describe the rendered aggregate rows.");
+                    if (!main._showAll.Checked || new[] { main._showAll, main._showRisky, main._showCleanup, main._showDisabled }.Count(x => x.Checked) != 1 || main._showAll.AccessibleRole != AccessibleRole.CheckButton) throw new InvalidOperationException("The active filter is not exposed as one checked accessible control.");
+                    Size checkedFilterText = TextRenderer.MeasureText("✓  " + main._showAll.Text.Replace("&", ""), main._showAll.Font, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+                    if (main._showAll.Width < checkedFilterText.Width + (int)Math.Round(18 * scale)) throw new InvalidOperationException("The non-color checked filter indicator is clipped at " + scale.ToString("0.0") + " scale.");
+
+                    ListViewItem openSpeedyItem = main._list.Items.Cast<ListViewItem>().Single(i => ReferenceEquals(i.Tag, openSpeedy));
+                    openSpeedyItem.Selected = true; openSpeedyItem.Focused = true; main._list.Select(); main.UpdateButtons(); main.UpdateContextMenu();
+                    if (!main._editSelected.Enabled || main._editSelected.Text.IndexOf("Manage 2 routes", StringComparison.OrdinalIgnoreCase) < 0 || main._disable.Text.IndexOf("Disable all 1", StringComparison.OrdinalIgnoreCase) < 0 || !CanBulkDisable(openSpeedy, true) || main._launchSelected.Enabled || main._quietSelected.Enabled || main._copySelected.Enabled || main._disable.Enabled || main._enable.Enabled || main._contextState.Enabled || main._contextMode.Enabled || main._contextLaunch.Enabled || main._contextOpen.Enabled || main._contextCopy.Enabled || main._contextDelete.Enabled) throw new InvalidOperationException("Aggregate bulk-disable or fail-closed non-bulk actions are incorrect.");
+                    if (main._detailBody.Text.IndexOf("1 enabled", StringComparison.OrdinalIgnoreCase) < 0 || main._detailBody.Text.IndexOf("1 disabled", StringComparison.OrdinalIgnoreCase) < 0 || main._detailBody.Text.IndexOf("rollback-safe transaction", StringComparison.OrdinalIgnoreCase) < 0 || main._selectionMeta.Text.IndexOf("Disable all is one rollback-safe transaction", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Aggregate details omit route counts or transactional bulk-disable guidance.");
+                    var blockedBulk = new InventoryRow { Routes = new List<StartupItem> { new StartupItem { Id = "preview|bulk|ok", Enabled = true, CanDisable = true }, new StartupItem { Id = "preview|bulk|blocked", Enabled = true, CanDisable = false, ExternalAuthority = "Policy" } }, Primary = openSpeedy.Primary, IsAppSummary = true };
+                    if (CanBulkDisable(blockedBulk, true) || BulkStateActionReason(blockedBulk).IndexOf("Policy", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Aggregate bulk disable does not fail closed before writes when one route is externally owned.");
+                    ForceLayout(main);
+                    var excluded = new HashSet<Control> { main._emptyState, main._progress, main._retry, main._disable, main._enable, main._quietSelected, main._launchSelected };
+                    AssertVisibleContainment(main, "MainForm@" + scale.ToString("0.0"), excluded, ref checks);
+                    AssertInteractiveLayout(main, "MainForm@" + scale.ToString("0.0"), excluded, ref checks);
+                    AssertAccessible(main, excluded, ref checks);
+                    trace("main-audit-" + scale.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                    foreach (Label caption in main._metricCaptions)
+                    {
+                        int preferredWidth = TextRenderer.MeasureText(caption.Text, caption.Font, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Width;
+                        if (caption.Width < preferredWidth || caption.Bottom > caption.Parent.ClientSize.Height + 1) throw new InvalidOperationException("Summary metric caption is clipped at " + scale.ToString("0.0") + " scale: " + caption.Text + ".");
+                    }
+                    if (main._list.Columns.Count != 6 || main._list.Columns[1].Text != "Status" || main._list.Columns[2].Text != "Mode") throw new InvalidOperationException("State and Mode must be separate primary columns.");
+                    if (main._list.Columns[1].Width < (int)Math.Round(130 * scale) - 1 || main._list.Columns[2].Width < (int)Math.Round(146 * scale) - 1 || main._list.SmallImageList.ImageSize.Height < (int)Math.Round(38 * scale) - 1) throw new InvalidOperationException("List categorical columns or row height regressed at " + scale.ToString("0.0") + " scale.");
+
+                    InvokeButtonClickForTest(main._editSelected);
+                    string manageState = "filter=" + main._filterMode + " target=" + (main._routeTargetFilter ?? "<null>") + " items=" + main._list.Items.Count + " selected=" + (main.Selected() == null ? "false" : "true") + " checked=" + main._showRisky.Checked;
+                    trace("main-manage-" + scale.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " " + manageState);
+                    bool managePassed = main._filterMode == "All" && !string.IsNullOrWhiteSpace(main._routeTargetFilter) && main._list.Items.Count == 2 && main.Selected() != null && main._showRisky.Checked;
+                    if (!managePassed) throw new InvalidOperationException("Manage routes did not switch to one canonical target's exact routes and focus the first route: " + manageState + ".");
+                    main.UpdateButtons(); main.UpdateContextMenu();
+                    if (main._add.Enabled || main._refresh.Enabled || main._tools.Enabled || main._launchSelected.Enabled || main._editSelected.Enabled || main._quietSelected.Enabled || main._copySelected.Enabled || main._disable.Enabled || main._enable.Enabled || main._contextState.Enabled || main._contextMode.Enabled || main._contextLaunch.Enabled || main._contextEdit.Enabled || main._contextOpen.Enabled || main._contextCopy.Enabled || main._contextDelete.Enabled) throw new InvalidOperationException("Safe preview/test mode exposes a live system action after selecting an exact route.");
+                    ListViewItem disabledRow = main._list.Items.Cast<ListViewItem>().Single(item => !((InventoryRow)item.Tag).Primary.Enabled);
+                    main._list.SelectedItems.Clear(); disabledRow.Selected = true; disabledRow.Focused = true; main.UpdateButtons();
+                    StartupItem disabledItem = ((InventoryRow)disabledRow.Tag).Primary;
+                    if (CanEditRoute(disabledItem, true) || DetailBodyFor(disabledItem).IndexOf("Enable this startup entry before editing it.", StringComparison.Ordinal) < 0) throw new InvalidOperationException("Disabled startup entries expose Edit or omit the fail-closed enable-first help.");
+                    var multiActionTask = new StartupItem { Id = @"task|\FixtureMulti", Enabled = true, CanDisable = true, Source = "Scheduled Task", Command = "one.exe || two.exe", Location = @"\FixtureMulti", Status = "Enabled Logon startup task; actions=2; modeEditable=false" };
+                    if (CanEditRoute(multiActionTask, true) || CanUseLaunchMode(multiActionTask, true) || CanLaunchRoute(multiActionTask, true) || ModeActionReason(multiActionTask, "").IndexOf("multiple or non-executable actions", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Multi-action scheduled tasks expose Edit, Run now, or Quiet mode instead of a capability explanation.");
+                    var expertRoute = new StartupItem { Id = "advanced|fixture", Name = "Fixture package", Source = "LSA Startup Package", Location = @"HKLM\SYSTEM\Fixture", Enabled = true, CanDisable = true, RequiresExpertConfirmation = true, RequiresElevation = true, RequiresReboot = true, MutationReason = "Exact indexed component can be removed transactionally" };
+                    string expertDetails = DetailBodyFor(expertRoute);
+                    if (StateActionReason(expertRoute).IndexOf("Expert confirmation", StringComparison.OrdinalIgnoreCase) < 0 || expertDetails.IndexOf("Administrator access: required", StringComparison.OrdinalIgnoreCase) < 0 || expertDetails.IndexOf("restart Windows", StringComparison.OrdinalIgnoreCase) < 0 || CapabilitySummary(expertRoute).IndexOf("Expert confirmation", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Expert boot routes omit confirmation, elevation, reboot, or rollback guidance.");
+                    var externalRoute = new StartupItem { Id = "gpscript|fixture", Name = "Domain script", Source = "Group Policy Script", Location = "Domain GPO", Enabled = true, CanDisable = false, ExternalAuthority = "Domain Group Policy", MutationReason = "Owned by Domain Group Policy; change it through that authority" };
+                    if (StateActionReason(externalRoute).IndexOf("Domain Group Policy", StringComparison.OrdinalIgnoreCase) < 0 || DetailBodyFor(externalRoute).IndexOf("Authority: Domain Group Policy", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Externally authoritative routes are presented as generic read-only entries.");
+                    checks += 8;
+                    if (!CoverageIsClean("BOOT_AUDIT independent=true independence_scope=enumerators sources=1 shown=1 gaps=0 errors=0 surfaces=Boot_Execute:1\r\nTRAY_AUDIT apps=2 running=2 findings=0 uncertain=0") || CoverageIsClean("BOOT_AUDIT independent=true independence_scope=enumerators sources=1 shown=1 gaps=0 errors=0 surfaces=Boot_Execute:1\r\nTRAY_AUDIT apps=2 running=1 findings=0 uncertain=0") || CoverageIsClean("BOOT_AUDIT independent=true independence_scope=enumerators sources=1 shown=1 gaps=0 errors=0 surfaces=Boot_Execute:1\r\nTRAY_AUDIT apps=2 running=2 findings=0 uncertain=1")) throw new InvalidOperationException("Coverage UI can report complete without every quiet app running and unambiguous.");
+                    if (Math.Abs(scale - 1f) < .01f)
+                    {
+                        AssertContrast("Accent active button", StartupUiTheme.ForegroundFor(main.Accent), main.Accent, ref checks); AssertContrast("Enabled active button", StartupUiTheme.ForegroundFor(main.Good), main.Good, ref checks); AssertContrast("Disable active button", StartupUiTheme.ForegroundFor(main.Danger), main.Danger, ref checks); AssertContrast("Warning active button", StartupUiTheme.ForegroundFor(main.Warn), main.Warn, ref checks); AssertContrast("Steel active button", StartupUiTheme.ForegroundFor(main.Steel), main.Steel, ref checks); AssertContrast("Neutral active button", main.TextMain, main.Surface2, ref checks);
+                        AssertContrast("Disabled button", StartupUiTheme.DisabledText, StartupUiTheme.DisabledBack, ref checks); AssertContrast("Accent hover button", StartupUiTheme.ForegroundFor(main.Accent), StartupUiTheme.Mix(main.Accent, Color.White, 8), ref checks); AssertContrast("Selected row", main.TextMain, StartupUiTheme.SelectedRow, ref checks); AssertContrast("Enabled row", main.Good, Color.FromArgb(19, 23, 29), ref checks); AssertContrast("Quiet row", main.Accent, Color.FromArgb(19, 23, 29), ref checks); AssertContrast("Muted row", main.Muted, Color.FromArgb(19, 23, 29), ref checks); AssertContrast("Warning row", main.Warn, Color.FromArgb(19, 23, 29), ref checks); AssertContrast("Error status", StartupUiTheme.DangerText, main.Bg, ref checks); AssertContrast("Managed metric", StartupUiTheme.SteelText, main.Surface, ref checks);
+                    }
+                    checks++;
+                }
+                trace("add-create-" + scale.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                using (var add = new AddStartupForm())
+                {
+                    ForceLayout(add);
+                    SimulateTargetDpi(add, add.DpiGeometryScale, scale);
+                    add.Size = new Size((int)Math.Round(720 * scale), (int)Math.Round(680 * scale));
+                    ForceLayout(add);
+                    if (add._status.Height < 28 || add._status.Width < 120 || add._status.Right > add._status.Parent.ClientSize.Width + 1 || add._status.Bottom > add._status.Parent.ClientSize.Height + 1) throw new InvalidOperationException("Add/Edit status and validation message area is clipped at " + scale.ToString("0.0") + " scale.");
+                    Size statusTextSize = TextRenderer.MeasureText(add._status.Text, add._status.Font, new Size(Math.Max(1, add._status.ClientSize.Width), int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+                    if (add._status.Height < statusTextSize.Height || !string.Equals(add._status.AccessibleDescription, add._status.Text, StringComparison.Ordinal)) throw new InvalidOperationException("Add status is not wrapped or accessibility-synchronized at " + scale.ToString("0.0") + " scale.");
+                    Size quietTextSize = TextRenderer.MeasureText(add._quietDescription.Text, add._quietDescription.Font, new Size(Math.Max(1, add._quietDescription.ClientSize.Width - add._quietDescription.Padding.Horizontal), int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+                    int quietTextHeight = quietTextSize.Height + add._quietDescription.Padding.Vertical;
+                    if (add._quietDescription.Height < quietTextHeight) throw new InvalidOperationException("Quiet-mode explanation is clipped at " + scale.ToString("0.0") + " scale: needs " + quietTextSize + ", has " + add._quietDescription.ClientSize + "; padding=" + add._quietDescription.Padding + " font=" + add._quietDescription.Font.SizeInPoints.ToString("0.00") + "pt deviceDpi=" + add.DeviceDpi + " productionScale=" + add.DpiGeometryScale.ToString("0.00") + " form=" + add.ClientSize + ".");
+                    var excluded = new HashSet<Control>();
+                    if (!add._advanced.Checked && add._args.Parent != null && add._args.Parent.Parent != null) excluded.Add(add._args.Parent.Parent);
+                    AssertVisibleContainment(add, "AddStartupForm@" + scale.ToString("0.0"), excluded, ref checks);
+                    AssertInteractiveLayout(add, "AddStartupForm@" + scale.ToString("0.0"), excluded, ref checks);
+                    AssertAccessible(add, excluded, ref checks);
+                    trace("add-audit-" + scale.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                    if (!add.UsesNormalDefault) throw new InvalidOperationException("New startup entries must default to Window mode.");
+                    add._advanced.Checked = true; ForceLayout(add); excluded.Clear();
+                    if (add._status.Height < 28 || add._quietDescription.Height < quietTextHeight) throw new InvalidOperationException("Advanced Add/Edit layout clips the status or Quiet-mode explanation at " + scale.ToString("0.0") + " scale: status=" + add._status.ClientSize + " quiet=" + add._quietDescription.ClientSize + " quietNeeded=" + quietTextHeight + ".");
+                    AssertVisibleContainment(add, "AddStartupFormAdvanced@" + scale.ToString("0.0"), excluded, ref checks);
+                    AssertInteractiveLayout(add, "AddStartupFormAdvanced@" + scale.ToString("0.0"), excluded, ref checks);
+                    AssertAccessible(add, excluded, ref checks);
+                    if (!AllControls(add).OfType<ThemedButton>().Any()) throw new InvalidOperationException("Add/Edit does not use the shared themed button control.");
+                    checks++;
+                }
+                trace("edit-create-" + scale.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                using (var edit = new AddStartupForm("Sample app", @"C:\Apps\Sample\Sample.exe", "--sample", true))
+                {
+                    ForceLayout(edit); SimulateTargetDpi(edit, edit.DpiGeometryScale, scale); edit.Size = new Size((int)Math.Round(720 * scale), (int)Math.Round(680 * scale)); ForceLayout(edit);
+                    if (!edit._advanced.Checked || !edit.TrayMode || edit._status.Height < TextRenderer.MeasureText(edit._status.Text, edit._status.Font, new Size(Math.Max(1, edit._status.ClientSize.Width), int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix).Height) throw new InvalidOperationException("Edit form clips advanced, quiet-mode, or live status content at " + scale.ToString("0.0") + " scale.");
+                    AssertVisibleContainment(edit, "EditStartupForm@" + scale.ToString("0.0"), new HashSet<Control>(), ref checks);
+                    AssertInteractiveLayout(edit, "EditStartupForm@" + scale.ToString("0.0"), new HashSet<Control>(), ref checks);
+                    AssertAccessible(edit, new HashSet<Control>(), ref checks);
+                    checks++;
+                }
+                trace("scale-complete-" + scale.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            trace("main-transition");
+            using (var transition = new MainForm(false, false))
+            {
+                ForceLayout(transition); Size original = transition.Size; Size originalList = transition._list.Size; float originalScale = transition._dpiGeometryScale;
+                foreach (float target in new[] { 1f, 1.5f, 2f, originalScale }) SimulateMainDpiTransition(transition, target);
+                if (Math.Abs(transition.Width - original.Width) > 3 || Math.Abs(transition.Height - original.Height) > 3 || Math.Abs(transition._list.Width - originalList.Width) > 3 || Math.Abs(transition._list.Height - originalList.Height) > 3) throw new InvalidOperationException("Per-monitor DPI round trip accumulated layout drift.");
+                checks++;
+            }
+            trace("add-transition");
+            using (var addTransition = new AddStartupForm("Sample app", @"C:\Apps\Sample\Sample.exe", "--sample", true))
+            {
+                ForceLayout(addTransition); Size original = addTransition.Size; Rectangle originalStatus = addTransition._status.Bounds; float originalScale = addTransition.DpiGeometryScale;
+                foreach (float target in new[] { 1f, 1.5f, 2f, originalScale }) addTransition.SimulateDpiTransitionForTest(target);
+                if (Math.Abs(addTransition.Width - original.Width) > 3 || Math.Abs(addTransition.Height - original.Height) > 3 || Math.Abs(addTransition._status.Left - originalStatus.Left) > 3 || Math.Abs(addTransition._status.Top - originalStatus.Top) > 3 || Math.Abs(addTransition._status.Width - originalStatus.Width) > 3 || Math.Abs(addTransition._status.Height - originalStatus.Height) > 3) throw new InvalidOperationException("Add/Edit per-monitor DPI round trip accumulated layout drift.");
+                checks++;
+            }
+            trace("hidden-start");
+            using (var hidden = new MainForm(true, false))
+            {
+                hidden.Visible = true;
+                if (hidden.Visible || hidden.ShowInTaskbar) throw new InvalidOperationException("Start-in-tray painted an initial window or taskbar button.");
+                checks++;
+                Message open = Message.Create(hidden.Handle, Program.OpenMainMessage, IntPtr.Zero, IntPtr.Zero);
+                hidden.WndProc(ref open);
+                if (!hidden.Visible || !hidden.ShowInTaskbar) throw new InvalidOperationException("Explicit main-window activation failed to release the hidden visibility gate.");
+                checks++;
+            }
+            trace("complete");
+            return "UI_SELF_TEST passed checks=" + checks + " scales=100,150,200 layouts=MainForm,AddStartupForm,EditStartupForm appAggregation=canonicalTarget allRoutes=routeLevel aggregateManageFlow=passed aggregateBulkDisable=transactional aggregateNonBulkActions=failClosed checkedFilters=true contrastAA=true dpiTransitionDrift=none darkChromeRequested=true startInTrayInitialVisible=false stateModeSeparated=true disabledEditFailClosed=true capabilityAwareActions=true expertConfirmation=true externalAuthority=true multiActionFailClosed=true";
+        }
+
+        private static List<StartupItem> PreviewItems()
+        {
+            return new List<StartupItem>
+            {
+                new StartupItem { Id = "preview|openspeedy|task", Name = "OpenSpeedy", AppName = "OpenSpeedy", Source = "Scheduled Task", Scope = "User", Command = @"C:\Apps\OpenSpeedy\OpenSpeedy.exe --minimize-to-tray", Location = @"\MichStartupMaster\OpenSpeedy", Enabled = true, CanDisable = true, IsManaged = true, Status = "Safe preview row" },
+                new StartupItem { Id = "preview|openspeedy|registry", Name = "OpenSpeedy helper", AppName = "OpenSpeedy helper", Source = "Registry Run", Scope = "User", Command = @"C:\Apps\OpenSpeedy\OpenSpeedy.exe --minimize-to-tray", Location = @"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", Enabled = false, CanDisable = true, IsManaged = false, Status = "Safe preview duplicate route" },
+                new StartupItem { Id = "preview|codex", Name = "Codex", AppName = "Codex", Source = "Startup Folder", Scope = "User", Command = @"C:\Apps\Codex\Codex.exe", Location = @"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview row" },
+                new StartupItem { Id = "preview|updater", Name = "Example Update Task", AppName = "Example updater", Source = "Scheduled Task", Scope = "User", Command = @"C:\Apps\Example\updater.exe --wake", Location = @"\Example\Updater", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview row" },
+                new StartupItem { Id = "preview|driver", Name = "ExampleDriver", AppName = "Example system driver", Source = "System Driver", Scope = "Machine", Command = @"C:\Windows\System32\drivers\example.sys", Location = @"HKLM\SYSTEM\CurrentControlSet\Services\ExampleDriver", Enabled = true, CanDisable = false, IsManaged = false, Status = "Safe preview row" },
+                new StartupItem { Id = "preview|twin|one", Name = "Twin utility route one", AppName = "Twin utility", Source = "Scheduled Task", Scope = "User", Command = @"C:\Apps\One\worker.exe", Location = @"\Example\TwinOne", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview same-name distinct target" },
+                new StartupItem { Id = "preview|twin|two", Name = "Twin utility route two", AppName = "Twin utility", Source = "Registry Run", Scope = "User", Command = @"C:\Apps\Two\worker.exe", Location = @"HKCU\Software\Example\TwinTwo", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview same-name distinct target" }
+            };
+        }
+
+        private static void ForceLayout(Control control)
+        {
+            var main = control as MainForm;
+            var add = control as AddStartupForm;
+            if (main != null) main.EnsureDpiGeometry();
+            else if (add != null) add.EnsureDpiGeometry();
+            else control.CreateControl();
+            control.PerformLayout();
+            foreach (Control child in control.Controls) ForceLayout(child);
+            control.PerformLayout();
+        }
+
+        internal static float RenderedDpiScale(Control control)
+        {
+            float dpi = Math.Max(96f, control.DeviceDpi);
+            try
+            {
+                using (Graphics graphics = control.CreateGraphics()) dpi = Math.Max(dpi, graphics.DpiX);
+            }
+            catch { }
+            return dpi / 96f;
+        }
+
+        private static void SimulateTargetDpi(Control root, float productionScale, float targetScale)
+        {
+            float ratio = targetScale / Math.Max(.01f, productionScale);
+            if (Math.Abs(ratio - 1f) > .01f)
+            {
+                root.SuspendLayout();
+                root.Scale(new SizeF(ratio, ratio));
+                ScaleFontsForTest(root, ratio);
+                root.ResumeLayout(true);
+                var main = root as MainForm;
+                if (main != null)
+                {
+                    if (main._listMenu != null) ScaleFontsForTest(main._listMenu, ratio);
+                    if (main._toolsMenu != null) ScaleFontsForTest(main._toolsMenu, ratio);
+                }
+            }
+            var mainLayout = root as MainForm;
+            if (mainLayout != null) mainLayout.SetLayoutScale(targetScale);
+            var add = root as AddStartupForm;
+            if (add != null) add.SetLayoutScale(targetScale);
+        }
+
+        // Point-sized fonts already rasterize at the monitor DPI in production. Tests and explicit
+        // preview simulations run on the current monitor, so snapshot every inherited/explicit font
+        // before changing any parent and adjust the point sizes only for that simulated target.
+        private static void ScaleFontsForTest(Control root, float ratio)
+        {
+            var controls = new List<Control>();
+            Action<Control> collect = null;
+            collect = control => { controls.Add(control); foreach (Control child in control.Controls) collect(child); };
+            collect(root);
+            var fonts = controls.Select(control => control.Font).ToArray();
+            for (int i = 0; i < controls.Count; i++)
+            {
+                Font font = fonts[i];
+                controls[i].Font = new Font(font.FontFamily, Math.Max(1f, font.SizeInPoints * ratio), font.Style, GraphicsUnit.Point, font.GdiCharSet);
+            }
+        }
+
+        private static IEnumerable<Control> AllControls(Control root)
+        {
+            foreach (Control child in root.Controls)
+            {
+                yield return child;
+                foreach (Control descendant in AllControls(child)) yield return descendant;
+            }
+        }
+
+        private static void InvokeButtonClickForTest(ButtonBase button)
+        {
+            // Button.PerformClick intentionally ignores an invisible control. Raise the same Click
+            // event without showing a test window so the real wired handler remains under test.
+            var click = button.GetType().GetMethod("OnClick", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (click == null) throw new InvalidOperationException("Could not locate the button click handler for the headless UI test.");
+            click.Invoke(button, new object[] { EventArgs.Empty });
+        }
+
+        private static void SimulateMainDpiTransition(MainForm main, float targetScale)
+        {
+            targetScale = Math.Max(1f, Math.Min(2f, targetScale));
+            float ratio = targetScale / Math.Max(.01f, main._dpiGeometryScale);
+            if (Math.Abs(ratio - 1f) > .01f)
+            {
+                main.SuspendLayout();
+                main.Scale(new SizeF(ratio, ratio));
+                ScaleFontsForTest(main, ratio);
+                if (main._listMenu != null) ScaleFontsForTest(main._listMenu, ratio);
+                if (main._toolsMenu != null) ScaleFontsForTest(main._toolsMenu, ratio);
+                main.ResumeLayout(true);
+            }
+            main._dpiGeometryScale = targetScale;
+            main.SetLayoutScale(targetScale);
+            ForceLayout(main);
+        }
+
+        private static void AssertVisibleContainment(Control parent, string path, HashSet<Control> excluded, ref int checks)
+        {
+            if (excluded.Contains(parent)) return;
+            foreach (Control child in parent.Controls)
+            {
+                if (excluded.Contains(child) || child.Width <= 1 || child.Height <= 1) continue;
+                if (child.Left < 0 || child.Top < 0 || child.Right > parent.ClientSize.Width + 1 || child.Bottom > parent.ClientSize.Height + 1) throw new InvalidOperationException(path + " clips visible " + (child.AccessibleName ?? child.Name ?? child.GetType().Name) + " bounds=" + child.Bounds + " parent=" + parent.ClientSize + ".");
+                checks++;
+                AssertVisibleContainment(child, path + "/" + child.GetType().Name, excluded, ref checks);
+            }
+        }
+
+        private static bool IsInteractive(Control control) { return control is ButtonBase || control is TextBoxBase || control is ListView; }
+
+        private static void AssertInteractiveLayout(Control parent, string path, HashSet<Control> excluded, ref int checks)
+        {
+            if (excluded.Contains(parent)) return;
+            var interactive = parent.Controls.Cast<Control>().Where(c => !excluded.Contains(c) && IsInteractive(c) && c.Width > 1 && c.Height > 1).ToList();
+            foreach (var control in interactive)
+            {
+                if (control.Left < 0 || control.Top < 0 || control.Right > parent.ClientSize.Width + 1 || control.Bottom > parent.ClientSize.Height + 1) throw new InvalidOperationException(path + " clips " + (control.AccessibleName ?? control.Name ?? control.GetType().Name) + " bounds=" + control.Bounds + " parent=" + parent.ClientSize + ".");
+                var button = control as ButtonBase;
+                if (button != null && !string.IsNullOrWhiteSpace(button.Text))
+                {
+                    Size textSize = TextRenderer.MeasureText(button.Text.Replace("&", ""), button.Font, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+                    int horizontalAllowance = button is Button ? 20 : 28;
+                    if (button.Width < textSize.Width + horizontalAllowance || button.Height < textSize.Height + 4) throw new InvalidOperationException(path + " clips button text " + (button.AccessibleName ?? button.Text) + " control=" + button.Size + " text=" + textSize + ".");
+                }
+                checks++;
+            }
+            for (int i = 0; i < interactive.Count; i++)
+            {
+                for (int j = i + 1; j < interactive.Count; j++)
+                {
+                    if (interactive[i].Bounds.IntersectsWith(interactive[j].Bounds)) throw new InvalidOperationException(path + " overlaps " + (interactive[i].AccessibleName ?? interactive[i].GetType().Name) + " and " + (interactive[j].AccessibleName ?? interactive[j].GetType().Name) + ".");
+                }
+            }
+            foreach (Control child in parent.Controls) AssertInteractiveLayout(child, path + "/" + child.GetType().Name, excluded, ref checks);
+        }
+
+        private static void AssertAccessible(Control parent, HashSet<Control> excluded, ref int checks)
+        {
+            if (excluded.Contains(parent)) return;
+            foreach (Control child in parent.Controls)
+            {
+                if (!excluded.Contains(child) && IsInteractive(child) && child.Width > 1 && child.Height > 1)
+                {
+                    if (string.IsNullOrWhiteSpace(child.AccessibleName)) throw new InvalidOperationException(child.GetType().Name + " is missing an accessible name.");
+                    checks++;
+                }
+                AssertAccessible(child, excluded, ref checks);
+            }
+        }
+
+        private static void AssertContrast(string name, Color foreground, Color background, ref int checks)
+        {
+            double lighter = Math.Max(RelativeLuminance(foreground), RelativeLuminance(background));
+            double darker = Math.Min(RelativeLuminance(foreground), RelativeLuminance(background));
+            double ratio = (lighter + .05) / (darker + .05);
+            if (ratio < 4.5) throw new InvalidOperationException(name + " contrast is " + ratio.ToString("0.00") + ":1; expected at least 4.5:1.");
+            checks++;
+        }
+
+        private static double RelativeLuminance(Color color)
+        {
+            Func<byte, double> channel = value => { double v = value / 255d; return v <= .04045 ? v / 12.92 : Math.Pow((v + .055) / 1.055, 2.4); };
+            return .2126 * channel(color.R) + .7152 * channel(color.G) + .0722 * channel(color.B);
+        }
+
+        public MainForm(bool startInTray = false, bool runtimeEnabled = true)
         {
             _startInTray = startInTray;
-            Text = "Mich Startup Master - Windows Boot Control";
-            Width = 1440; Height = 900; MinimumSize = new Size(1160, 760);
-            BackColor = Bg; Font = new Font("Segoe UI", 10f); DoubleBuffered = true; Icon = Program.AppIcon; KeyPreview = true;
+            _runtimeEnabled = runtimeEnabled;
+            _allowVisible = !startInTray;
+            Text = "Mich Startup Master — Startup Control";
+            Width = 1360; Height = 820; MinimumSize = new Size(1060, 700);
+            AutoScaleMode = AutoScaleMode.None;
+            StartPosition = FormStartPosition.CenterScreen;
+            BackColor = Bg; ForeColor = TextMain; Font = new Font("Segoe UI Variable Text", 9.5f); DoubleBuffered = true; Icon = Program.AppIcon; KeyPreview = true;
+            AccessibleName = "Mich Startup Master startup control center";
+            AccessibleDescription = "Review and control every discovered Windows startup route.";
+            ShowInTaskbar = !startInTray;
             _tooltip = new ToolTip { AutoPopDelay = 6000, InitialDelay = 400, ReshowDelay = 200, ShowAlways = true };
-            BuildUi(); BuildTray();
-            Load += (s, e) => { RefreshItems(); DetectNewStartupItems(); };
-            _guardTimer = new Timer { Interval = 30000 };
-            _guardTimer.Tick += (s, e) => { RunGuardsAsync(false); DetectNewStartupItems(); };
-            _guardTimer.Start();
-            FormClosing += OnClosingToTray;
-            Resize += (s, e) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
+            BuildUi();
             KeyDown += MainFormKeyDown;
-            Shown += (s, e) =>
+            if (_runtimeEnabled)
             {
-                if (_startInTray) BeginInvoke(new Action(HideToTray));
-                else if (_search != null) _search.Clear();
-            };
-            // A window that was hidden and is shown again (e.g. opened from the Start Menu while
-            // the hidden boot agent owns the window) must always present the full list.
-            VisibleChanged += (s, e) => { if (Visible && _search != null) _search.Clear(); };
+                BuildTray();
+                // A hidden logon agent stays genuinely idle. Opening the dashboard performs the
+                // first scan; a visible dashboard then checks at a deliberately slow cadence.
+                Load += (s, e) => { if (!_startInTray) RefreshItems(); };
+                _watchTimer = new Timer { Interval = 300000 };
+                _watchTimer.Tick += (s, e) => { if (Visible && !_isRefreshing) DetectNewStartupItems(); };
+                _watchTimer.Start();
+                FormClosing += OnClosingToTray;
+                Resize += (s, e) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
+                Shown += (s, e) => { if (!_startInTray && _search != null) _search.Focus(); };
+            }
+            else
+            {
+                _add.Enabled = false; _refresh.Enabled = false; _tools.Enabled = false; _emptyPrimary.Enabled = false; _retry.Enabled = false;
+                _selectionMeta.Text = "Safe preview — system access and startup changes are disabled.";
+                UpdateButtons();
+            }
+            if (SystemInformation.HighContrast) ApplyHighContrastTheme(this);
+            _dpiLayoutReady = true;
+            if (IsHandleCreated) ApplyInitialDpiGeometry();
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        protected override void OnHandleCreated(EventArgs e)
         {
-            using (var b = new LinearGradientBrush(ClientRectangle, Color.FromArgb(4, 12, 18), Color.FromArgb(22, 48, 42), 28f)) e.Graphics.FillRectangle(b, ClientRectangle);
-            using (var glow = new SolidBrush(Color.FromArgb(42, 20, 184, 166))) e.Graphics.FillEllipse(glow, Width - 420, -180, 620, 420);
-            using (var glow2 = new SolidBrush(Color.FromArgb(28, 245, 158, 11))) e.Graphics.FillEllipse(glow2, -180, Height - 260, 420, 320);
-            base.OnPaint(e);
+            base.OnHandleCreated(e);
+            StartupUiTheme.ApplyNativeDarkChrome(this, _list);
+            if (_dpiLayoutReady) ApplyInitialDpiGeometry();
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            Rectangle suggestedBounds = e.SuggestedRectangle;
+            base.OnDpiChanged(e);
+            if (!_dpiGeometryApplied) return;
+            float targetScale = Math.Max(1f, e.DeviceDpiNew / 96f);
+            float ratio = targetScale / Math.Max(.01f, _dpiGeometryScale);
+            if (Math.Abs(ratio - 1f) > .01f)
+            {
+                SuspendLayout();
+                Scale(new SizeF(ratio, ratio));
+                ResumeLayout(true);
+            }
+            if (suggestedBounds.Width > 0 && suggestedBounds.Height > 0) Bounds = suggestedBounds;
+            _dpiGeometryScale = targetScale;
+            SetLayoutScale(targetScale);
+            StartupUiTheme.ApplyNativeDarkChrome(this, _list);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _refreshVersion++;
+                if (_watchTimer != null) { _watchTimer.Stop(); _watchTimer.Dispose(); _watchTimer = null; }
+                if (_tray != null) { _tray.Visible = false; _tray.Dispose(); _tray = null; }
+                if (_tooltip != null) { _tooltip.Dispose(); _tooltip = null; }
+                if (_list != null && _list.SmallImageList != null) { ImageList rowImages = _list.SmallImageList; _list.SmallImageList = null; rowImages.Dispose(); }
+            }
+            base.Dispose(disposing);
+        }
+
+        private void EnsureDpiGeometry()
+        {
+            if (!IsHandleCreated) CreateHandle();
+            ApplyInitialDpiGeometry();
+        }
+
+        private void ApplyInitialDpiGeometry()
+        {
+            if (_dpiGeometryApplied) return;
+            _dpiGeometryApplied = true;
+            // Hidden forms can report a placeholder DeviceDpi before their first message loop.
+            // The HWND graphics context reflects the DPI used to rasterize point-sized fonts, so
+            // geometry follows the larger rendered value and cannot lag behind the text.
+            _dpiGeometryScale = RenderedDpiScale(this);
+            if (Math.Abs(_dpiGeometryScale - 1f) > .01f)
+            {
+                SuspendLayout();
+                Scale(new SizeF(_dpiGeometryScale, _dpiGeometryScale));
+                ResumeLayout(true);
+            }
+            SetLayoutScale(_dpiGeometryScale);
+        }
+
+        private void SetLayoutScale(float scale)
+        {
+            _layoutScale = Math.Max(1f, scale);
+            if (_list != null)
+            {
+                if (_list.SmallImageList == null) _list.SmallImageList = new ImageList();
+                _list.SmallImageList.ImageSize = new Size(1, Math.Max(36, (int)Math.Round(38 * _layoutScale)));
+                ResizeListColumns();
+                _list.Invalidate();
+            }
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == Program.OpenMainMessage)
+            {
+                OpenFromTray();
+                return;
+            }
+            base.WndProc(ref message);
+        }
+
+        protected override void SetVisibleCore(bool value)
+        {
+            // The logon agent must never paint a normal window and hide it one frame later.
+            // Keep the first visibility request suppressed until the user opens the tray icon.
+            if (_startInTray && !_allowVisible && value)
+            {
+                if (!IsHandleCreated) CreateHandle();
+                value = false;
+            }
+            base.SetVisibleCore(value);
         }
 
         private void BuildUi()
         {
-            var hero = Card(new Rectangle(28, 24, Width - 72, 158));
-            hero.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-            Controls.Add(hero);
-            var title = new Label { Text = "Startup Master", ForeColor = TextMain, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 30f), AutoSize = true, Location = new Point(26, 18) };
-            var sub = new Label { Text = "One command center for every Windows startup route: tasks, services, drivers, registry, folders, quiet tray launch, and protected disabled state.", ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI", 11.5f), AutoSize = false, Width = 900, Height = 46, Location = new Point(30, 72) };
-            _summary = new Label { ForeColor = Color.White, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 10.5f), AutoSize = true, Location = new Point(300, 120) };
-            hero.Controls.Add(title); hero.Controls.Add(sub); hero.Controls.Add(_summary);
-            _add = Button("+ Add startup", Accent, 170); _add.Location = new Point(30, 112); _add.Click += (s, e) => AddBootApp(); hero.Controls.Add(_add);
-            _refresh = Button("Refresh inventory", Steel, 160); _refresh.Location = new Point(hero.Width - 190, 104); _refresh.Anchor = AnchorStyles.Top | AnchorStyles.Right; _refresh.Click += (s, e) => RefreshItems(); hero.Controls.Add(_refresh);
-            var heroIcon = new PictureBox { Image = Program.AppIcon.ToBitmap(), SizeMode = PictureBoxSizeMode.Zoom, Bounds = new Rectangle(hero.Width - 92, 22, 60, 60), Anchor = AnchorStyles.Top | AnchorStyles.Right, BackColor = Color.Transparent };
-            hero.Controls.Add(heroIcon);
+            SuspendLayout();
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Bg, Padding = new Padding(24, 16, 24, 14), ColumnCount = 1, RowCount = 5, GrowStyle = TableLayoutPanelGrowStyle.FixedSize };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 72f));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56f));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 88f));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32f));
+            Controls.Add(root);
 
-            int cardTop = 202, cardW = 194, gap = 14;
-            _visibleValue = MetricCard("Visible", "startup items in view", Color.FromArgb(129, 140, 248), 28 + (cardW + gap) * 0, cardTop, cardW);
-            _enabledValue = MetricCard("Enabled", "will run at boot", Good, 28 + (cardW + gap) * 1, cardTop, cardW);
-            _disabledValue = MetricCard("Disabled", "kept from startup", Danger, 28 + (cardW + gap) * 2, cardTop, cardW);
-            _reviewValue = MetricCard("Cleanup", "green suggestions", Good, 28 + (cardW + gap) * 3, cardTop, cardW);
-            _managedValue = MetricCard("Managed", "created here", Accent, 28 + (cardW + gap) * 4, cardTop, cardW);
+            var header = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Bg, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 430f));
+            header.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            var heading = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, Margin = new Padding(0) };
+            heading.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46f)); heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            heading.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f)); heading.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            var icon = new PictureBox { Image = Program.AppIcon.ToBitmap(), SizeMode = PictureBoxSizeMode.Zoom, Dock = DockStyle.Fill, Margin = new Padding(0, 4, 10, 8), AccessibleName = "Startup Master icon" };
+            heading.Controls.Add(icon, 0, 0); heading.SetRowSpan(icon, 2);
+            heading.Controls.Add(new Label { Text = "Startup control", Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomLeft, ForeColor = TextMain, Font = new Font("Segoe UI Variable Display Semibold", 21f), AutoEllipsis = true }, 1, 0);
+            heading.Controls.Add(new Label { Text = "Every discovered Windows startup route is shown immediately, one registration per row.", Dock = DockStyle.Fill, TextAlign = ContentAlignment.TopLeft, ForeColor = Muted, Font = new Font(Font.FontFamily, 9.5f), AutoEllipsis = true }, 1, 1);
+            header.Controls.Add(heading, 0, 0);
+            var headerActions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(0, 12, 0, 0), Margin = new Padding(0) };
+            _add = Button("&Add startup", Accent, 138); _add.Click += (s, e) => AddBootApp();
+            _refresh = Button("&Refresh", Surface2, 116); _refresh.Click += (s, e) => RefreshItems();
+            _tools = Button("&Tools  ···", Surface2, 108); _tools.Click += (s, e) => _toolsMenu.Show(_tools, new Point(0, _tools.Height));
+            headerActions.Controls.Add(_add); headerActions.Controls.Add(_refresh); headerActions.Controls.Add(_tools);
+            header.Controls.Add(headerActions, 1, 0); root.Controls.Add(header, 0, 0);
+            BuildToolsMenu();
 
-            var toolbar = Card(new Rectangle(28, 302, Width - 72, 112));
-            toolbar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right; Controls.Add(toolbar);
-            var searchLabel = new Label { Text = "Search", ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 9f), Location = new Point(18, 8), AutoSize = true }; toolbar.Controls.Add(searchLabel);
-            _search = StyledTextBox(); _search.Location = new Point(18, 30); _search.Width = 390; _search.TextChanged += (s, e) => RenderList(); toolbar.Controls.Add(_search);
-            _clearSearch = Button("Clear", Surface2, 82); _clearSearch.Location = new Point(440, 26); _clearSearch.Height = 32; _clearSearch.Click += (s, e) => { _search.Text = ""; }; toolbar.Controls.Add(_clearSearch);
-            _showAll = Button("All", Accent, 72); _showAll.Location = new Point(18, 70); _showAll.Click += (s, e) => SetFilter("All"); toolbar.Controls.Add(_showAll);
-            _showRisky = Button("High risk", Danger, 104); _showRisky.Location = new Point(100, 70); _showRisky.Click += (s, e) => SetFilter("Risky"); toolbar.Controls.Add(_showRisky);
-            _showCleanup = Button("Suggested", Good, 110); _showCleanup.Location = new Point(214, 70); _showCleanup.Click += (s, e) => SetFilter("Cleanup"); toolbar.Controls.Add(_showCleanup);
-            _showDisabled = Button("Disabled", Surface2, 104); _showDisabled.Location = new Point(334, 70); _showDisabled.Click += (s, e) => SetFilter("Disabled"); toolbar.Controls.Add(_showDisabled);
-            _editSelected = Button("Edit", Steel, 82); _editSelected.Location = new Point(toolbar.Width - 830, 18); _editSelected.Anchor = AnchorStyles.Top | AnchorStyles.Right; _editSelected.Click += (s, e) => EditSelected(); toolbar.Controls.Add(_editSelected);
-            _quietSelected = Button("Make quiet", Accent, 120); _quietSelected.Location = new Point(toolbar.Width - 738, 18); _quietSelected.Anchor = AnchorStyles.Top | AnchorStyles.Right; _quietSelected.Click += (s, e) => MakeSelectedQuiet(); toolbar.Controls.Add(_quietSelected);
-            _disable = Button("Remove", Danger, 110); _disable.Location = new Point(toolbar.Width - 608, 18); _disable.Anchor = AnchorStyles.Top | AnchorStyles.Right; _disable.Click += (s, e) => DisableSelected(); toolbar.Controls.Add(_disable);
-            _enable = Button("Restore", Good, 105); _enable.Location = new Point(toolbar.Width - 488, 18); _enable.Anchor = AnchorStyles.Top | AnchorStyles.Right; _enable.Click += (s, e) => EnableSelected(); toolbar.Controls.Add(_enable);
-            _deleteManaged = Button("Delete task", Warn, 115); _deleteManaged.Location = new Point(toolbar.Width - 373, 18); _deleteManaged.Anchor = AnchorStyles.Top | AnchorStyles.Right; _deleteManaged.Click += (s, e) => DeleteManaged(); toolbar.Controls.Add(_deleteManaged);
-            _protectNow = Button("Protect disabled", Surface2, 135); _protectNow.Location = new Point(toolbar.Width - 270, 18); _protectNow.Anchor = AnchorStyles.Top | AnchorStyles.Right; _protectNow.Click += (s, e) => ProtectDisabledNow(); toolbar.Controls.Add(_protectNow);
-            _enforceNow = Button("Enforce now", Steel, 112); _enforceNow.Location = new Point(toolbar.Width - 130, 18); _enforceNow.Anchor = AnchorStyles.Top | AnchorStyles.Right; _enforceNow.Click += (s, e) => RunGuardsAsync(true); toolbar.Controls.Add(_enforceNow);
-            _coverage = Button("Coverage", Steel, 92); _coverage.Location = new Point(toolbar.Width - 230, 18); _coverage.Anchor = AnchorStyles.Top | AnchorStyles.Right; _coverage.Click += (s, e) => RunBootAuditAsync(); toolbar.Controls.Add(_coverage);
-            _openFolders = Button("Open startup folders", Surface2, 160); _openFolders.Location = new Point(toolbar.Width - 190, 66); _openFolders.Anchor = AnchorStyles.Top | AnchorStyles.Right; _openFolders.Click += (s, e) => OpenStartupFolders(); toolbar.Controls.Add(_openFolders);
+            var summaryStrip = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface, ColumnCount = 6, RowCount = 1, Padding = new Padding(10, 4, 10, 4), Margin = new Padding(0, 0, 0, 8) };
+            summaryStrip.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            for (int i = 0; i < 5; i++) summaryStrip.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150f));
+            summaryStrip.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _visibleValue = AddMetric(summaryStrip, 0, "Visible", Accent);
+            _enabledValue = AddMetric(summaryStrip, 1, "Enabled", Good);
+            _disabledValue = AddMetric(summaryStrip, 2, "Disabled", Muted);
+            _reviewValue = AddMetric(summaryStrip, 3, "Attention", Warn);
+            _managedValue = AddMetric(summaryStrip, 4, "Managed", StartupUiTheme.SteelText);
+            _summary = new Label { Text = "Inventory not scanned yet", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, ForeColor = Muted, AutoEllipsis = true, AccessibleName = "Inventory summary" };
+            summaryStrip.Controls.Add(_summary, 5, 0); root.Controls.Add(summaryStrip, 0, 1);
 
-            var listCard = Card(new Rectangle(28, 432, Width - 72, Height - 488));
-            listCard.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom; Controls.Add(listCard);
-            _hint = new Label { Text = "Loading startup inventory without blocking the window...", ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI", 9.5f), Location = new Point(18, 12), AutoSize = true }; listCard.Controls.Add(_hint);
-            _list = new ListView { Location = new Point(18, 42), Size = new Size(listCard.Width - 36, listCard.Height - 60), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom, View = View.Details, FullRowSelect = true, BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(12, 18, 34), ForeColor = TextMain, Font = new Font("Segoe UI", 9.7f), HideSelection = false, OwnerDraw = true };
-            _list.SmallImageList = new ImageList { ImageSize = new Size(1, 34) };
-            _list.Columns.Add("Status", 105); _list.Columns.Add("Application", 250); _list.Columns.Add("Startup entry", 220); _list.Columns.Add("Source", 145); _list.Columns.Add("Risk", 112); _list.Columns.Add("Cleanup", 112); _list.Columns.Add("Popup", 112); _list.Columns.Add("Location", 250); _list.Columns.Add("Launch command", 430);
-            _list.DrawColumnHeader += (s, e) => { using (var b = new SolidBrush(Surface2)) e.Graphics.FillRectangle(b, e.Bounds); TextRenderer.DrawText(e.Graphics, e.Header.Text, new Font(Font, FontStyle.Bold), new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width, e.Bounds.Height), Color.White, TextFormatFlags.VerticalCenter | TextFormatFlags.Left); };
-            _list.DrawSubItem += DrawSubItem; _list.SelectedIndexChanged += (s, e) => UpdateButtons(); _list.MouseDown += SelectListItemOnRightClick; _list.MouseUp += ListMouseUpPopupToggle; _list.DoubleClick += (s, e) => EditSelected();
-            _list.ContextMenuStrip = BuildListContextMenu();
-            _list.Resize += (s, e) => { if (_list.Columns.Count > 8) _list.Columns[8].Width = Math.Max(300, _list.Width - 1306); };
-            listCard.Controls.Add(_list);
+            var findArea = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface, ColumnCount = 1, RowCount = 2, Padding = new Padding(12, 8, 12, 6), Margin = new Padding(0, 0, 0, 8) };
+            findArea.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            findArea.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f)); findArea.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            var findRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Margin = new Padding(0) };
+            findRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70f)); findRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); findRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100f));
+            findRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            findRow.Controls.Add(new Label { Text = "Find", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Muted, Font = new Font(Font, FontStyle.Bold) }, 0, 0);
+            _search = StyledTextBox(); _search.Dock = DockStyle.Fill; _search.Margin = new Padding(0, 2, 8, 2); _search.AccessibleName = "Search startup inventory"; _search.AccessibleDescription = "Filter by application, entry, source, path, command, or status."; _search.TextChanged += (s, e) => RenderList(); findRow.Controls.Add(_search, 1, 0);
+            _clearSearch = Button("C&lear", Surface2, 90); _clearSearch.Height = 32; _clearSearch.Margin = new Padding(4, 0, 0, 0); _clearSearch.Click += (s, e) => { _routeTargetFilter = null; _search.Clear(); RenderList(); _search.Focus(); }; findRow.Controls.Add(_clearSearch, 2, 0);
+            findArea.Controls.Add(findRow, 0, 0);
+            var filters = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0), Padding = new Padding(70, 0, 0, 0) };
+            _showAll = FilterButton("&Apps", 100, "Apps");
+            _showRisky = FilterButton("All &routes", 120, "All");
+            _showCleanup = FilterButton("Needs &attention", 170, "Attention");
+            _showDisabled = FilterButton("&Disabled", 120, "Disabled");
+            filters.Controls.Add(_showAll); filters.Controls.Add(_showRisky); filters.Controls.Add(_showCleanup); filters.Controls.Add(_showDisabled);
+            findArea.Controls.Add(filters, 0, 1); root.Controls.Add(findArea, 0, 2);
+
+            var inventory = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface, ColumnCount = 1, RowCount = 3, Padding = new Padding(1), Margin = new Padding(0) };
+            inventory.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            inventory.RowStyles.Add(new RowStyle(SizeType.Absolute, 60f)); inventory.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); inventory.RowStyles.Add(new RowStyle(SizeType.Absolute, 96f));
+            var selectionBar = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface, ColumnCount = 2, RowCount = 1, Padding = new Padding(12, 6, 10, 6), Margin = new Padding(0) };
+            selectionBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); selectionBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 590f));
+            selectionBar.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            var selectionText = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(0) };
+            selectionText.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            selectionText.RowStyles.Add(new RowStyle(SizeType.Percent, 52f)); selectionText.RowStyles.Add(new RowStyle(SizeType.Percent, 48f));
+            _selectionTitle = new Label { Text = "Select an item to manage it", Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomLeft, ForeColor = TextMain, Font = new Font(Font, FontStyle.Bold), AutoEllipsis = true, AccessibleName = "Selected startup item" };
+            _selectionMeta = new Label { Text = "State and startup mode are separate controls.", Dock = DockStyle.Fill, TextAlign = ContentAlignment.TopLeft, ForeColor = Muted, AutoEllipsis = true };
+            selectionText.Controls.Add(_selectionTitle, 0, 0); selectionText.Controls.Add(_selectionMeta, 0, 1); selectionBar.Controls.Add(selectionText, 0, 0);
+            var selectionActions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(0, 5, 0, 0), Margin = new Padding(0) };
+            _disable = Button("&Disable at boot", Danger, 160); _disable.Click += (s, e) => DisableSelected();
+            _enable = Button("&Enable at boot", Good, 160); _enable.Click += (s, e) => EnableSelected();
+            _quietSelected = Button("Use &quiet tray", Accent, 160); _quietSelected.Click += (s, e) => ToggleSelectedMode();
+            _editSelected = Button("&Edit", Surface2, 90); _editSelected.Click += (s, e) => EditSelected();
+            _launchSelected = Button("&Run now", Surface2, 110); _launchSelected.Click += (s, e) => LaunchSelectedNow();
+            selectionActions.Controls.Add(_disable); selectionActions.Controls.Add(_enable); selectionActions.Controls.Add(_quietSelected); selectionActions.Controls.Add(_editSelected); selectionActions.Controls.Add(_launchSelected);
+            selectionBar.Controls.Add(selectionActions, 1, 0); inventory.Controls.Add(selectionBar, 0, 0);
+
+            _list = new ListView { Dock = DockStyle.Fill, Margin = new Padding(12, 0, 12, 0), View = View.Details, FullRowSelect = true, BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(19, 23, 29), ForeColor = TextMain, Font = new Font("Segoe UI Variable Text", 9.5f), HideSelection = false, OwnerDraw = true, MultiSelect = false, ShowItemToolTips = true, ShowGroups = false };
+            _list.AccessibleName = "Startup inventory"; _list.AccessibleDescription = "Complete route-level Windows startup inventory. Each registration is shown once. Use Space to enable or disable, Control Q to change window or quiet tray mode, and Shift F10 for all actions.";
+            _list.SmallImageList = new ImageList { ImageSize = new Size(1, 38) };
+            _list.Columns.Add("Application", 290); _list.Columns.Add("Status", 112); _list.Columns.Add("Mode", 132); _list.Columns.Add("Source", 170); _list.Columns.Add("Impact", 142); _list.Columns.Add("Startup entry", 300);
+            _list.DrawColumnHeader += DrawColumnHeader;
+            _list.DrawSubItem += DrawSubItem; _list.SelectedIndexChanged += (s, e) => UpdateButtons(); _list.MouseDown += SelectListItemOnRightClick; _list.DoubleClick += (s, e) => EditSelected(); _list.KeyDown += ListKeyDown;
+            _listMenu = BuildListContextMenu(); _list.ContextMenuStrip = _listMenu;
+            _list.Resize += (s, e) => ResizeListColumns();
+            inventory.Controls.Add(_list, 0, 1);
+            _emptyState = BuildEmptyState(); _emptyState.Visible = false; inventory.Controls.Add(_emptyState, 0, 1); inventory.SetCellPosition(_emptyState, new TableLayoutPanelCellPosition(0, 1));
+
+            var details = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Surface2, ColumnCount = 2, RowCount = 1, Padding = new Padding(14, 8, 10, 8), Margin = new Padding(12, 8, 12, 10) };
+            details.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); details.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 184f));
+            details.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            var detailText = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(0) };
+            detailText.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            detailText.RowStyles.Add(new RowStyle(SizeType.Absolute, 24f)); detailText.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            _detailTitle = new Label { Text = "Source details", Dock = DockStyle.Fill, ForeColor = TextMain, Font = new Font(Font, FontStyle.Bold), AutoEllipsis = true };
+            _detailBody = new Label { Text = "Select a row to see its exact registration, location, and launch command.", Dock = DockStyle.Fill, ForeColor = Muted, AutoEllipsis = true, UseMnemonic = false };
+            detailText.Controls.Add(_detailTitle, 0, 0); detailText.Controls.Add(_detailBody, 0, 1); details.Controls.Add(detailText, 0, 0);
+            _copySelected = Button("&Copy command", Surface, 170); _copySelected.Anchor = AnchorStyles.Right; _copySelected.Click += (s, e) => CopySelectedCommand(); details.Controls.Add(_copySelected, 1, 0);
+            inventory.Controls.Add(details, 0, 2); root.Controls.Add(inventory, 0, 3);
+
+            var status = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Bg, ColumnCount = 3, RowCount = 1, Margin = new Padding(0) };
+            status.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); status.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 128f)); status.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 82f));
+            status.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            _hint = new Label { Text = "Ready", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Muted, AutoEllipsis = true, AccessibleName = "Startup inventory status", AccessibleRole = AccessibleRole.Alert };
+            _progress = new ProgressBar { Dock = DockStyle.Fill, Style = ProgressBarStyle.Marquee, MarqueeAnimationSpeed = 28, Margin = new Padding(8, 8, 8, 7), Visible = false, AccessibleName = "Inventory operation in progress" };
+            _retry = Button("&Retry", Surface2, 72); _retry.Height = 28; _retry.Margin = new Padding(8, 2, 0, 2); _retry.Visible = false; _retry.Click += (s, e) => RefreshItems();
+            status.Controls.Add(_hint, 0, 0); status.Controls.Add(_progress, 1, 0); status.Controls.Add(_retry, 2, 0); root.Controls.Add(status, 0, 4);
+
             AttachTooltips();
+            SetFilter("All");
+            UpdateButtons();
+            ResumeLayout(true);
         }
 
         private void AttachTooltips()
         {
-            _tooltip.SetToolTip(_add, "Add any .exe/.cmd/.bat/.ps1/.lnk to Windows startup — just paste a full path and the rest fills in.");
-            _tooltip.SetToolTip(_refresh, "Re-scan every boot source and refresh the list.");
-            _tooltip.SetToolTip(_search, "Type to filter the list. Cleared automatically when the window opens.");
-            _tooltip.SetToolTip(_showAll, "Show every startup entry.");
-            _tooltip.SetToolTip(_showRisky, "Show high-consequence entries: services, drivers, and logon components.");
-            _tooltip.SetToolTip(_showCleanup, "Show suggested optional-startup cleanup candidates.");
+            _tooltip.SetToolTip(_add, "Add an executable, shortcut, or script to Windows startup.");
+            _tooltip.SetToolTip(_refresh, "Read every startup source again. Refresh never changes startup settings.");
+            _tooltip.SetToolTip(_tools, "Coverage, explicit repair, protection, and startup-folder tools.");
+            _tooltip.SetToolTip(_search, "Filter by application, registration, source, path, command, or status. Ctrl+F focuses search.");
+            _tooltip.SetToolTip(_showAll, "Summarize app-launching routes by target. This is an optional convenience view.");
+            _tooltip.SetToolTip(_showRisky, "Show the complete startup inventory: one row per captured registration, including services, drivers, boot/logon hooks, and system internals.");
+            _tooltip.SetToolTip(_showCleanup, "Show high-impact, script-based, or optional-startup items worth reviewing.");
             _tooltip.SetToolTip(_showDisabled, "Show entries currently kept from startup.");
-            _tooltip.SetToolTip(_editSelected, "Edit the selected entry's path, arguments, and startup mode.");
-            _tooltip.SetToolTip(_quietSelected, "Start the selected app quietly in the tray at every boot (no window).");
-            _tooltip.SetToolTip(_disable, "Remove the selected entry from startup. It can be restored later.");
-            _tooltip.SetToolTip(_enable, "Restore the selected entry so it runs at boot.");
-            _tooltip.SetToolTip(_deleteManaged, "Permanently delete a startup task created by this app.");
-            _tooltip.SetToolTip(_protectNow, "Re-assert every disabled entry so it stays disabled.");
-            _tooltip.SetToolTip(_enforceNow, "Re-assert every enabled, quiet, and disabled guard right now.");
-            _tooltip.SetToolTip(_coverage, "Verify every boot source is shown and every tray app has one correct icon.");
-            _tooltip.SetToolTip(_openFolders, "Open the user and common Startup folders in Explorer.");
+            _tooltip.SetToolTip(_editSelected, "Edit the selected app path, arguments, and startup mode.");
+            _tooltip.SetToolTip(_quietSelected, "Configure Window or Quiet (tray). Actual startup presentation needs verification.");
+            _tooltip.SetToolTip(_disable, "Disable this registration at boot without uninstalling the app.");
+            _tooltip.SetToolTip(_enable, "Enable this registration for the next sign-in or boot.");
+            _tooltip.SetToolTip(_launchSelected, "Run the selected application now without changing startup settings.");
+            _tooltip.SetToolTip(_copySelected, "Copy the exact launch command for the selected registration.");
+        }
+
+        private void BuildToolsMenu()
+        {
+            _toolsMenu = new ContextMenuStrip { ShowImageMargin = false };
+            _toolsMenu.Items.Add("Verify boot &coverage", null, (s, e) => RunBootAuditAsync());
+            _toolsMenu.Items.Add("&Repair startup rules now", null, (s, e) => RunGuardsAsync(true));
+            _toolsMenu.Items.Add("&Protect current disabled items", null, (s, e) => ProtectDisabledNow());
+            _toolsMenu.Items.Add(new ToolStripSeparator());
+            _toolsMenu.Items.Add("Open startup &folders", null, (s, e) => OpenStartupFolders());
         }
 
         private ContextMenuStrip BuildListContextMenu()
         {
-            var menu = new ContextMenuStrip();
-            menu.Items.Add("Edit startup", null, (s, e) => EditSelected());
-            menu.Items.Add("Remove from startup", null, (s, e) => DisableSelected());
-            menu.Items.Add("Restore startup", null, (s, e) => EnableSelected());
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("Make quiet", null, (s, e) => MakeSelectedQuiet());
-            menu.Items.Add("Launch now", null, (s, e) => LaunchSelectedNow());
-            menu.Items.Add("Open location", null, (s, e) => OpenSelectedLocation());
-            menu.Items.Add("Copy launch command", null, (s, e) => CopySelectedCommand());
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("Refresh", null, (s, e) => RefreshItems());
+            var menu = new ContextMenuStrip { ShowImageMargin = false };
+            _contextState = new ToolStripMenuItem("Enable at boot", null, (s, e) => ToggleSelectedEnabled());
+            _contextMode = new ToolStripMenuItem("Use Quiet (tray)", null, (s, e) => ToggleSelectedMode());
+            _contextLaunch = new ToolStripMenuItem("Run now", null, (s, e) => LaunchSelectedNow());
+            _contextEdit = new ToolStripMenuItem("Edit startup", null, (s, e) => EditSelected());
+            _contextOpen = new ToolStripMenuItem("Open location", null, (s, e) => OpenSelectedLocation());
+            _contextCopy = new ToolStripMenuItem("Copy launch command", null, (s, e) => CopySelectedCommand());
+            _contextDelete = new ToolStripMenuItem("Permanently delete managed task...", null, (s, e) => DeleteManaged());
+            menu.Items.Add(_contextState); menu.Items.Add(_contextMode); menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(_contextLaunch); menu.Items.Add(_contextEdit); menu.Items.Add(_contextOpen); menu.Items.Add(_contextCopy);
+            menu.Items.Add(new ToolStripSeparator()); menu.Items.Add(_contextDelete);
+            menu.Opening += (s, e) => UpdateContextMenu();
             return menu;
         }
 
-        private Panel Card(Rectangle bounds)
+        private Label AddMetric(TableLayoutPanel parent, int column, string caption, Color accent)
         {
-            var p = new Panel { Bounds = bounds, BackColor = Surface, BorderStyle = BorderStyle.None };
-            ApplyRound(p, 14);
-            p.Resize += (s, e) => ApplyRound(p, 14);
-            return p;
+            var cell = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0), Padding = new Padding(5, 0, 5, 0) };
+            cell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46f)); cell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            cell.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            var value = new Label { Text = "0", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, ForeColor = accent, Font = new Font("Segoe UI Variable Display Semibold", 15f), AccessibleName = caption + " count" };
+            var label = new Label { Text = caption, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Muted, AutoEllipsis = true, AccessibleName = caption + " metric" };
+            _metricCaptions.Add(label);
+            cell.Controls.Add(value, 0, 0); cell.Controls.Add(label, 1, 0); parent.Controls.Add(cell, column, 0);
+            return value;
+        }
+
+        private ThemedFilterButton FilterButton(string text, int width, string mode)
+        {
+            var button = new ThemedFilterButton { Text = text, Width = width, Height = 30, Margin = new Padding(0, 0, 8, 0), Font = new Font("Segoe UI Variable Text Semibold", 9.3f), UseMnemonic = true, AccessibleName = text.Replace("&", "").Trim(), AccessibleDescription = "Show the " + (mode == "All" ? "All routes" : mode) + " startup view." };
+            button.Click += (s, e) => SetFilter(mode);
+            return button;
+        }
+
+        private Panel BuildEmptyState()
+        {
+            var panel = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(19, 23, 29), Margin = new Padding(12, 0, 12, 0) };
+            var content = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(24), Margin = new Padding(0) };
+            content.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            content.RowStyles.Add(new RowStyle(SizeType.Percent, 50f)); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 34f)); content.RowStyles.Add(new RowStyle(SizeType.Absolute, 42f)); content.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
+            _emptyTitle = new Label { Text = "No startup items in this view", Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomCenter, ForeColor = TextMain, Font = new Font("Segoe UI Variable Display Semibold", 15f), AccessibleName = "Inventory state" };
+            _emptyBody = new Label { Text = "Clear the search or choose another view.", Dock = DockStyle.Fill, TextAlign = ContentAlignment.TopCenter, ForeColor = Muted, AutoEllipsis = true };
+            var actions = new FlowLayoutPanel { AutoSize = true, Anchor = AnchorStyles.None, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+            _emptyPrimary = Button("&Add startup", Accent, 126); _emptyPrimary.Click += (s, e) => AddBootApp();
+            _emptySecondary = Button("&Clear filters", Surface2, 126); _emptySecondary.Click += (s, e) => { if (_emptyRetryMode) RefreshItems(); else ResetToCompleteInventory(); };
+            actions.Controls.Add(_emptyPrimary); actions.Controls.Add(_emptySecondary);
+            content.Controls.Add(_emptyTitle, 0, 0); content.Controls.Add(_emptyBody, 0, 1); content.Controls.Add(actions, 0, 2); panel.Controls.Add(content);
+            return panel;
         }
 
         // Clip a control to softly rounded corners. Buttons never resize, so a one-shot region is
@@ -3251,60 +13443,96 @@ foreach($t in Get-ScheduledTask){
             catch { }
         }
 
-        private Label MetricCard(string title, string helper, Color accent, int x, int y, int w)
+        private void DrawColumnHeader(object sender, DrawListViewColumnHeaderEventArgs e)
         {
-            var card = Card(new Rectangle(x, y, w, 84)); card.Anchor = AnchorStyles.Top | AnchorStyles.Left; Controls.Add(card);
-            var stripe = new Panel { BackColor = accent, Location = new Point(0, 0), Size = new Size(5, 84) }; card.Controls.Add(stripe);
-            var value = new Label { Text = "0", ForeColor = TextMain, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 22f), Location = new Point(18, 8), AutoSize = true }; card.Controls.Add(value);
-            card.Controls.Add(new Label { Text = title, ForeColor = accent, BackColor = Color.Transparent, Font = new Font("Segoe UI Semibold", 9.5f), Location = new Point(20, 50), AutoSize = true });
-            card.Controls.Add(new Label { Text = helper, ForeColor = Muted, BackColor = Color.Transparent, Font = new Font("Segoe UI", 8.5f), Location = new Point(20, 66), AutoSize = true });
-            return value;
+            Color background = SystemInformation.HighContrast ? SystemColors.Control : Surface2;
+            Color foreground = SystemInformation.HighContrast ? SystemColors.ControlText : TextMain;
+            using (var b = new SolidBrush(background)) e.Graphics.FillRectangle(b, e.Bounds);
+            using (var p = new Pen(SystemInformation.HighContrast ? SystemColors.ControlDark : Border)) e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+            using (var font = new Font(_list.Font, FontStyle.Bold)) TextRenderer.DrawText(e.Graphics, e.Header.Text, font, new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height), foreground, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
         }
 
         private void DrawSubItem(object sender, DrawListViewSubItemEventArgs e)
         {
-            var item = (StartupItem)e.Item.Tag; bool selected = e.Item.Selected;
-            Color row = selected ? Color.FromArgb(52, 64, 116) : (e.ItemIndex % 2 == 0 ? Color.FromArgb(13, 20, 38) : Color.FromArgb(16, 24, 45));
-            if (!selected && item.RiskLevel() == "Critical") row = e.ItemIndex % 2 == 0 ? Color.FromArgb(54, 16, 22) : Color.FromArgb(68, 20, 28);
-            else if (!selected && item.AdviceLevel() == "Cleanup") row = e.ItemIndex % 2 == 0 ? Color.FromArgb(10, 44, 34) : Color.FromArgb(12, 54, 41);
+            var uiRow = (InventoryRow)e.Item.Tag;
+            var item = uiRow.Primary;
+            bool selected = e.Item.Selected;
+            Color row = SystemInformation.HighContrast
+                ? (selected ? SystemColors.Highlight : SystemColors.Window)
+                : (selected ? StartupUiTheme.SelectedRow : (e.ItemIndex % 2 == 0 ? Color.FromArgb(19, 23, 29) : Color.FromArgb(22, 27, 33)));
+            Color foreground = SystemInformation.HighContrast
+                ? (selected ? SystemColors.HighlightText : SystemColors.WindowText)
+                : TextMain;
             using (var b = new SolidBrush(row)) e.Graphics.FillRectangle(b, e.Bounds);
-            if (e.ColumnIndex == 6) { DrawPopupToggle(e.Graphics, e.Bounds, item); return; }
-            Color c = TextMain; string text = e.SubItem.Text;
-            if (e.ColumnIndex == 0) { c = item.Enabled ? Good : Danger; text = item.Enabled ? "● Enabled" : "● Disabled"; }
-            if (e.ColumnIndex == 4) c = item.RiskLevel() == "Critical" ? Color.FromArgb(255, 180, 180) : (item.RiskLevel() == "Review" ? Warn : Good);
-            if (e.ColumnIndex == 5) c = item.AdviceLevel() == "Cleanup" ? Good : Muted;
-            if (e.ColumnIndex == 7 || e.ColumnIndex == 8) c = Muted;
-            TextRenderer.DrawText(e.Graphics, text, _list.Font, new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height), c, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.Left);
+            if (!SystemInformation.HighContrast && e.ColumnIndex == 0 && (item.RiskLevel() == "Critical" || item.AdviceLevel() == "Cleanup"))
+            {
+                using (var marker = new SolidBrush(item.RiskLevel() == "Critical" ? Danger : Warn)) e.Graphics.FillRectangle(marker, new Rectangle(e.Bounds.X, e.Bounds.Y + 5, 3, Math.Max(1, e.Bounds.Height - 10)));
+            }
+            Color color = foreground;
+            if (!SystemInformation.HighContrast && !selected && e.ColumnIndex == 1) color = uiRow.AllEnabled ? Good : Muted;
+            if (!SystemInformation.HighContrast && !selected && e.ColumnIndex == 2) color = AggregateModeText(uiRow) == "Quiet (tray)" ? Accent : Muted;
+            if (!SystemInformation.HighContrast && !selected && e.ColumnIndex == 4) color = item.RiskLevel() == "Critical" ? StartupUiTheme.DangerText : (uiRow.HasAttention ? Warn : Muted);
+            if (!SystemInformation.HighContrast && !selected && (e.ColumnIndex == 3 || e.ColumnIndex == 5)) color = Muted;
+            Font font = e.ColumnIndex == 0 ? new Font(_list.Font, FontStyle.Bold) : _list.Font;
+            try
+            {
+                TextRenderer.DrawText(e.Graphics, e.SubItem.Text, font, new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 14, e.Bounds.Height), color, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
+            }
+            finally { if (!ReferenceEquals(font, _list.Font)) font.Dispose(); }
+            if (e.ColumnIndex == 0 && e.Item.Focused && selected) ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(e.Item.Bounds, -2, -2), foreground, row);
         }
 
-        private void DrawPopupToggle(Graphics g, Rectangle bounds, StartupItem item)
+        private static string ModeText(StartupItem item)
         {
-            bool popupEnabled = item.PopupEnabled();
-            Rectangle r = PopupButtonRect(bounds);
-            bool notApplicable = item.PopupLabel() == "N/A";
-            Color color = notApplicable ? Surface2 : (popupEnabled ? Warn : Good);
-            string text = notApplicable ? "N/A" : (popupEnabled ? "Enabled" : "Disabled");
-            using (var b = new SolidBrush(color)) g.FillRectangle(b, r);
-            using (var p = new Pen(Color.FromArgb(190, Color.White))) g.DrawRectangle(p, r);
-            TextRenderer.DrawText(g, text, new Font(_list.Font, FontStyle.Bold), r, Color.FromArgb(10, 14, 28), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            if (item == null || item.PopupLabel() == "N/A") return "Not supported";
+            if ((item.Id ?? "").StartsWith("preview|")) return StartupService.IsQuietLaunch(item.Command ?? "", item.Location) ? "Quiet (tray)" : "Window";
+            return item.PresentationState;
         }
 
-        private Rectangle PopupButtonRect(Rectangle bounds)
+        private static string ImpactText(StartupItem item)
         {
-            int w = Math.Max(92, bounds.Width - 18);
-            int h = Math.Min(26, bounds.Height - 8);
-            int y = bounds.Y + (bounds.Height - h) / 2;
-            int x = bounds.X + Math.Max(6, (bounds.Width - w) / 2);
-            return new Rectangle(x, y, w, h);
+            if (item.RiskLevel() == "Critical") return "High impact";
+            if (item.RiskLevel() == "Review") return "Review";
+            if (item.AdviceLevel() == "Cleanup") return "Optional?";
+            if (item.RiskLevel() == "System") return "System";
+            return "Normal";
         }
 
-        private TextBox StyledTextBox() { return new TextBox { BorderStyle = BorderStyle.FixedSingle, BackColor = Color.FromArgb(10, 16, 31), ForeColor = Color.White, Font = new Font("Segoe UI", 11f), Height = 30 }; }
+        private TextBox StyledTextBox() { return new TextBox { BorderStyle = BorderStyle.FixedSingle, BackColor = Color.FromArgb(20, 24, 30), ForeColor = TextMain, Font = new Font("Segoe UI Variable Text", 10.5f), Height = 30, TabIndex = 0 }; }
         private Button Button(string text, Color color, int width)
         {
-            var b = new Button { Text = text, Width = width, Height = 40, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 9.5f), Cursor = Cursors.Hand };
-            b.FlatAppearance.BorderSize = 0;
-            ApplyRound(b, 10);
-            b.MouseEnter += (s, e) => b.BackColor = ControlPaint.Light(color, .10f); b.MouseLeave += (s, e) => b.BackColor = color; return b;
+            var b = new ThemedButton(color) { Text = text, Width = width, Height = 38, Font = new Font("Segoe UI Variable Text Semibold", 9.3f), Cursor = Cursors.Hand, UseMnemonic = true, AccessibleName = text.Replace("&", "").Replace("·", "").Trim(), Margin = new Padding(4, 0, 0, 0) };
+            return b;
+        }
+
+        private void SetButtonTone(Button button, Color color)
+        {
+            if (button == null || SystemInformation.HighContrast) return;
+            var themed = button as ThemedButton;
+            if (themed != null) themed.SetTone(color);
+            else { button.BackColor = color; button.ForeColor = StartupUiTheme.ForegroundFor(color); }
+        }
+
+        private void ResizeListColumns()
+        {
+            if (_list == null || _list.Columns.Count != 6) return;
+            int status = (int)Math.Round(130 * _layoutScale), mode = (int)Math.Round(146 * _layoutScale), source = (int)Math.Round(176 * _layoutScale), impact = (int)Math.Round(138 * _layoutScale);
+            int fixedWidth = status + mode + source + impact;
+            int flexible = Math.Max((int)Math.Round(400 * _layoutScale), _list.ClientSize.Width - fixedWidth - (int)Math.Round(8 * _layoutScale));
+            _list.Columns[0].Width = Math.Max((int)Math.Round(210 * _layoutScale), (int)(flexible * .5));
+            _list.Columns[1].Width = status; _list.Columns[2].Width = mode; _list.Columns[3].Width = source; _list.Columns[4].Width = impact;
+            _list.Columns[5].Width = Math.Max((int)Math.Round(190 * _layoutScale), flexible - _list.Columns[0].Width);
+        }
+
+        private static void ApplyHighContrastTheme(Control root)
+        {
+            root.BackColor = SystemColors.Window; root.ForeColor = SystemColors.WindowText;
+            foreach (Control child in root.Controls)
+            {
+                child.BackColor = child is Button ? SystemColors.Control : SystemColors.Window;
+                child.ForeColor = child is Button ? SystemColors.ControlText : SystemColors.WindowText;
+                ApplyHighContrastTheme(child);
+            }
         }
 
         private void BuildTray()
@@ -3312,11 +13540,11 @@ foreach($t in Get-ScheduledTask){
             _tray = new NotifyIcon { Icon = Program.AppIcon, Text = "Mich Startup Master", Visible = true };
             _tray.DoubleClick += (s, e) => OpenFromTray();
             _tray.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left) OpenFromTray(); };
-            var trayMenu = new ContextMenuStrip();
+            var trayMenu = new ContextMenuStrip { ShowImageMargin = false };
             trayMenu.Items.Add("Open Startup Master", null, (s, e) => OpenFromTray());
             trayMenu.Items.Add("Refresh inventory", null, (s, e) => RefreshItems());
             trayMenu.Items.Add("Verify boot coverage", null, (s, e) => RunBootAuditAsync());
-            trayMenu.Items.Add("Enforce quiet + disabled + enabled guards", null, (s, e) => RunGuardsAsync(true));
+            trayMenu.Items.Add("Repair startup rules now", null, (s, e) => RunGuardsAsync(true));
             trayMenu.Items.Add("Exit", null, (s, e) => { _reallyExit = true; if (_tray != null) { _tray.Visible = false; _tray.Dispose(); } Application.Exit(); });
             _tray.ContextMenuStrip = trayMenu;
         }
@@ -3324,9 +13552,13 @@ foreach($t in Get-ScheduledTask){
         {
             if (IsDisposed) return;
             if (InvokeRequired) { BeginInvoke(new Action(OpenFromTray)); return; }
-            // Always show the full inventory on open: a leftover search term must never make
-            // items look missing from the app, and the list must always reflect the current state.
-            if (_search != null) _search.Clear();
+            // A tray-resident process can outlive a prior search, aggregate view, or focused
+            // route.  Each explicit open must therefore begin at the complete inventory rather
+            // than silently preserve a view state that hides an otherwise discovered startup
+            // registration.
+            ResetToCompleteInventory();
+            // Release the pre-paint visibility gate only after an explicit tray interaction.
+            _allowVisible = true;
             ShowInTaskbar = true;
             Show();
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
@@ -3345,20 +13577,14 @@ foreach($t in Get-ScheduledTask){
         private void OnClosingToTray(object sender, FormClosingEventArgs e) { if (!_reallyExit && _tray != null && _tray.Visible && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; HideToTray(); } }
         private void RefreshItems()
         {
-            if (_isRefreshing) return;
+            if (_isRefreshing || _watchScanRunning || !_runtimeEnabled) return;
             _isRefreshing = true;
             int version = ++_refreshVersion;
             Cursor = Cursors.AppStarting;
-            SetBusy(true, "Refreshing startup inventory in the background...");
-            Task.Run(() =>
-            {
-                ProtectedDisabledService.EnforceProtected();
-                ProtectedQuietService.EnforceProtected();
-                EnabledStartupService.EnforceEnabled(true);
-                var scanned = StartupService.ScanAll();
-                ProtectedDisabledService.ProtectCurrentDisabled();
-                return scanned;
-            }).ContinueWith(t =>
+            InventoryRow selected = SelectedRow();
+            string selectedId = selected == null ? "" : (selected.Key ?? "");
+            SetBusy(true, "Reading every startup source — no settings are being changed...");
+            Task.Run(() => { List<StartupItem> current = StartupService.ScanAll(); return Tuple.Create(current, new List<StartupItem>()); }).ContinueWith(t =>
             {
                 if (IsDisposed) return;
                 BeginInvoke(new Action(() =>
@@ -3369,65 +13595,257 @@ foreach($t in Get-ScheduledTask){
                     SetBusy(false, "");
                     if (t.Exception != null)
                     {
-                        MessageBox.Show(t.Exception.GetBaseException().Message, "Refresh failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        string error = t.Exception.GetBaseException().Message;
+                        foreach (var stale in _items)
+                        {
+                            stale.VerifiedState = "Unknown";
+                            stale.EvidenceReason = "Refresh failed; previous registration evidence is stale: " + error;
+                            stale.PresentationState = "Needs verification";
+                        }
+                        RenderList(selectedId);
+                        _retry.Visible = true;
+                        SetStatus("Refresh failed — the previous inventory is still shown. " + error, Danger);
+                        if (_items.Count == 0) ShowEmptyState("Inventory could not be loaded", error, true);
                         return;
                     }
-                    _items = t.Result;
-                    RenderList();
+                    _items = t.Result.Item1;
+                    _lastRefresh = DateTime.Now;
+                    _retry.Visible = false;
+                    RenderList(selectedId);
+                    NotifyFreshStartupItems(t.Result.Item2);
                 }));
             });
         }
 
         private void SetBusy(bool busy, string message)
         {
-            _refresh.Enabled = !busy;
-            _refresh.Text = busy ? "Loading..." : "Refresh inventory";
-            if (!string.IsNullOrWhiteSpace(message)) _hint.Text = message;
+            _progress.Visible = busy;
+            _refresh.Enabled = !busy; _tools.Enabled = !busy; _add.Enabled = !busy;
+            _search.Enabled = !busy; _showAll.Enabled = !busy; _showRisky.Enabled = !busy; _showCleanup.Enabled = !busy; _showDisabled.Enabled = !busy;
+            _list.Enabled = !busy;
+            _refresh.Text = busy ? "Reading..." : "&Refresh";
+            if (!string.IsNullOrWhiteSpace(message)) SetStatus(message, Muted);
+            if (busy && _items.Count == 0)
+            {
+                _emptyRetryMode = false; _emptyTitle.Text = "Reading every startup route"; _emptyBody.Text = "Registry, folders, scheduled tasks, services, drivers, logon hooks, and system sources are being scanned.";
+                _emptyPrimary.Visible = false; _emptySecondary.Visible = false; _emptyState.Visible = true; _emptyState.BringToFront();
+            }
+            UpdateButtons();
         }
 
-        private void RenderList()
+        private void RenderList(string selectionId = null)
         {
-            string q = (_search.Text ?? "").Trim().ToLowerInvariant();
-            var rows = _items.Where(x => MatchesFilter(x) && (string.IsNullOrEmpty(q) || (x.HumanName() + " " + x.Name + " " + x.Command + " " + x.Source + " " + x.Location + " " + x.Status + " " + x.AdviceReason()).ToLowerInvariant().Contains(q))).ToList();
-            _list.BeginUpdate(); _list.Items.Clear(); foreach (var x in rows) { var li = new ListViewItem(x.Enabled ? "Enabled" : "Disabled") { Tag = x }; li.SubItems.Add(x.HumanName()); li.SubItems.Add(x.Name); li.SubItems.Add(x.Source); li.SubItems.Add(x.RiskLabel()); li.SubItems.Add(x.AdviceLabel()); li.SubItems.Add(x.PopupLabel()); li.SubItems.Add(x.Location); li.SubItems.Add(x.Command); _list.Items.Add(li); } _list.EndUpdate();
-            int highRisk = _items.Count(x => x.RiskLevel() == "Critical");
-            int cleanup = _items.Count(x => x.AdviceLevel() == "Cleanup");
-            _summary.Text = rows.Count + " visible / " + _items.Count + " total • " + _items.Count(x => x.Enabled) + " enabled • " + _items.Count(x => !x.Enabled) + " disabled • " + highRisk + " high risk • " + cleanup + " suggested cleanup";
-            _visibleValue.Text = rows.Count.ToString(); _enabledValue.Text = _items.Count(x => x.Enabled).ToString(); _disabledValue.Text = _items.Count(x => !x.Enabled).ToString(); _reviewValue.Text = cleanup.ToString(); _managedValue.Text = _items.Count(x => x.IsManaged).ToString();
-            _hint.Text = rows.Count == 0 ? "No startup items match this view. Clear search or switch filter." : "Application names are resolved from the executable metadata when possible. Red means high consequence; green REMOVE? means a conservative optional-startup cleanup candidate.";
+            if (_list == null) return;
+            InventoryRow selectedBefore = SelectedRow();
+            if (selectionId == null && selectedBefore != null) selectionId = selectedBefore.Key;
+            string q = (_search.Text ?? "").Trim();
+            List<InventoryRow> rows = BuildVisibleRows(q);
+            _list.BeginUpdate();
+            _list.Items.Clear(); _list.Groups.Clear();
+            _list.ShowGroups = false;
+            foreach (InventoryRow row in rows)
+            {
+                string application = DisplayNameForRow(row, rows);
+                string status = row.AllEnabled ? "● Enabled" : (row.AllDisabled ? "○ Disabled" : (row.Routes.Any(x => x.StateText() == "Drifted") ? "Drifted" : (row.Routes.Any(x => x.StateText() == "Unknown") ? "Unknown" : "◐ Mixed")));
+                string source = row.Routes.Select(x => x.Source ?? "").Distinct(StringComparer.OrdinalIgnoreCase).Count() == 1 ? row.Primary.Source : row.Routes.Count + " routes";
+                string entry = row.Routes.Count == 1 ? row.Primary.Name : row.Routes.Count + " registrations";
+                var li = new ListViewItem(application) { Tag = row, ToolTipText = row.IsAmbiguous ? row.Routes.Count + " startup routes for " + TargetCaption(row.TargetIdentity) + ". Open All routes to manage one registration." : row.Primary.Source + " — " + row.Primary.Location };
+                li.SubItems.Add(status); li.SubItems.Add(AggregateModeText(row)); li.SubItems.Add(source); li.SubItems.Add(AggregateImpactText(row)); li.SubItems.Add(entry);
+                _list.Items.Add(li);
+            }
+            _list.EndUpdate(); ResizeListColumns();
+            if (!string.IsNullOrWhiteSpace(selectionId))
+            {
+                foreach (ListViewItem li in _list.Items)
+                {
+                    var row = (InventoryRow)li.Tag;
+                    if (!string.Equals(row.Key ?? "", selectionId, StringComparison.OrdinalIgnoreCase)) continue;
+                    li.Selected = true; li.Focused = true; li.EnsureVisible(); break;
+                }
+            }
+            int attention = rows.Count(row => row.HasAttention || (!row.AllEnabled && !row.AllDisabled));
+            _summary.Text = _items.Count + " routes captured" + (_lastRefresh.HasValue ? "  ·  scanned " + _lastRefresh.Value.ToString("HH:mm:ss") : "") + (_filterMode == "Apps" ? "  ·  system routes in All routes" : "");
+            _visibleValue.Text = rows.Count.ToString(); _enabledValue.Text = rows.Count(x => x.AllEnabled).ToString(); _disabledValue.Text = rows.Count(x => x.AllDisabled).ToString(); _reviewValue.Text = attention.ToString(); _managedValue.Text = rows.Count(x => x.HasManaged).ToString();
+            if (!_isRefreshing)
+            {
+                string viewStatus = rows.Count == 0 ? "No matches in this view." : (_filterMode == "Apps" ? "Showing " + rows.Count + " apps representing " + rows.Sum(x => x.Routes.Count) + " startup routes. Open All routes to manage duplicates safely." : (!string.IsNullOrWhiteSpace(_routeTargetFilter) ? "Showing " + rows.Count + " exact routes for " + TargetCaption(_routeTargetFilter) + ". Select one registration to manage it safely." : "Showing " + rows.Count + " startup routes. Refresh is read-only."));
+                SetStatus(viewStatus, Muted);
+            }
+            if (rows.Count == 0) ShowEmptyState(_items.Count == 0 ? "No startup routes were found" : "No startup items match this view", string.IsNullOrWhiteSpace(q) ? "Choose All routes or another view, or add an application." : "Clear the search to return to the current view.", false);
+            else _emptyState.Visible = false;
             UpdateButtons();
+        }
+
+        private List<InventoryRow> BuildVisibleRows(string query)
+        {
+            var eligible = _items.Where(MatchesFilter).ToList();
+            var rows = new List<InventoryRow>();
+            if (_filterMode == "Apps")
+            {
+                foreach (var group in eligible.GroupBy(CanonicalTargetIdentity, StringComparer.OrdinalIgnoreCase))
+                {
+                    List<StartupItem> routes = group.ToList();
+                    if (!string.IsNullOrWhiteSpace(query) && !routes.Any(x => SearchText(x).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
+                    StartupItem primary = routes.OrderByDescending(RouteSeverity).ThenByDescending(x => x.IsManaged).ThenBy(x => x.HumanName(), StringComparer.OrdinalIgnoreCase).First();
+                    rows.Add(new InventoryRow { Key = "app|" + group.Key, TargetIdentity = group.Key, Routes = routes, Primary = primary, IsAppSummary = true });
+                }
+            }
+            else
+            {
+                foreach (StartupItem item in eligible)
+                {
+                    if (!string.IsNullOrWhiteSpace(query) && SearchText(item).IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    rows.Add(new InventoryRow { Key = "route|" + (item.Id ?? CanonicalTargetIdentity(item)), TargetIdentity = CanonicalTargetIdentity(item), Routes = new List<StartupItem> { item }, Primary = item, IsAppSummary = false });
+                }
+            }
+            return rows.OrderBy(x => x.Primary.HumanName(), StringComparer.OrdinalIgnoreCase).ThenBy(x => x.TargetIdentity, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static string SearchText(StartupItem item)
+        {
+            return string.Join(" ", new[] { item.HumanName(), item.Name, item.Command, item.Source, item.Location, item.Status, item.AdviceReason() }.Where(x => !string.IsNullOrWhiteSpace(x)));
+        }
+
+        private static string CanonicalTargetIdentity(StartupItem item)
+        {
+            if (item == null) return "route:(null)";
+            string target = "", arguments = "";
+            try { if (StartupService.TryDecodeTrayPayload(item.Command ?? "", out target, out arguments) && !string.IsNullOrWhiteSpace(target)) return NormalizeTargetIdentity(target); } catch { }
+            try { StartupService.ResolveLaunchTarget(item, out target, out arguments); if (!string.IsNullOrWhiteSpace(target)) return NormalizeTargetIdentity(target); } catch { }
+            try { if (StartupService.TrySplitCommand(item.Command ?? "", out target, out arguments) && !string.IsNullOrWhiteSpace(target)) return NormalizeTargetIdentity(target); } catch { }
+            string raw = Regex.Replace((item.Command ?? "").Trim().ToLowerInvariant(), @"\s+", " ");
+            return raw.Length == 0 ? "route:" + (item.Id ?? item.Source + "|" + item.Location + "|" + item.Name) : "raw:" + raw;
+        }
+
+        private static string NormalizeTargetIdentity(string target)
+        {
+            string value = Environment.ExpandEnvironmentVariables((target ?? "").Trim().Trim('"')).Replace('/', '\\');
+            try { if (Path.IsPathRooted(value)) value = Path.GetFullPath(value); } catch { }
+            return "path:" + value.TrimEnd('\\').ToLowerInvariant();
+        }
+
+        private static string TargetCaption(string identity)
+        {
+            string value = identity ?? "";
+            if (value.StartsWith("path:", StringComparison.OrdinalIgnoreCase)) value = value.Substring(5);
+            try { string file = Path.GetFileName(value); if (!string.IsNullOrWhiteSpace(file)) return file; } catch { }
+            return value;
+        }
+
+        private static string DisplayNameForRow(InventoryRow row, IList<InventoryRow> allRows)
+        {
+            string name = row.Primary.HumanName();
+            bool duplicateName = allRows.Count(x => string.Equals(x.Primary.HumanName(), name, StringComparison.OrdinalIgnoreCase)) > 1;
+            return duplicateName ? name + "  ·  " + TargetDisambiguator(row.TargetIdentity) : name;
+        }
+
+        private static string TargetDisambiguator(string identity)
+        {
+            string value = identity ?? "";
+            if (value.StartsWith("path:", StringComparison.OrdinalIgnoreCase)) value = value.Substring(5);
+            try
+            {
+                string file = Path.GetFileName(value), directory = Path.GetDirectoryName(value), parent = string.IsNullOrWhiteSpace(directory) ? "" : new DirectoryInfo(directory).Name;
+                if (!string.IsNullOrWhiteSpace(parent) && !string.IsNullOrWhiteSpace(file)) return parent + "\\" + file;
+                if (!string.IsNullOrWhiteSpace(file)) return file;
+            }
+            catch { }
+            return value;
+        }
+
+        private static int RouteSeverity(StartupItem item)
+        {
+            if (item.RiskLevel() == "Critical") return 4;
+            if (item.RiskLevel() == "Review" || item.AdviceLevel() == "Cleanup") return 3;
+            if (item.RiskLevel() == "System") return 2;
+            return 1;
+        }
+
+        private static string AggregateModeText(InventoryRow row)
+        {
+            var modes = row.Routes.Select(ModeText).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            return modes.Count == 1 ? modes[0] : "Mixed";
+        }
+
+        private static string AggregateImpactText(InventoryRow row)
+        {
+            StartupItem highest = row.Routes.OrderByDescending(RouteSeverity).First();
+            return ImpactText(highest);
         }
 
         private bool MatchesFilter(StartupItem item)
         {
-            if (_filterMode == "Risky") return item.RiskLevel() == "Critical";
-            if (_filterMode == "Cleanup") return item.AdviceLevel() == "Cleanup";
-            if (_filterMode == "Disabled") return !item.Enabled || item.PopupLabel() == "Disabled";
+            if (_filterMode == "Apps") return IsAppRoute(item);
+            if (_filterMode == "Attention") return item.RiskLevel() == "Critical" || item.RiskLevel() == "Review" || item.AdviceLevel() == "Cleanup";
+            if (_filterMode == "Disabled") return !item.Enabled;
+            if (_filterMode == "All" && !string.IsNullOrWhiteSpace(_routeTargetFilter)) return string.Equals(CanonicalTargetIdentity(item), _routeTargetFilter, StringComparison.OrdinalIgnoreCase);
             return true;
+        }
+
+        private static bool IsAppRoute(StartupItem item)
+        {
+            if (item == null || (item.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase)) return false;
+            string source = item.Source ?? "";
+            return source != "Windows Service" && source != "System Driver" && source != "Winlogon Autostart" && source != "Winlogon Notification" && source != "AppInit DLLs" && source != "Active Setup" && source != "Boot Execute" && source != "Image Hijack" && source != "Known DLL" && source != "Network Provider" && source != "Winsock Provider" && source != "Print Monitor" && source != "Media Codec" && source != "WMI Event Consumer" && source != "Group Policy Script" && source != "Explorer Startup Extension" && source != "Explorer Shell Extension" && source != "Internet Explorer Add-on" && source != "AppCert DLLs" && source != "LSA Startup Package" && source != "Stale Startup Metadata";
         }
 
         private void SetFilter(string mode)
         {
-            _filterMode = mode;
-            _showAll.BackColor = mode == "All" ? Accent : Surface2;
-            _showRisky.BackColor = mode == "Risky" ? Danger : Surface2;
-            _showCleanup.BackColor = mode == "Cleanup" ? Good : Surface2;
-            _showDisabled.BackColor = mode == "Disabled" ? Accent : Surface2;
+            _routeTargetFilter = null;
+            ApplyFilterSelection(mode);
             RenderList();
+        }
+
+        private void ResetToCompleteInventory()
+        {
+            // This is deliberately stronger than clearing only the query.  Apps is an optional
+            // summary and a focused route is an intentional drill-down; neither is a safe
+            // recovery state when someone asks to see every startup registration again.
+            _routeTargetFilter = null;
+            if (_search != null && !string.IsNullOrWhiteSpace(_search.Text)) _search.Clear();
+            SetFilter("All");
+        }
+
+        private void ApplyFilterSelection(string mode)
+        {
+            _filterMode = mode;
+            _showAll.Checked = mode == "Apps";
+            _showRisky.Checked = mode == "All";
+            _showCleanup.Checked = mode == "Attention";
+            _showDisabled.Checked = mode == "Disabled";
+            _showAll.AccessibleDescription = "Apps view" + (_showAll.Checked ? ", selected." : ".");
+            _showRisky.AccessibleDescription = "All routes view" + (_showRisky.Checked ? ", selected." : ".");
+            _showCleanup.AccessibleDescription = "Needs attention view" + (_showCleanup.Checked ? ", selected." : ".");
+            _showDisabled.AccessibleDescription = "Disabled view" + (_showDisabled.Checked ? ", selected." : ".");
         }
 
         private void MainFormKeyDown(object sender, KeyEventArgs e)
         {
             bool editingText = ActiveControl is TextBox;
             if (editingText && (e.KeyCode == Keys.Delete || e.KeyCode == Keys.Enter || (e.Control && e.KeyCode == Keys.C))) return;
+            if (e.KeyCode == Keys.Escape && !string.IsNullOrWhiteSpace(_routeTargetFilter)) { SetFilter("All"); e.Handled = true; return; }
+            if (!_runtimeEnabled)
+            {
+                if (e.Control && e.KeyCode == Keys.F) { _search.Focus(); _search.SelectAll(); e.Handled = true; }
+                else if (e.KeyCode == Keys.Escape && !string.IsNullOrWhiteSpace(_search.Text)) { _search.Clear(); e.Handled = true; }
+                return;
+            }
             if (e.Control && e.KeyCode == Keys.N) { AddBootApp(); e.Handled = true; return; }
+            if (e.Control && e.KeyCode == Keys.F) { _search.Focus(); _search.SelectAll(); e.Handled = true; return; }
+            if (e.Control && e.KeyCode == Keys.Q) { ToggleSelectedMode(); e.Handled = true; return; }
             if (e.KeyCode == Keys.F5) { RefreshItems(); e.Handled = true; return; }
-            if (e.KeyCode == Keys.Delete) { DisableSelected(); e.Handled = true; return; }
             if (e.KeyCode == Keys.Enter) { EditSelected(); e.Handled = true; return; }
             if (e.Control && e.KeyCode == Keys.L) { LaunchSelectedNow(); e.Handled = true; return; }
             if (e.Control && e.KeyCode == Keys.O) { OpenSelectedLocation(); e.Handled = true; return; }
             if (e.Control && e.KeyCode == Keys.C) { CopySelectedCommand(); e.Handled = true; return; }
             if (e.KeyCode == Keys.Escape && !string.IsNullOrWhiteSpace(_search.Text)) { _search.Text = ""; e.Handled = true; return; }
+        }
+
+        private void ListKeyDown(object sender, KeyEventArgs e)
+        {
+            if (!_runtimeEnabled) return;
+            if (e.KeyCode == Keys.Space) { ToggleSelectedEnabled(); e.Handled = true; e.SuppressKeyPress = true; return; }
+            if (e.Shift && e.KeyCode == Keys.F10 && Selected() != null) { _listMenu.Show(_list, new Point(24, Math.Min(_list.Height - 20, Math.Max(20, _list.FocusedItem == null ? 20 : _list.FocusedItem.Bounds.Bottom)))); e.Handled = true; return; }
         }
 
         private void SelectListItemOnRightClick(object sender, MouseEventArgs e)
@@ -3440,47 +13858,234 @@ foreach($t in Get-ScheduledTask){
             hit.Item.Focused = true;
         }
 
-        private void ListMouseUpPopupToggle(object sender, MouseEventArgs e)
+        private void UpdateButtons()
         {
-            var hit = _list.HitTest(e.Location);
-            if (hit.Item == null || hit.SubItem == null) return;
-            int col = hit.Item.SubItems.IndexOf(hit.SubItem);
-            if (col != 6) return;
-            if (!PopupButtonRect(hit.SubItem.Bounds).Contains(e.Location)) return;
-            ToggleItemPopupState((StartupItem)hit.Item.Tag);
+            InventoryRow row = SelectedRow();
+            bool any = row != null, exact = any && !row.IsAmbiguous;
+            StartupItem x = exact ? row.Primary : null;
+            bool app = exact && x.PopupLabel() != "N/A", ready = _runtimeEnabled && !_isRefreshing;
+            int enabledRoutes = any ? row.Routes.Count(route => route.Enabled) : 0;
+            bool bulkDisable = any && row.IsAmbiguous && enabledRoutes > 0;
+            _editSelected.Text = any && row.IsAmbiguous ? "&Manage " + row.Routes.Count + " routes" : "&Edit";
+            _editSelected.AccessibleName = any && row.IsAmbiguous ? "Manage " + row.Routes.Count + " startup routes" : "Edit startup";
+            _editSelected.Width = Math.Max((int)Math.Round((any && row.IsAmbiguous ? 150 : 90) * _layoutScale), 90);
+            bool modeAction = CanUseLaunchMode(x, ready), launchAction = CanLaunchRoute(x, ready), stateAction = ready && ((exact && x.CanDisable && string.IsNullOrWhiteSpace(x.ExternalAuthority)) || (bulkDisable && CanBulkDisable(row, true)));
+            _editSelected.Enabled = any && row.IsAmbiguous ? !_isRefreshing : CanEditRoute(x, ready); _quietSelected.Enabled = modeAction; _launchSelected.Enabled = launchAction; _copySelected.Enabled = ready && exact && !string.IsNullOrWhiteSpace(x.Command);
+            _disable.Text = bulkDisable ? "&Disable all " + enabledRoutes : "&Disable at boot";
+            _disable.AccessibleName = bulkDisable ? "Disable all " + enabledRoutes + " enabled startup routes" : "Disable at boot";
+            _disable.Visible = (exact && x.Enabled) || bulkDisable; _enable.Visible = exact && !x.Enabled;
+            _quietSelected.Visible = !any || exact; _launchSelected.Visible = !any || exact;
+            _disable.Enabled = stateAction && ((exact && x.Enabled) || bulkDisable); _enable.Enabled = stateAction && exact && !x.Enabled;
+            _quietSelected.Text = app && StartupService.IsQuietLaunch(x.Command ?? "", x.Location) ? "Use &window" : "Use &quiet tray";
+            _selectionTitle.Text = any ? row.Primary.HumanName() : "Select an item to manage it";
+            _selectionMeta.Text = !any ? "State and startup mode are separate controls." : (row.IsAmbiguous ? row.Routes.Count + " startup routes  ·  " + enabledRoutes + " enabled  ·  Disable all is one rollback-safe transaction" : x.StateText() + "  ·  " + ModeText(x) + "  ·  " + x.EvidenceReason + "  ·  " + x.PresentationReason + "  ·  " + x.Source + (!x.Enabled && app ? "  ·  Enable before editing" : "") + CapabilitySummary(x));
+            _detailTitle.Text = !any ? "Source details" : (row.IsAmbiguous ? row.Routes.Count + " registrations  ·  " + TargetCaption(row.TargetIdentity) : x.Source + "  ·  " + x.Name);
+            _detailBody.Text = !any ? "Select a row to see its exact registration, location, and launch command." : DetailBodyFor(row);
+            _detailBody.AccessibleDescription = _detailBody.Text;
+            string editTip = row != null && row.IsAmbiguous ? "Open All routes and select one registration before editing." : ModeActionReason(x, "Edit the selected app path, arguments, and startup mode.");
+            _tooltip.SetToolTip(_editSelected, editTip);
+            _tooltip.SetToolTip(_quietSelected, ModeActionReason(x, "Choose whether this app starts in Window or Quiet (tray) mode."));
+            _tooltip.SetToolTip(_launchSelected, ModeActionReason(x, "Run this exact launch action now."));
+            string stateTip = bulkDisable ? BulkStateActionReason(row) : StateActionReason(x);
+            _tooltip.SetToolTip(_disable, stateTip); _tooltip.SetToolTip(_enable, stateTip);
         }
 
-        private void ToggleItemPopupState(StartupItem item)
+        private static bool CanBulkDisable(InventoryRow row, bool ready)
         {
-            if (item.PopupLabel() == "N/A") { _hint.Text = "Popup mode is not applicable to " + item.Source + " rows."; return; }
+            if (!ready || row == null || !row.IsAmbiguous) return false;
+            List<StartupItem> enabled = row.Routes.Where(route => route != null && route.Enabled).ToList();
+            return enabled.Count > 0 && enabled.All(route => route.CanDisable && string.IsNullOrWhiteSpace(route.ExternalAuthority));
+        }
+
+        private static string BulkStateActionReason(InventoryRow row)
+        {
+            if (row == null || !row.IsAmbiguous) return "Select an app with multiple startup routes first.";
+            List<StartupItem> enabled = row.Routes.Where(route => route != null && route.Enabled).ToList();
+            if (enabled.Count == 0) return "Every startup route for this app is already disabled.";
+            StartupItem blocked = enabled.FirstOrDefault(route => !string.IsNullOrWhiteSpace(route.ExternalAuthority) || !route.CanDisable);
+            if (blocked != null) return "All routes stay unchanged: " + StateActionReason(blocked);
+            return "Disable all " + enabled.Count + " enabled routes for this app as one transaction; any failure restores every route.";
+        }
+
+        private static bool CanUseLaunchMode(StartupItem item, bool ready) { return ready && item != null && item.Enabled && item.PopupLabel() != "N/A" && StartupService.CanMutateStartupMode(item); }
+        private static bool CanLaunchRoute(StartupItem item, bool ready) { return CanUseLaunchMode(item, ready); }
+        private static bool CanEditRoute(StartupItem item, bool ready) { return CanUseLaunchMode(item, ready); }
+        private static string ModeActionReason(StartupItem item, string availableText)
+        {
+            if (item == null) return "Select one exact startup route first.";
+            if (!item.Enabled) return "Enable this startup entry before editing it.";
+            if (item.PopupLabel() == "N/A") return "This system startup route does not expose an application window mode.";
+            if (!StartupService.CanMutateStartupMode(item)) return "This scheduled task contains multiple or non-executable actions. Edit, Run now, and Quiet mode are unavailable so Startup Master cannot flatten it into the wrong command.";
+            return availableText;
+        }
+        private static string StateActionReason(StartupItem item)
+        {
+            if (item == null) return "Select one exact startup route first.";
+            if (!string.IsNullOrWhiteSpace(item.ExternalAuthority)) return string.IsNullOrWhiteSpace(item.MutationReason) ? "Managed by " + item.ExternalAuthority + ". Change it through that authority." : item.MutationReason;
+            if (!item.CanDisable) return string.IsNullOrWhiteSpace(item.MutationReason) ? (item.RequiresElevation ? "Open Startup Master as administrator to change this route." : "This route is read-only because Windows exposes no reversible authority for it.") : item.MutationReason;
+            if (item.RequiresExpertConfirmation) return "Expert confirmation is required. Startup Master will preserve and verify the exact original value before changing it.";
+            return item.Enabled ? "Disable this exact startup route without uninstalling the app." : "Restore this exact startup route from its preserved state.";
+        }
+        private static string CapabilitySummary(StartupItem item)
+        {
+            if (item == null) return "";
+            var parts = new List<string>();
+            if (!string.IsNullOrWhiteSpace(item.ExternalAuthority)) parts.Add("Managed by " + item.ExternalAuthority);
+            else if (item.RequiresElevation && !item.CanDisable) parts.Add("Administrator required");
+            if (item.RequiresExpertConfirmation) parts.Add("Expert confirmation");
+            if (item.RequiresReboot) parts.Add("Restart required");
+            return parts.Count == 0 ? "" : "  ·  " + string.Join("  ·  ", parts);
+        }
+        private static string DetailBodyFor(StartupItem item)
+        {
+            if (item == null) return "";
+            var lines = new List<string> { "Location: " + (item.Location ?? ""), "Command: " + (item.Command ?? "") };
+            if (!item.Enabled && item.PopupLabel() != "N/A") lines.Add("Enable this startup entry before editing it.");
+            if (!string.IsNullOrWhiteSpace(item.MutationReason)) lines.Add("Change access: " + item.MutationReason);
+            if (!string.IsNullOrWhiteSpace(item.ExternalAuthority)) lines.Add("Authority: " + item.ExternalAuthority);
+            if (item.RequiresElevation) lines.Add("Administrator access: required");
+            if (item.RequiresExpertConfirmation) lines.Add("Safety: explicit expert confirmation required; exact original state is preserved for rollback");
+            if (item.RequiresReboot) lines.Add("Effect: restart Windows to verify the change");
+            if (item.Enabled && item.PopupLabel() != "N/A" && !StartupService.CanMutateStartupMode(item)) lines.Add(ModeActionReason(item, ""));
+            return string.Join(Environment.NewLine, lines);
+        }
+        private static string DetailBodyFor(InventoryRow row)
+        {
+            if (row == null) return "";
+            if (!row.IsAmbiguous) return DetailBodyFor(row.Primary);
+            int enabled = row.Routes.Count(x => x.StateText() == "Enabled"), disabled = row.Routes.Count(x => x.StateText() == "Disabled");
+            string sources = string.Join(", ", row.Routes.Select(x => x.Source).Distinct(StringComparer.OrdinalIgnoreCase));
+            return "Target: " + TargetCaption(row.TargetIdentity) + Environment.NewLine + enabled + " enabled  ·  " + disabled + " disabled  ·  " + (row.Routes.Count - enabled - disabled) + " unverified  ·  " + sources + Environment.NewLine + "Disable all enabled routes here in one rollback-safe transaction, or open All routes to manage one registration.";
+        }
+
+        private void UpdateContextMenu()
+        {
+            InventoryRow row = SelectedRow(); bool exact = row != null && !row.IsAmbiguous;
+            var x = exact ? row.Primary : null; bool any = x != null; bool app = any && x.PopupLabel() != "N/A"; bool ready = _runtimeEnabled && !_isRefreshing;
+            int enabledRoutes = row == null ? 0 : row.Routes.Count(route => route.Enabled);
+            bool bulkDisable = row != null && row.IsAmbiguous && enabledRoutes > 0;
+            _contextState.Text = bulkDisable ? "Disable all " + enabledRoutes + " enabled routes" : (any && x.Enabled ? "Disable at boot" : "Enable at boot");
+            _contextState.Enabled = bulkDisable ? CanBulkDisable(row, ready) : ready && any && x.CanDisable && string.IsNullOrWhiteSpace(x.ExternalAuthority);
+            _contextMode.Text = app && StartupService.IsQuietLaunch(x.Command ?? "", x.Location) ? "Use Window mode" : "Use Quiet (tray)";
+            _contextMode.Enabled = CanUseLaunchMode(x, ready);
+            _contextEdit.Text = row != null && row.IsAmbiguous ? "Manage " + row.Routes.Count + " routes" : "Edit startup";
+            _contextLaunch.Enabled = CanLaunchRoute(x, ready); _contextEdit.Enabled = row != null && row.IsAmbiguous ? !_isRefreshing : CanEditRoute(x, ready); _contextOpen.Enabled = ready && any; _contextCopy.Enabled = ready && any && !string.IsNullOrWhiteSpace(x.Command);
+            _contextDelete.Visible = any && x.IsManaged && x.Source == "Scheduled Task"; _contextDelete.Enabled = ready && _contextDelete.Visible;
+        }
+
+        private InventoryRow SelectedRow() { return _list == null || _list.SelectedItems.Count == 0 ? null : _list.SelectedItems[0].Tag as InventoryRow; }
+        private StartupItem Selected() { InventoryRow row = SelectedRow(); return row == null || row.IsAmbiguous ? null : row.Primary; }
+        private void ToggleSelectedEnabled() { InventoryRow row = SelectedRow(); if (row != null && row.IsAmbiguous) { DisableAllSelectedRoutes(row); return; } var x = Selected(); if (x == null || _isRefreshing || !_runtimeEnabled) return; if (x.Enabled) DisableSelected(); else EnableSelected(); }
+        private void DisableSelected()
+        {
+            InventoryRow row = SelectedRow();
+            if (row != null && row.IsAmbiguous) { DisableAllSelectedRoutes(row); return; }
+            var x = Selected(); if (x == null || !x.Enabled || _isRefreshing || !_runtimeEnabled) return;
+            if (!x.CanDisable || !string.IsNullOrWhiteSpace(x.ExternalAuthority)) { SetStatus(StateActionReason(x), Warn); return; }
+            bool expertConfirmed = x.RequiresExpertConfirmation;
+            if (expertConfirmed)
+            {
+                if (!ConfirmExpertStateChange(x, false)) return;
+            }
+            else
+            {
+                string message = "Disable " + x.HumanName() + " at Windows startup?" + Environment.NewLine + Environment.NewLine + "Source: " + x.Source + Environment.NewLine + "Registration: " + x.Location + Environment.NewLine + Environment.NewLine + "The app stays installed and you can enable this route again later.";
+                if (MessageBox.Show(message, "Disable at boot", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            }
+            try { StartupService.Disable(x, expertConfirmed); Toast("Disabled at boot", x.HumanName() + " will not run from this startup route." + (x.RequiresReboot ? " Restart Windows to verify the change." : "")); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Disable failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        }
+
+        private void DisableAllSelectedRoutes(InventoryRow row)
+        {
+            if (row == null || !row.IsAmbiguous || _isRefreshing || !_runtimeEnabled) return;
+            List<StartupItem> enabled = row.Routes.Where(route => route != null && route.Enabled).ToList();
+            if (enabled.Count == 0) { SetStatus("Every startup route for this app is already disabled.", Muted); return; }
+            if (!CanBulkDisable(row, true)) { SetStatus(BulkStateActionReason(row), Warn); return; }
+            bool expertConfirmed = enabled.Any(route => route.RequiresExpertConfirmation);
+            string sources = string.Join(Environment.NewLine, enabled.Select(route => "• " + route.Source + " — " + route.Location));
+            string message = "Disable every enabled startup route for " + row.Primary.HumanName() + "?" + Environment.NewLine + Environment.NewLine
+                + enabled.Count + " route" + (enabled.Count == 1 ? "" : "s") + " will be disabled:" + Environment.NewLine + sources + Environment.NewLine + Environment.NewLine
+                + "This is one transaction. If any route fails, Startup Master restores every route and intent store to its original state. The app stays installed.";
+            if (expertConfirmed) message += Environment.NewLine + Environment.NewLine + "One or more routes are high-impact Windows startup components and require expert confirmation.";
+            if (MessageBox.Show(this, message, "Disable all app routes", MessageBoxButtons.YesNo, expertConfirmed ? MessageBoxIcon.Warning : MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+
+            _isRefreshing = true;
+            SetBusy(true, "Disabling all " + enabled.Count + " startup routes as one transaction...");
+            Task.Run(() => StartupService.DisableAllRoutes(enabled, expertConfirmed)).ContinueWith(task =>
+            {
+                if (IsDisposed) return;
+                BeginInvoke(new Action(() =>
+                {
+                    _isRefreshing = false;
+                    SetBusy(false, "");
+                    if (task.Exception == null)
+                    {
+                        Toast("All startup routes disabled", task.Result + " route" + (task.Result == 1 ? "" : "s") + " disabled for " + row.Primary.HumanName() + ".");
+                        RefreshItems();
+                    }
+                    else
+                    {
+                        MessageBox.Show(task.Exception.GetBaseException().Message, "Bulk disable failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        UpdateButtons();
+                    }
+                }));
+            });
+        }
+        private void EnableSelected()
+        {
+            var x = Selected(); if (x == null || x.Enabled || _isRefreshing || !_runtimeEnabled) return;
+            if (!x.CanDisable || !string.IsNullOrWhiteSpace(x.ExternalAuthority)) { SetStatus(StateActionReason(x), Warn); return; }
+            bool expertConfirmed = x.RequiresExpertConfirmation;
+            if (expertConfirmed && !ConfirmExpertStateChange(x, true)) return;
+            try { StartupService.Enable(x, expertConfirmed); Toast("Enabled at boot", x.HumanName() + " will run from this startup route." + (x.RequiresReboot ? " Restart Windows to verify the change." : "")); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Enable failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        }
+        private bool ConfirmExpertStateChange(StartupItem item, bool enabling)
+        {
+            string action = enabling ? "restore" : "disable";
+            string message = "Expert boot change" + Environment.NewLine + Environment.NewLine
+                + "This will " + action + " a Windows boot, sign-in, or security startup component. A wrong change can prevent Windows or your account from starting correctly." + Environment.NewLine + Environment.NewLine
+                + "Source: " + item.Source + Environment.NewLine
+                + "Registration: " + item.Location + Environment.NewLine
+                + "Reason: " + (string.IsNullOrWhiteSpace(item.MutationReason) ? "High-impact Windows startup route" : item.MutationReason) + Environment.NewLine
+                + (item.RequiresElevation ? "Administrator access: required" + Environment.NewLine : "")
+                + (item.RequiresReboot ? "Verification: restart Windows after this change" + Environment.NewLine : "")
+                + Environment.NewLine + "Startup Master will preserve the exact original registry type, bytes, order, and scope, verify the write, and roll back if verification fails." + Environment.NewLine + Environment.NewLine
+                + "Continue with this exact route?";
+            return MessageBox.Show(this, message, enabling ? "Expert restore at boot" : "Expert disable at boot", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+        }
+        private void DeleteManaged()
+        {
+            var x = Selected(); if (x == null || !x.IsManaged || x.Source != "Scheduled Task" || _isRefreshing || !_runtimeEnabled) return;
+            string message = "Permanently delete the managed startup task for " + x.HumanName() + "?" + Environment.NewLine + Environment.NewLine + "Source: " + x.Source + Environment.NewLine + "Location: " + x.Location + Environment.NewLine + Environment.NewLine + "This removes the task itself. Startup Master cannot restore it afterward.";
+            if (MessageBox.Show(message, "Permanently delete managed task", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            try { StartupService.DeleteManagedTask(x.Location); Toast("Managed task deleted", x.HumanName()); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Permanent delete failed", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        }
+        private void ToggleSelectedMode()
+        {
+            var x = Selected(); if (x == null || _isRefreshing || !_runtimeEnabled) return;
+            if (!CanUseLaunchMode(x, true)) { SetStatus(ModeActionReason(x, ""), Warn); return; }
+            bool quietNow = StartupService.IsQuietLaunch(x.Command ?? "", x.Location);
             try
             {
-                bool wasEnabled = item.PopupEnabled();
-                StartupService.TogglePopupMode(item);
-                _hint.Text = item.Name + " popup is now " + (wasEnabled ? "Disabled — it will start through the silent tray wrapper." : "Enabled — it will start normally and may show a window.");
+                StartupService.SetPopupMode(x, quietNow);
+                Toast(quietNow ? "Window mode selected" : "Quiet (tray) selected", quietNow ? x.HumanName() + " may show its normal window at startup." : x.HumanName() + " is configured for quiet startup. Presentation needs verification at the next startup.");
                 RefreshItems();
             }
-            catch (Exception ex)
-            {
-                _hint.Text = "Could not change Popup for " + item.Name + ": " + ex.Message;
-            }
+            catch (Exception ex) { MessageBox.Show(ex.Message, "Startup mode change failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         }
-
-        private void UpdateButtons() { var x = Selected(); bool any = x != null; _editSelected.Enabled = any && x.PopupLabel() != "N/A"; _quietSelected.Enabled = any && x.PopupLabel() != "N/A" && x.PopupLabel() != "Disabled"; _disable.Enabled = any && x.Enabled && x.CanDisable; _enable.Enabled = any && !x.Enabled; _deleteManaged.Enabled = any && x.IsManaged && x.Source == "Scheduled Task"; }
-        private StartupItem Selected() { return _list.SelectedItems.Count == 0 ? null : (StartupItem)_list.SelectedItems[0].Tag; }
-        private void DisableSelected() { var x = Selected(); if (x == null) return; if (MessageBox.Show("Remove '" + x.Name + "' from Windows startup?", "Confirm remove", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return; try { StartupService.Disable(x); Toast("Removed from startup", x.Name + " will not run next boot."); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Remove failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); } }
-        private void EnableSelected() { var x = Selected(); if (x == null) return; try { StartupService.Enable(x); Toast("Restored", x.Name + " will run next boot."); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Restore failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); } }
-        private void DeleteManaged() { var x = Selected(); if (x == null || !x.IsManaged || x.Source != "Scheduled Task") { MessageBox.Show("Select a MichStartupMaster managed scheduled task."); return; } if (MessageBox.Show("Delete managed startup task '" + x.Name + "'?", "Confirm delete", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return; try { StartupService.DeleteManagedTask(x.Location); RefreshItems(); Toast("Deleted", x.Name); } catch (Exception ex) { MessageBox.Show(ex.Message, "Delete failed"); } }
-        private void MakeSelectedQuiet() { var x = Selected(); if (x == null) return; try { StartupService.SetPopupMode(x, false); Toast("Quiet protected", x.Name + " will start through the tray wrapper and be re-enforced."); RefreshItems(); } catch (Exception ex) { MessageBox.Show(ex.Message, "Quiet mode failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); } }
         private void EditSelected()
         {
+            InventoryRow selectedRow = SelectedRow();
+            if (selectedRow != null && selectedRow.IsAmbiguous) { ManageSelectedRoutes(selectedRow); return; }
+            if (!_runtimeEnabled) return;
             var x = Selected();
             if (x == null) return;
+            if (!CanEditRoute(x, true)) { SetStatus(ModeActionReason(x, ""), Warn); return; }
             try
             {
                 string target, arguments;
                 StartupService.ResolveLaunchTarget(x, out target, out arguments);
-                using (var d = new AddStartupForm(x.HumanName(), target, arguments, x.PopupLabel() != "Enabled"))
+                using (var d = new AddStartupForm(x.HumanName(), target, arguments, StartupService.IsQuietLaunch(x.Command ?? "", x.Location)))
                 {
                     if (d.ShowDialog(this) != DialogResult.OK) return;
                     string task = StartupService.EditStartup(x, d.AppTitle, d.AppPath, d.AppArguments, d.TrayMode);
@@ -3490,9 +14095,28 @@ foreach($t in Get-ScheduledTask){
             }
             catch (Exception ex) { MessageBox.Show(ex.Message, "Edit failed", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         }
-        private void ProtectDisabledNow() { try { string result = ProtectedDisabledService.ProtectCurrentDisabled(); Toast("Protected disabled", result); } catch (Exception ex) { MessageBox.Show(ex.Message, "Protect disabled failed"); } }
+
+        private void ManageSelectedRoutes(InventoryRow row)
+        {
+            if (row == null || !row.IsAmbiguous || _isRefreshing) return;
+            _routeTargetFilter = row.TargetIdentity;
+            ApplyFilterSelection("All");
+            StartupItem first = row.Routes.OrderByDescending(x => x.Enabled).ThenBy(x => x.Source, StringComparer.OrdinalIgnoreCase).First();
+            RenderList("route|" + (first.Id ?? CanonicalTargetIdentity(first)));
+            _list.Focus();
+            SetStatus("Managing " + row.Routes.Count + " exact routes for " + TargetCaption(row.TargetIdentity) + ". Select one route to edit, enable, disable, or change its mode.", Accent);
+        }
+        private void ProtectDisabledNow()
+        {
+            if (_isRefreshing || !_runtimeEnabled) return; _isRefreshing = true; SetBusy(true, "Protecting the current disabled set by explicit request...");
+            Task.Run(() => ProtectedDisabledService.ProtectCurrentDisabled()).ContinueWith(t =>
+            {
+                if (IsDisposed) return; BeginInvoke(new Action(() => { _isRefreshing = false; SetBusy(false, ""); if (t.Exception == null) { Toast("Disabled set protected", t.Result); RefreshItems(); } else SetStatus("Protect failed: " + t.Exception.GetBaseException().Message, Danger); }));
+            });
+        }
         private void RunBootAuditAsync()
         {
+            if (_isRefreshing || !_runtimeEnabled) return; _isRefreshing = true;
             SetBusy(true, "Verifying every boot source is shown in the app and every tray app has one correct icon...");
             Task.Run(() =>
             {
@@ -3504,26 +14128,51 @@ foreach($t in Get-ScheduledTask){
                 if (IsDisposed) return;
                 BeginInvoke(new Action(() =>
                 {
+                    _isRefreshing = false;
                     SetBusy(false, "");
                     string result = t.Exception != null ? "Coverage check failed: " + t.Exception.GetBaseException().Message : t.Result;
-                    bool clean = result.IndexOf("gaps=0", StringComparison.Ordinal) >= 0 && result.IndexOf("findings=0", StringComparison.Ordinal) >= 0;
+                    bool clean = CoverageIsClean(result);
                     Toast(clean ? "Coverage: complete" : "Coverage: gaps found", result);
                 }));
             });
         }
 
+        private static bool CoverageIsClean(string result)
+        {
+            string[] lines = (result ?? "").Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+            string boot = lines.FirstOrDefault(x => x.StartsWith("BOOT_AUDIT ", StringComparison.Ordinal));
+            string tray = lines.FirstOrDefault(x => x.StartsWith("TRAY_AUDIT ", StringComparison.Ordinal));
+            if (boot == null || tray == null || boot.IndexOf("independent=true", StringComparison.Ordinal) < 0 || boot.IndexOf("gaps=0", StringComparison.Ordinal) < 0 || boot.IndexOf("errors=0", StringComparison.Ordinal) < 0) return false;
+            int apps, running, findings, uncertain;
+            return TryReceiptInt(tray, "apps", out apps) && TryReceiptInt(tray, "running", out running) && TryReceiptInt(tray, "findings", out findings) && TryReceiptInt(tray, "uncertain", out uncertain) && apps == running && findings == 0 && uncertain == 0;
+        }
+
+        private static bool TryReceiptInt(string line, string name, out int value)
+        {
+            value = 0;
+            var match = Regex.Match(line ?? "", @"(?:^|\s)" + Regex.Escape(name) + @"=(\d+)(?:\s|$)");
+            return match.Success && int.TryParse(match.Groups[1].Value, out value);
+        }
+
         private void RunGuardsAsync(bool showResult)
         {
-            // includeImport=true lets the throttled pass re-run v2 migration, external-task import,
-            // and duplicate-launcher retirement at most every five minutes while the app runs.
+            if (_isRefreshing || !_runtimeEnabled) return;
+            _isRefreshing = true;
+            SetBusy(true, "Repairing enabled, disabled, and Quiet (tray) rules by explicit request...");
             Task.Run(() => ProtectedDisabledService.EnforceProtected() + " | " + ProtectedQuietService.EnforceProtected() + " | " + EnabledStartupService.EnforceEnabled(true)).ContinueWith(t =>
             {
-                if (IsDisposed || !showResult) return;
-                BeginInvoke(new Action(() => Toast("Guards enforced", t.Exception == null ? t.Result : t.Exception.GetBaseException().Message)));
+                if (IsDisposed) return;
+                BeginInvoke(new Action(() =>
+                {
+                    _isRefreshing = false; SetBusy(false, "");
+                    if (t.Exception == null) Toast("Startup rules repaired", t.Result); else SetStatus("Repair failed: " + t.Exception.GetBaseException().Message, Danger);
+                    if (showResult) RefreshItems();
+                }));
             });
         }
         private void OpenStartupFolders()
         {
+            if (!_runtimeEnabled) return;
             try
             {
                 Process.Start("explorer.exe", Environment.GetFolderPath(Environment.SpecialFolder.Startup));
@@ -3533,8 +14182,10 @@ foreach($t in Get-ScheduledTask){
         }
         private void LaunchSelectedNow()
         {
+            if (!_runtimeEnabled) return;
             var x = Selected();
             if (x == null) return;
+            if (!CanLaunchRoute(x, true)) { SetStatus(ModeActionReason(x, ""), Warn); return; }
             try
             {
                 string target, arguments, execute, actionArgs;
@@ -3548,6 +14199,7 @@ foreach($t in Get-ScheduledTask){
         }
         private void OpenSelectedLocation()
         {
+            if (!_runtimeEnabled) return;
             var x = Selected();
             if (x == null) return;
             try
@@ -3562,6 +14214,7 @@ foreach($t in Get-ScheduledTask){
         }
         private void CopySelectedCommand()
         {
+            if (!_runtimeEnabled) return;
             var x = Selected();
             if (x == null) return;
             try
@@ -3573,14 +14226,30 @@ foreach($t in Get-ScheduledTask){
         }
         private void AddBootApp()
         {
+            if (!_runtimeEnabled) return;
             using (var d = new AddStartupForm())
             {
                 if (d.ShowDialog(this) != DialogResult.OK) return;
-                try { StartupService.AddManagedStartup(d.AppTitle, d.AppPath, d.AppArguments, d.TrayMode, true); Toast("Added zero-delay boot app", d.AppTitle + (d.TrayMode ? " will start quietly through tray mode." : " will start normally.")); RefreshItems(); }
+                try { StartupService.AddManagedStartup(d.AppTitle, d.AppPath, d.AppArguments, d.TrayMode, true); Toast("Startup saved", d.AppTitle + (d.TrayMode ? " will use Quiet (tray) mode." : " will use Window mode.")); RefreshItems(); }
                 catch (Exception ex) { MessageBox.Show(ex.Message, "Add failed", MessageBoxButtons.OK, MessageBoxIcon.Error); }
             }
         }
-        private void Toast(string title, string body) { _hint.Text = title + ": " + body; }
+        private void ShowEmptyState(string title, string body, bool retry)
+        {
+            _emptyRetryMode = retry;
+            _emptyTitle.Text = title; _emptyBody.Text = body;
+            _emptyPrimary.Visible = !retry; _emptySecondary.Visible = true; _emptySecondary.Text = retry ? "&Retry" : "&Clear filters";
+            _emptyState.Visible = true; _emptyState.BringToFront();
+        }
+
+        private void SetStatus(string message, Color color)
+        {
+            if (_hint == null) return;
+            _hint.Text = message ?? ""; _hint.ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : (color == Danger ? StartupUiTheme.DangerText : color);
+            _hint.AccessibleDescription = message ?? "";
+        }
+
+        private void Toast(string title, string body) { SetStatus(title + ": " + body, Good); }
 
         // Show a real Windows notification next to the tray icon (used for the "new startup item"
         // alert). Also updates the in-app hint so the message is visible either way.
@@ -3602,25 +14271,32 @@ foreach($t in Get-ScheduledTask){
         // are found, so nothing set to run at boot — by this app or any other — is ever missed.
         private void DetectNewStartupItems()
         {
-            Task.Run(() => StartupWatcher.DetectNew()).ContinueWith(t =>
+            if (_watchScanRunning || _isRefreshing || IsDisposed) return;
+            _watchScanRunning = true;
+            Task.Run(() =>
+            {
+                List<StartupItem> current = StartupService.ScanAll();
+                return Tuple.Create(current, StartupWatcher.DetectNew(current));
+            }).ContinueWith(t =>
             {
                 if (IsDisposed) return;
-                var fresh = t.Exception != null ? new List<StartupItem>() : t.Result;
-                if (fresh.Count == 0) return;
                 BeginInvoke(new Action(() =>
                 {
-                    if (fresh.Count == 1)
-                    {
-                        var item = fresh[0];
-                        NotifyToast("New startup item detected", item.HumanName() + " was just set to start with Windows.", ToolTipIcon.Warning);
-                    }
-                    else
-                    {
-                        NotifyToast("New startup items detected", fresh.Count + " new entries were just set to start with Windows.", ToolTipIcon.Warning);
-                    }
-                    RefreshItems();
+                    _watchScanRunning = false;
+                    if (t.Exception != null) return;
+                    _items = t.Result.Item1;
+                    _lastRefresh = DateTime.Now;
+                    RenderList();
+                    NotifyFreshStartupItems(t.Result.Item2);
                 }));
             });
+        }
+
+        private void NotifyFreshStartupItems(IList<StartupItem> fresh)
+        {
+            if (fresh == null || fresh.Count == 0) return;
+            if (fresh.Count == 1) NotifyToast("New startup item detected", fresh[0].HumanName() + " was just set to start with Windows.", ToolTipIcon.Warning);
+            else NotifyToast("New startup items detected", fresh.Count + " new entries were just set to start with Windows.", ToolTipIcon.Warning);
         }
 
         private static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "\\\"") + "\""; }
@@ -3632,54 +14308,162 @@ foreach($t in Get-ScheduledTask){
         public string AppPath { get { return _path.Text.Trim().Trim('"'); } }
         public string AppArguments { get { return _args.Text; } }
         public bool TrayMode { get { return _trayMode.Checked; } }
-        private TextBox _name, _path, _args, _paste;
+        internal bool UsesNormalDefault { get { return _normalMode.Checked && !_trayMode.Checked; } }
+        private TextBox _name, _path;
+        internal TextBox _args;
         private RadioButton _normalMode, _trayMode;
-        private Label _status;
-        private readonly Color Bg = Color.FromArgb(10, 14, 28), Surface = Color.FromArgb(21, 28, 51), Surface2 = Color.FromArgb(17, 24, 44), TextMain = Color.FromArgb(245, 247, 255), Muted = Color.FromArgb(156, 166, 195), Accent = Color.FromArgb(20, 184, 166), Good = Color.FromArgb(52, 211, 153);
+        internal Label _status, _quietDescription;
+        internal CheckBox _advanced;
+        private float _dpiGeometryScale = 1f;
+        internal float DpiGeometryScale { get { return _dpiGeometryScale; } }
+        private float _layoutScale = 1f;
+        private TableLayoutPanel _root;
+        private bool _dpiLayoutReady;
+        private bool _dpiGeometryApplied;
+        private readonly Color Bg = StartupUiTheme.Bg, Surface = StartupUiTheme.Surface, Surface2 = StartupUiTheme.Surface2, Border = StartupUiTheme.Border, TextMain = StartupUiTheme.TextMain, Muted = StartupUiTheme.Muted, Accent = StartupUiTheme.Accent, Good = StartupUiTheme.Good, Danger = StartupUiTheme.Danger;
 
-        public AddStartupForm() : this("", "", "", true) { }
+        public AddStartupForm() : this("", "", "", false) { }
 
         public AddStartupForm(string appTitle, string appPath, string appArguments, bool trayMode)
         {
-            Text = "Add app to Windows startup"; Width = 780; Height = 640; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; BackColor = Bg; ForeColor = Color.White; Font = new Font("Segoe UI", 10f); StartPosition = FormStartPosition.CenterParent; Icon = Program.AppIcon; DoubleBuffered = true;
-            Controls.Add(new Label { Text = string.IsNullOrWhiteSpace(appPath) ? "Add an app to startup" : "Edit startup app", Left = 32, Top = 22, AutoSize = true, ForeColor = TextMain, Font = new Font("Segoe UI Semibold", 22f) });
-            Controls.Add(new Label { Text = "Just paste a full path or a whole command line — the friendly name, arguments and quiet mode are filled in for you.", Left = 34, Top = 62, Width = 700, Height = 40, ForeColor = Muted, Font = new Font("Segoe UI", 10.5f) });
+            bool editing = !string.IsNullOrWhiteSpace(appPath);
+            Text = editing ? "Edit startup app" : "Add app to Windows startup";
+            Width = 800; Height = 680; MinimumSize = new Size(720, 680); FormBorderStyle = FormBorderStyle.Sizable; MaximizeBox = false; MinimizeBox = false;
+            AutoScaleMode = AutoScaleMode.None; BackColor = Bg; ForeColor = TextMain; Font = new Font("Segoe UI Variable Text", 9.5f); StartPosition = FormStartPosition.CenterParent; Icon = Program.AppIcon; DoubleBuffered = true;
+            AccessibleName = editing ? "Edit startup application" : "Add startup application"; AccessibleDescription = "Choose an application and how it should start with Windows.";
+            AllowDrop = true; DragEnter += OnDragEnter; DragDrop += OnDragDrop;
 
-            // Smart paste: one field that accepts a bare path or a full command line.
-            AddLabel("Paste a full path or command (fastest way)", 112);
-            _paste = Box(138, 622); _paste.Width = 528; _paste.Leave += (s, e) => { if (!string.IsNullOrWhiteSpace(_paste.Text)) ApplyPaste(_paste.Text); };
-            var paste = Button("Paste & fill", Accent, 120); paste.Left = 668; paste.Top = 136; paste.Click += PastePath; Controls.Add(paste);
+            _root = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Bg, Padding = new Padding(24, 18, 24, 16), ColumnCount = 1, RowCount = 8, GrowStyle = TableLayoutPanelGrowStyle.FixedSize };
+            _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 72f)); _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 74f)); _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 66f)); _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34f)); _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 0f)); _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 188f)); _root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52f));
+            Controls.Add(_root);
 
-            AddLabel("Friendly name (auto-filled)", 182); _name = Box(208, 640);
-            AddLabel("Executable path", 252); _path = Box(278, 528); _path.Width = 528; _path.Leave += (s, e) => AutoFillFromPath();
-            var browse = Button("Browse", Surface, 104); browse.Left = 668; browse.Top = 276; browse.Click += Browse; Controls.Add(browse);
-            AddLabel("Optional arguments", 322); _args = Box(348, 640);
+            var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(0) };
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            header.RowStyles.Add(new RowStyle(SizeType.Absolute, 38f)); header.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            header.Controls.Add(new Label { Text = editing ? "Edit startup app" : "Add anything to startup", Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomLeft, ForeColor = TextMain, Font = new Font("Segoe UI Variable Display Semibold", 20f), AutoEllipsis = true }, 0, 0);
+            header.Controls.Add(new Label { Text = "Paste a full file path, press Enter, and you are done. Browsing is optional.", Dock = DockStyle.Fill, TextAlign = ContentAlignment.TopLeft, ForeColor = Muted, AutoEllipsis = true }, 0, 1); _root.Controls.Add(header, 0, 0);
 
-            AddLabel("Startup mode", 398);
-            _normalMode = new RadioButton { Text = "Start normally — run the app directly at Windows logon (a window may appear)", Left = 34, Top = 424, Width = 700, ForeColor = TextMain, BackColor = Bg, Checked = !trayMode };
-            _trayMode = new RadioButton { Text = "Start quietly in tray mode — no window, no terminal, starts silently at every boot", Left = 34, Top = 454, Width = 700, ForeColor = Good, BackColor = Bg, Checked = trayMode };
-            Controls.Add(_normalMode); Controls.Add(_trayMode);
-            Controls.Add(new Label { Text = "Quiet tray mode launches the app hidden and keeps it alive; the app's own tray icon opens its window when you click it.", Left = 54, Top = 482, Width = 690, Height = 34, ForeColor = Muted, Font = new Font("Segoe UI", 9f) });
+            _path = FieldBox("File path or full command");
+            var pasteButton = Button("&Paste", Surface2, 82); var browseButton = Button("&Browse...", Surface2, 96);
+            var pathRow = BuildFieldRow("File path or full command", _path, new[] { pasteButton, browseButton });
+            pasteButton.Click += PastePath; browseButton.Click += Browse;
+            _path.Leave += (s, e) => { if (File.Exists(AppPath)) AutoFillFromPath(); else if (!string.IsNullOrWhiteSpace(_path.Text)) ApplyPaste(_path.Text); };
+            _root.Controls.Add(pathRow, 0, 1);
 
-            _name.Text = appTitle ?? "";
-            _path.Text = appPath ?? "";
-            _args.Text = appArguments ?? "";
+            _name = FieldBox("Friendly application name");
+            _root.Controls.Add(BuildFieldRow("Friendly name", _name, null), 0, 2);
+            _advanced = new CheckBox { Text = "&Advanced: command-line arguments", Dock = DockStyle.Fill, ForeColor = Muted, BackColor = Bg, AccessibleName = "Show advanced command-line arguments", TabIndex = 2 };
+            _advanced.CheckedChanged += (s, e) => SetAdvancedVisible(_advanced.Checked); _root.Controls.Add(_advanced, 0, 3);
+            _args = FieldBox("Optional command-line arguments");
+            _root.Controls.Add(BuildFieldRow("Command-line arguments (optional)", _args, null), 0, 4);
 
-            _status = new Label { Left = 34, Top = 524, Width = 700, Height = 34, ForeColor = Good, Font = new Font("Segoe UI", 9.5f) };
-            Controls.Add(_status);
+            var mode = new GroupBox { Text = " Startup mode ", Dock = DockStyle.Fill, ForeColor = TextMain, BackColor = Surface, Padding = new Padding(14, 10, 14, 8), AccessibleName = "Startup mode" };
+            var modeLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = new Padding(0) };
+            modeLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            modeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28f)); modeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f)); modeLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28f)); modeLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            _normalMode = new RadioButton { Text = "&Window — start normally", Dock = DockStyle.Fill, ForeColor = TextMain, BackColor = Surface, Checked = !trayMode, AccessibleName = "Window startup mode", TabIndex = 3 };
+            _trayMode = new RadioButton { Text = "&Quiet (tray) — start hidden and stay ready", Dock = DockStyle.Fill, ForeColor = TextMain, BackColor = Surface, Checked = trayMode, AccessibleName = "Quiet tray startup mode", TabIndex = 4 };
+            modeLayout.Controls.Add(_normalMode, 0, 0); modeLayout.Controls.Add(new Label { Text = "The app starts directly. Its normal window may appear at sign-in.", Dock = DockStyle.Fill, ForeColor = Muted, Padding = new Padding(22, 0, 0, 0), AutoEllipsis = true }, 0, 1);
+            modeLayout.Controls.Add(_trayMode, 0, 2);
+            _quietDescription = new Label { Text = "Starts hidden with exactly one working tray icon. The app's native icon is used when available; otherwise its own file or launch-handler icon opens it immediately.", Dock = DockStyle.Fill, ForeColor = Muted, Padding = new Padding(22, 0, 0, 0), AccessibleName = "Quiet startup behavior", AccessibleDescription = "The app starts without a visible window and remains immediately available from one tray icon that uses the application's identity.", UseMnemonic = false, AutoEllipsis = false };
+            modeLayout.Controls.Add(_quietDescription, 0, 3);
+            mode.Controls.Add(modeLayout); _root.Controls.Add(mode, 0, 5);
 
-            var ok = Button(string.IsNullOrWhiteSpace(appPath) ? "Add at next boot" : "Save startup", Accent, 170); ok.Left = 430; ok.Top = 566; ok.DialogResult = DialogResult.OK; ok.Click += ValidateBeforeClose;
-            var cancel = Button("Cancel", Surface, 110); cancel.Left = 612; cancel.Top = 566; cancel.DialogResult = DialogResult.Cancel;
-            Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
+            _status = new Label { Text = "Window mode is the safe default. Choose Quiet (tray) for apps you want ready without an opening window.", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Muted, AutoEllipsis = false, UseMnemonic = false, AccessibleName = "Startup form status", AccessibleDescription = "Window mode is the safe default. Choose Quiet (tray) for apps you want ready without an opening window.", AccessibleRole = AccessibleRole.Alert };
+            _root.Controls.Add(_status, 0, 6);
+            _normalMode.CheckedChanged += (s, e) => { if (_normalMode.Checked) SetFormStatus("Window mode starts the app normally. Its window may appear at sign-in.", Muted); };
+            _trayMode.CheckedChanged += (s, e) => { if (_trayMode.Checked) SetFormStatus("Quiet (tray) requests a hidden launch. Startup presentation needs verification.", Accent); };
+            var footer = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(0, 6, 0, 0), Margin = new Padding(0) };
+            var ok = Button(editing ? "&Save changes" : "&Add to startup", Accent, 148); ok.DialogResult = DialogResult.OK; ok.Click += ValidateBeforeClose; ok.TabIndex = 6;
+            var cancel = Button("&Cancel", Surface2, 100); cancel.DialogResult = DialogResult.Cancel; cancel.TabIndex = 7;
+            footer.Controls.Add(ok); footer.Controls.Add(cancel); _root.Controls.Add(footer, 0, 7); AcceptButton = ok; CancelButton = cancel;
+
+            _name.Text = appTitle ?? ""; _path.Text = appPath ?? ""; _args.Text = appArguments ?? "";
+            _advanced.Checked = !string.IsNullOrWhiteSpace(appArguments); SetAdvancedVisible(_advanced.Checked);
+            SetFormStatus(trayMode ? "Quiet (tray) requests a hidden launch. Startup presentation needs verification." : "Window mode is the safe default. The app starts normally and may show its window at sign-in.", trayMode ? Accent : Muted);
+            Shown += (s, e) => _path.Focus();
+            if (SystemInformation.HighContrast) ApplyHighContrast(this);
+            _dpiLayoutReady = true;
+            if (IsHandleCreated) ApplyInitialDpiGeometry();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            StartupUiTheme.ApplyNativeDarkChrome(this);
+            if (_dpiLayoutReady) ApplyInitialDpiGeometry();
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            Rectangle suggestedBounds = e.SuggestedRectangle;
+            base.OnDpiChanged(e);
+            if (!_dpiGeometryApplied) return;
+            float targetScale = Math.Max(1f, e.DeviceDpiNew / 96f);
+            float ratio = targetScale / Math.Max(.01f, _dpiGeometryScale);
+            if (Math.Abs(ratio - 1f) > .01f)
+            {
+                SuspendLayout();
+                Scale(new SizeF(ratio, ratio));
+                ResumeLayout(true);
+            }
+            if (suggestedBounds.Width > 0 && suggestedBounds.Height > 0) Bounds = suggestedBounds;
+            _dpiGeometryScale = targetScale;
+            SetLayoutScale(targetScale);
+            StartupUiTheme.ApplyNativeDarkChrome(this);
+        }
+
+        internal void EnsureDpiGeometry()
+        {
+            if (!IsHandleCreated) CreateHandle();
+            ApplyInitialDpiGeometry();
+        }
+
+        private void ApplyInitialDpiGeometry()
+        {
+            if (_dpiGeometryApplied) return;
+            _dpiGeometryApplied = true;
+            _dpiGeometryScale = MainForm.RenderedDpiScale(this);
+            if (Math.Abs(_dpiGeometryScale - 1f) > .01f)
+            {
+                SuspendLayout();
+                Scale(new SizeF(_dpiGeometryScale, _dpiGeometryScale));
+                ResumeLayout(true);
+            }
+            SetLayoutScale(_dpiGeometryScale);
+        }
+
+        internal void SetLayoutScale(float scale)
+        {
+            _layoutScale = Math.Max(1f, scale);
+            SetAdvancedVisible(_advanced.Checked);
+        }
+
+        internal void SimulateDpiTransitionForTest(float targetScale)
+        {
+            targetScale = Math.Max(1f, Math.Min(2f, targetScale));
+            float ratio = targetScale / Math.Max(.01f, _dpiGeometryScale);
+            if (Math.Abs(ratio - 1f) > .01f)
+            {
+                SuspendLayout();
+                Scale(new SizeF(ratio, ratio));
+                ResumeLayout(true);
+            }
+            _dpiGeometryScale = targetScale;
+            SetLayoutScale(targetScale);
+            PerformLayout();
         }
 
         private void ValidateBeforeClose(object sender, EventArgs e)
         {
+            if (!ApplyPasteForSave()) { DialogResult = DialogResult.None; return; }
             string path = AppPath;
             if (string.IsNullOrWhiteSpace(path) || !File.Exists(path) || !StartupService.IsSupportedStartupTarget(path))
             {
-                MessageBox.Show("Paste a valid full path to a .exe, .cmd, .bat, .ps1, or .lnk file (or browse for it), then save.", "Missing app", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 DialogResult = DialogResult.None;
+                SetFormStatus("Paste an existing file path before saving. Any file type is accepted.", Danger);
+                _path.Focus(); _path.SelectAll();
                 return;
             }
             // A friendly name is optional: derive it from the file's metadata right before saving.
@@ -3688,8 +14472,15 @@ foreach($t in Get-ScheduledTask){
                 string suggestion = StartupService.SuggestDisplayName(path);
                 _name.Text = string.IsNullOrWhiteSpace(suggestion) ? Path.GetFileNameWithoutExtension(path) : suggestion;
             }
+            SetFormStatus("Ready to save " + (TrayMode ? "in Quiet (tray) mode." : "in Window mode."), Good);
         }
 
+        private bool ApplyPasteForSave()
+        {
+            string expanded = Environment.ExpandEnvironmentVariables(AppPath);
+            if (File.Exists(expanded)) { _path.Text = expanded; return true; }
+            return ApplyPaste(_path.Text);
+        }
         private void AutoFillFromPath()
         {
             string path = AppPath;
@@ -3699,9 +14490,9 @@ foreach($t in Get-ScheduledTask){
             if (string.IsNullOrWhiteSpace(_name.Text))
             {
                 string suggestion = StartupService.SuggestDisplayName(expanded);
-                if (!string.IsNullOrWhiteSpace(suggestion)) { _name.Text = suggestion; _status.Text = "✓ Friendly name auto-filled from the file's metadata."; }
+                if (!string.IsNullOrWhiteSpace(suggestion)) { _name.Text = suggestion; SetFormStatus("Friendly name filled from the app's file metadata.", Good); }
             }
-            if (File.Exists(expanded) && StartupService.IsSupportedStartupTarget(expanded)) _status.Text = "✓ Ready to add.";
+            if (File.Exists(expanded) && StartupService.IsSupportedStartupTarget(expanded)) SetFormStatus("Ready to add. Choose Window or Quiet (tray), then save.", Good);
         }
 
         // Accept a bare full path OR a whole command line ("C:\app.exe --flag") and fill every
@@ -3710,7 +14501,7 @@ foreach($t in Get-ScheduledTask){
         {
             try
             {
-                text = (text ?? "").Trim();
+                text = Environment.ExpandEnvironmentVariables((text ?? "").Trim());
                 if (text.Length >= 2 && text[0] == '"' && text[text.Length - 1] == '"' && text.Count(c => c == '"') == 2) text = text.Substring(1, text.Length - 2);
                 string path, args;
                 if (File.Exists(text)) { path = text; args = ""; }
@@ -3724,27 +14515,44 @@ foreach($t in Get-ScheduledTask){
                         if (!string.IsNullOrWhiteSpace(resolved) && File.Exists(resolved)) path = resolved;
                     }
                 }
-                else { _status.ForeColor = Muted; _status.Text = "That path doesn't exist yet. Paste a full path to an installed .exe/.cmd/.bat/.ps1/.lnk."; return false; }
-                if (!File.Exists(path)) { _status.ForeColor = Muted; _status.Text = "That path doesn't exist yet. Paste a full path to an installed .exe/.cmd/.bat/.ps1/.lnk."; return false; }
-                if (!StartupService.IsSupportedStartupTarget(path)) { _status.ForeColor = Muted; _status.Text = "That file type can't be started directly. Use .exe, .cmd, .bat, .ps1, or .lnk."; return false; }
+                else { ShowError("That path does not exist. Paste the full path to an existing file."); return false; }
+                if (!File.Exists(path)) { ShowError("That path does not exist. Paste the full path to an existing file."); return false; }
+                if (!StartupService.IsSupportedStartupTarget(path)) { ShowError("Choose a supported application, shortcut, or script file."); return false; }
                 _path.Text = path;
                 _args.Text = args ?? "";
+                if (!string.IsNullOrWhiteSpace(args)) _advanced.Checked = true;
                 if (string.IsNullOrWhiteSpace(_name.Text)) _name.Text = StartupService.SuggestDisplayName(path);
-                if (!_trayMode.Checked && !_normalMode.Checked) _trayMode.Checked = true;
-                _status.ForeColor = Good;
-                _status.Text = "✓ Detected " + (string.IsNullOrWhiteSpace(args) ? "app" : "app with arguments") + ". Save to add it at every boot.";
+                SetFormStatus("Detected " + (string.IsNullOrWhiteSpace(args) ? "an application." : "an application and its arguments.") + " Choose a startup mode, then save.", Good);
                 return true;
             }
-            catch (Exception ex) { _status.ForeColor = Muted; _status.Text = ex.Message; return false; }
+            catch (Exception ex) { ShowError(ex.Message); return false; }
         }
 
-        private void AddLabel(string text, int top) { Controls.Add(new Label { Text = text, Left = 34, Top = top, AutoSize = true, ForeColor = Muted, Font = new Font("Segoe UI Semibold", 9.5f) }); }
-        private TextBox Box(int top, int width) { var t = new TextBox { Left = 34, Top = top, Width = width, Height = 32, BackColor = Surface2, ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Font = new Font("Segoe UI", 10.5f) }; Controls.Add(t); return t; }
-        private Button Button(string text, Color color, int width) { var b = new Button { Text = text, Width = width, Height = 40, FlatStyle = FlatStyle.Flat, BackColor = color, ForeColor = Color.White, Font = new Font("Segoe UI Semibold", 9.5f), Cursor = Cursors.Hand }; b.FlatAppearance.BorderSize = 0; b.MouseEnter += (s, e) => b.BackColor = ControlPaint.Light(color, .10f); b.MouseLeave += (s, e) => b.BackColor = color; return b; }
+        private Control BuildFieldRow(string label, TextBox box, Button[] actions)
+        {
+            var row = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(0, 2, 0, 4) };
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            row.RowStyles.Add(new RowStyle(SizeType.Absolute, 25f)); row.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            row.Controls.Add(new Label { Text = label, Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomLeft, ForeColor = Muted, Font = new Font(Font, FontStyle.Bold) }, 0, 0);
+            int actionCount = actions == null ? 0 : actions.Length;
+            var line = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = actionCount + 1, RowCount = 1, Margin = new Padding(0) };
+            line.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            line.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            line.Controls.Add(box, 0, 0);
+            for (int i = 0; i < actionCount; i++) { line.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, actions[i].Width + 8)); actions[i].Dock = DockStyle.Fill; actions[i].Margin = new Padding(8, 0, 0, 0); line.Controls.Add(actions[i], i + 1, 0); }
+            row.Controls.Add(line, 0, 1); return row;
+        }
+
+        private TextBox FieldBox(string accessibleName) { return new TextBox { Dock = DockStyle.Fill, Margin = new Padding(0), BorderStyle = BorderStyle.FixedSingle, BackColor = Surface2, ForeColor = TextMain, Font = new Font("Segoe UI Variable Text", 10.5f), AccessibleName = accessibleName }; }
+        private Button Button(string text, Color color, int width) { return new ThemedButton(color) { Text = text, Width = width, Height = 38, Font = new Font("Segoe UI Variable Text Semibold", 9.3f), Cursor = Cursors.Hand, UseMnemonic = true, AccessibleName = text.Replace("&", "").Trim(), Margin = new Padding(4, 0, 0, 0) }; }
+
+        private void SetAdvancedVisible(bool visible) { _root.RowStyles[4].SizeType = SizeType.Absolute; _root.RowStyles[4].Height = visible ? 66f * _layoutScale : 0f; _args.Visible = visible; _root.PerformLayout(); }
+        private void SetFormStatus(string message, Color color) { _status.ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : (color == Danger ? StartupUiTheme.DangerText : color); _status.Text = message ?? ""; _status.AccessibleDescription = message ?? ""; }
+        private void ShowError(string message) { SetFormStatus(message, Danger); }
 
         private void Browse(object sender, EventArgs e)
         {
-            using (var ofd = new System.Windows.Forms.OpenFileDialog { Filter = "Startup targets (*.exe;*.cmd;*.bat;*.ps1;*.lnk)|*.exe;*.cmd;*.bat;*.ps1;*.lnk|All files (*.*)|*.*", Title = "Choose app to start with Windows" })
+            using (var ofd = new System.Windows.Forms.OpenFileDialog { Filter = "All files (*.*)|*.*", Title = "Choose any file to open with Windows" })
             {
                 if (ofd.ShowDialog(this) != DialogResult.OK) return;
                 _path.Text = ofd.FileName;
@@ -3757,11 +14565,15 @@ foreach($t in Get-ScheduledTask){
         {
             try
             {
-                if (!Clipboard.ContainsText()) { _status.ForeColor = Muted; _status.Text = "Clipboard has no text. Copy a file path first."; return; }
+                if (!Clipboard.ContainsText()) { SetFormStatus("Clipboard has no text. Copy a file path first.", Muted); return; }
                 ApplyPaste(Clipboard.GetText() ?? "");
             }
-            catch (Exception ex) { _status.ForeColor = Muted; _status.Text = ex.Message; }
+            catch (Exception ex) { ShowError(ex.Message); }
         }
+
+        private void OnDragEnter(object sender, DragEventArgs e) { if (e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; }
+        private void OnDragDrop(object sender, DragEventArgs e) { try { var files = e.Data == null ? null : e.Data.GetData(DataFormats.FileDrop) as string[]; if (files != null && files.Length > 0) ApplyPaste(files[0]); } catch (Exception ex) { ShowError(ex.Message); } }
+        private static void ApplyHighContrast(Control root) { root.BackColor = SystemColors.Window; root.ForeColor = SystemColors.WindowText; foreach (Control child in root.Controls) { child.BackColor = child is Button || child is GroupBox ? SystemColors.Control : SystemColors.Window; child.ForeColor = child is Button || child is GroupBox ? SystemColors.ControlText : SystemColors.WindowText; ApplyHighContrast(child); } }
     }
 
 }
