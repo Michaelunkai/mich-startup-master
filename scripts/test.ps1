@@ -1834,7 +1834,7 @@ function Test-SafeProductContracts {
   $surfaceContracts = [int](Get-ReceiptValue $inventorySelfTest.Output 'surface_contracts')
   $expectedSurfaceNames = @(
     'Registry_Run', 'Registry_RunOnce', 'Registry_RunOnceEx', 'Registry_RunServices', 'Policy_Run',
-    'Legacy_Windows_Run', 'User_Logon_Script', 'Startup_Folder', 'Scheduled_Task',
+    'Legacy_Windows_Run', 'User_Logon_Script', 'Startup_Folder', 'Startup_Command', 'Scheduled_Task',
     'Windows_Service', 'System_Driver', 'Winlogon_Autostart', 'Winlogon_Notification',
     'Explorer_Startup_Extension', 'Explorer_Shell_Extension', 'Internet_Explorer_Add-on',
     'AppInit_DLLs', 'AppCert_DLLs', 'Active_Setup', 'Boot_Execute', 'LSA_Startup_Package',
@@ -2098,7 +2098,7 @@ function Test-LiveMutationSuite {
 
     $bulkDisableSelfTest = Invoke-AppCommand @('--bulk-disable-self-test')
     $bulkDisableReceipt = $bulkDisableSelfTest.Output.Trim()
-    Assert-Match $bulkDisableReceipt '^BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true storesRestored=true$' 'Transactional bulk disable self-test did not prove fail-closed rollback.'
+    Assert-Match $bulkDisableReceipt '^BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true storesRestored=true$' 'Transactional bulk disable self-test did not prove fail-closed rollback, including StartupApproved metadata.'
     'PASS bulk-disable transaction=true failedClosed=true registryRestored=true storesRestored=true'
 
     foreach ($candidateService in @($serviceName, $demandServiceName)) {

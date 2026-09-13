@@ -14,7 +14,7 @@ The default view is **All routes**: every discovered Windows startup registratio
 - **Refresh is read-only.** Repair and protection are explicit Tools actions.
 - Exact repeated adds reuse one canonical managed route. The boot agent transactionally retires exact duplicates and disabled `Launcher`/`Launch` aliases, including their saved quiet/enabled intent, so they cannot reappear after reboot.
 - The **Apps** tab exposes **Disable all** for an app with multiple routes. Every route is authorized before the first write; if any route fails, all earlier routes and intent stores are restored.
-- StartupApproved metadata is overlaid on its real registry/Startup-folder row instead of appearing as a contradictory duplicate.
+- StartupApproved metadata is overlaid on its real registry/Startup-folder/Windows startup-command row instead of appearing as a contradictory duplicate. An enabled approval is never hidden even when Windows withholds its launch command.
 - An independent boot audit checks the displayed inventory against separate Windows enumerators.
 - State stores use cross-process locking and atomic replacement.
 - One canonical logon task starts the hidden agent. Legacy app-owned Startup-folder launchers are retired, not retained as a second route.
@@ -25,6 +25,7 @@ The default view is **All routes**: every discovered Windows startup registratio
 The inventory covers the Windows startup surfaces used by this project, including:
 
 - Registry Run, RunOnce, RunOnceEx, RunServices, policy, loaded-user, and 32/64-bit views
+- Windows `Win32_StartupCommand` fallback entries, read in a timeout-isolated worker and deduplicated against native routes (this covers launchers such as Logitech G HUB that Windows reports even when its Run value is not enumerable)
 - Per-user and common Startup folders
 - Boot and logon scheduled tasks
 - Automatic services and boot/system/automatic drivers

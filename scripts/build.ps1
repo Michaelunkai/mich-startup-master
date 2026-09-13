@@ -513,8 +513,8 @@ function Assert-StagedBehavior {
     $probes += $truth
 
     $inventory = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--inventory-self-test'
-    $expectedSurfaceNames = 'Registry_Run,Registry_RunOnce,Registry_RunOnceEx,Registry_RunServices,Policy_Run,Legacy_Windows_Run,User_Logon_Script,Startup_Folder,Scheduled_Task,Windows_Service,System_Driver,Winlogon_Autostart,Winlogon_Notification,Explorer_Startup_Extension,Explorer_Shell_Extension,Internet_Explorer_Add-on,AppInit_DLLs,AppCert_DLLs,Active_Setup,Boot_Execute,LSA_Startup_Package,Image_Hijack,Known_DLL,Network_Provider,Winsock_Provider,Print_Monitor,Media_Codec,Group_Policy_Script,WMI_Event_Consumer,Packaged_Startup_Task'
-    $inventoryMatch = [regex]::Match($inventory.Stdout, '^INVENTORY_SELF_TEST kind=fixtures checks=(\d+) passed=(\d+) surface_contracts=30 surface_names=([^\s]+) service_start_modes=0,1,2,3$')
+    $expectedSurfaceNames = 'Registry_Run,Registry_RunOnce,Registry_RunOnceEx,Registry_RunServices,Policy_Run,Legacy_Windows_Run,User_Logon_Script,Startup_Folder,Startup_Command,Scheduled_Task,Windows_Service,System_Driver,Winlogon_Autostart,Winlogon_Notification,Explorer_Startup_Extension,Explorer_Shell_Extension,Internet_Explorer_Add-on,AppInit_DLLs,AppCert_DLLs,Active_Setup,Boot_Execute,LSA_Startup_Package,Image_Hijack,Known_DLL,Network_Provider,Winsock_Provider,Print_Monitor,Media_Codec,Group_Policy_Script,WMI_Event_Consumer,Packaged_Startup_Task'
+    $inventoryMatch = [regex]::Match($inventory.Stdout, '^INVENTORY_SELF_TEST kind=fixtures checks=(\d+) passed=(\d+) surface_contracts=31 surface_names=([^\s]+) service_start_modes=0,1,2,3$')
     if (-not $inventoryMatch.Success) {
         throw "Inventory behavior gate receipt is malformed: $($inventory.Stdout)"
     }
@@ -533,7 +533,7 @@ function Assert-StagedBehavior {
     $probes += $managedDedupe
 
     $bulkDisable = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--bulk-disable-self-test'
-    if ($bulkDisable.Stdout.Trim() -ne 'BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true storesRestored=true') {
+    if ($bulkDisable.Stdout.Trim() -ne 'BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true storesRestored=true') {
         throw "Transactional bulk-disable behavior gate failed: $($bulkDisable.Stdout)"
     }
     $probes += $bulkDisable
