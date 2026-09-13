@@ -5,7 +5,7 @@ Mich Startup Master is a native Windows 11 control center for seeing and managin
 - **State:** should this registration run at boot/sign-in?
 - **Mode:** should the app open a normal window, or start quietly and stay available in the system tray?
 
-The default view is **All routes**: every discovered Windows startup registration is visible immediately, exactly once per registration. Opening the dashboard from its tray icon or using **Clear filters** also resets to that complete route-level view and clears stale search/drill-down state. **Apps** is an optional summary view; it groups routes for convenience without deleting or hiding the underlying registrations, and can enable or disable every matching route for one app in a single rollback-safe transaction.
+The default view is **All routes**: every discovered Windows startup registration is visible immediately, exactly once per registration. Opening the dashboard from its tray icon or using **Clear filters** also resets to that complete route-level view and clears stale search/drill-down state. **Apps** is an optional summary view; it groups exact routes by a proven installed-product path owner (falling back to the canonical launch target), includes app-owned automatic services such as Logitech G HUB's updater, and can enable or disable every matching route for one app in a single rollback-safe transaction. Display-name similarity is never treated as ownership evidence.
 
 ## What changed in 2.0
 
@@ -26,7 +26,7 @@ The default view is **All routes**: every discovered Windows startup registratio
 The inventory covers the Windows startup surfaces used by this project, including:
 
 - Registry Run, RunOnce, RunOnceEx, RunServices, policy, loaded-user, and 32/64-bit views
-- Windows `Win32_StartupCommand` fallback entries, read in a timeout-isolated worker and deduplicated against native routes (this covers launchers such as Logitech G HUB that Windows reports even when its Run value is not enumerable)
+- Windows `Win32_StartupCommand` fallback entries, read in a timeout-isolated worker and deduplicated against native routes, including exact PATH-resolved commands such as `wscript.exe` (this covers launchers such as Logitech G HUB that Windows reports even when its Run value is not enumerable)
 - Per-user and common Startup folders
 - Boot and logon scheduled tasks
 - Automatic services and boot/system/automatic drivers

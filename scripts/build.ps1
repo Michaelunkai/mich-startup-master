@@ -533,7 +533,7 @@ function Assert-StagedBehavior {
     $probes += $managedDedupe
 
     $bulkDisable = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--bulk-disable-self-test'
-    if ($bulkDisable.Stdout.Trim() -ne 'BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true') {
+    if ($bulkDisable.Stdout.Trim() -ne 'BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true successfulBulkDisable=true successfulBulkRestore=true sharedPhysicalCollapsed=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true') {
         throw "Transactional bulk state behavior gate failed: $($bulkDisable.Stdout)"
     }
     $probes += $bulkDisable
@@ -646,7 +646,7 @@ function Assert-StagedBehavior {
     if ($uiJson.layout -ne 'responsive-native-control-center' -or $uiJson.defaultFilter -ne 'All routes' -or
         $uiJson.defaultViewIsCompleteRouteInventory -ne $true -or $uiJson.stateModeSeparated -ne $true -or
         $uiJson.startInTrayPrePaintSuppression -ne $true -or $uiJson.refreshIsReadOnly -ne $true -or
-        $uiJson.defaultNewMode -ne 'Window' -or $uiJson.appsAggregatedByCanonicalTarget -ne $true -or
+        $uiJson.defaultNewMode -ne 'Window' -or $uiJson.appsAggregatedByInstalledProductOrCanonicalTarget -ne $true -or
         $uiJson.appsNeverAggregatedByDisplayName -ne $true -or $uiJson.allRoutesRemainRouteLevel -ne $true -or
         $uiJson.aggregateNonBulkActionsFailClosed -ne $true -or $uiJson.aggregateBulkDisableTransactional -ne $true -or $uiJson.aggregateManageRoutesOneClick -ne $true -or
         $uiJson.actualApplicationTrayIconOnly -ne $true -or

@@ -1729,7 +1729,7 @@ function Assert-UiContract {
   if (-not $contract.startInTrayPrePaintSuppression) { throw 'Start-in-tray must suppress the first visible frame.' }
   if (-not $contract.refreshIsReadOnly) { throw 'Refresh must be read-only.' }
   if (-not $contract.sortableColumns -or -not $contract.keyboardAccessibleSorting -or $contract.statusInitialSort -ne 'Enabled first' -or -not $contract.repeatedColumnClickReversesSort) { throw 'Every inventory column must sort by mouse or keyboard, with Enabled first on the initial Status click and reversal on repeat.' }
-  if (-not $contract.humanReadableNames -or -not $contract.appsAggregatedByCanonicalTarget -or -not $contract.appsNeverAggregatedByDisplayName -or -not $contract.allRoutesRemainRouteLevel) { throw 'The UI must expose readable names, one canonical app row, and every exact underlying route.' }
+  if (-not $contract.humanReadableNames -or -not $contract.appsAggregatedByInstalledProductOrCanonicalTarget -or -not $contract.appsNeverAggregatedByDisplayName -or -not $contract.allRoutesRemainRouteLevel) { throw 'The UI must expose readable names, one installed-product app row when ownership is proven, canonical-target fallback rows, and every exact underlying route.' }
   if (-not $contract.aggregateNonBulkActionsFailClosed -or -not $contract.aggregateBulkDisableTransactional -or -not $contract.aggregateBulkEnableTransactional -or -not $contract.aggregateManageRoutesOneClick) { throw 'Aggregate rows must provide transactional bulk enable/disable while every ambiguous non-bulk action fails closed.' }
   if (-not $contract.contextualActions -or -not $contract.globalToolsInMenu) { throw 'Context actions and global tools must be separated.' }
   if (-not $contract.keyboardShortcuts -or -not $contract.accessibilityNames -or -not $contract.emptyLoadingErrorStates) { throw 'UI accessibility/state contracts are incomplete.' }
@@ -2057,7 +2057,7 @@ function Test-SafeProductContracts {
   foreach ($field in @('independent', 'independence_scope', 'sources', 'shown', 'gaps', 'errors', 'surfaces')) {
     if (-not $boot.ContainsKey($field)) { throw "BOOT_AUDIT is missing '$field': $bootLine" }
   }
-  if ($boot['independent'] -ne 'true' -or $boot['independence_scope'] -ne 'enumerators') { throw "Boot audit is not independent: $bootLine" }
+  if ($boot['independent'] -ne 'true' -or $boot['independence_scope'] -ne 'authoritative-enumerators') { throw "Boot audit is not independently backed by authoritative startup enumerators: $bootLine" }
   $bootSources = [int]$boot['sources']; $bootShown = [int]$boot['shown']; $bootGaps = [int]$boot['gaps']; $bootErrors = [int]$boot['errors']
   if ($bootSources -lt 1 -or $bootShown -lt 1 -or [string]::IsNullOrWhiteSpace([string]$boot['surfaces'])) { throw "Boot audit returned no independently enumerated coverage: $bootLine" }
   if ($bootGaps -ne 0 -or $bootErrors -ne 0) { throw "Boot coverage is incomplete or unreadable: $bootLine" }
@@ -2158,7 +2158,7 @@ function Test-LiveMutationSuite {
 
     $bulkDisableSelfTest = Invoke-AppCommand @('--bulk-disable-self-test')
     $bulkDisableReceipt = $bulkDisableSelfTest.Output.Trim()
-    Assert-Match $bulkDisableReceipt '^BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true$' 'Transactional bulk enable/disable self-test did not prove fail-closed rollback, including StartupApproved metadata.'
+    Assert-Match $bulkDisableReceipt '^BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true successfulBulkDisable=true successfulBulkRestore=true sharedPhysicalCollapsed=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true$' 'Transactional bulk enable/disable self-test did not prove successful multi-route state changes, shared HKCU physical-route collapse, exact restoration, and fail-closed rollback including StartupApproved metadata.'
     'PASS bulk-state transaction=true disableFailedClosed=true enableFailedClosed=true registryRestored=true storesRestored=true'
 
     foreach ($candidateService in @($serviceName, $demandServiceName)) {
@@ -2670,7 +2670,13 @@ finally {
 
   try {
     if ($script:OriginalKnownStoreEnvironmentExisted) { [Environment]::SetEnvironmentVariable('MSM_KNOWN_STORE', $script:OriginalKnownStoreEnvironmentValue, [EnvironmentVariableTarget]::Process) }
-    else { [Environment]::SetEnvironmentVariable('MSM_KNOWN_STORE', $null, [EnvironmentVariableTarget]::Process) }
+    else {
+      [Environment]::SetEnvironmentVariable('MSM_KNOWN_STORE', $null, [EnvironmentVariableTarget]::Process)
+      # Windows PowerShell can retain an empty Env: provider entry after the .NET
+      # process-environment API deletes the variable. Remove that exact provider
+      # entry too so the caller's originally absent environment is restored.
+      Remove-Item -LiteralPath 'Env:MSM_KNOWN_STORE' -ErrorAction SilentlyContinue
+    }
     $restoredTopKnownStore = Get-Item Env:MSM_KNOWN_STORE -ErrorAction SilentlyContinue
     if ($script:OriginalKnownStoreEnvironmentExisted) {
       if ($null -eq $restoredTopKnownStore -or -not [string]::Equals([string]$restoredTopKnownStore.Value, $script:OriginalKnownStoreEnvironmentValue, [StringComparison]::Ordinal)) { throw 'MSM_KNOWN_STORE was not restored exactly.' }
@@ -2680,7 +2686,10 @@ finally {
 
   try {
     if ($script:OriginalStateRootEnvironmentExisted) { [Environment]::SetEnvironmentVariable('MSM_STATE_ROOT', $script:OriginalStateRootEnvironmentValue, [EnvironmentVariableTarget]::Process) }
-    else { [Environment]::SetEnvironmentVariable('MSM_STATE_ROOT', $null, [EnvironmentVariableTarget]::Process) }
+    else {
+      [Environment]::SetEnvironmentVariable('MSM_STATE_ROOT', $null, [EnvironmentVariableTarget]::Process)
+      Remove-Item -LiteralPath 'Env:MSM_STATE_ROOT' -ErrorAction SilentlyContinue
+    }
     $restoredTopStateRoot = Get-Item Env:MSM_STATE_ROOT -ErrorAction SilentlyContinue
     if ($script:OriginalStateRootEnvironmentExisted) {
       if ($null -eq $restoredTopStateRoot -or -not [string]::Equals([string]$restoredTopStateRoot.Value, $script:OriginalStateRootEnvironmentValue, [StringComparison]::Ordinal)) { throw 'MSM_STATE_ROOT was not restored exactly.' }

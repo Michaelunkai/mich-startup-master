@@ -566,6 +566,19 @@ namespace MichStartupMaster
             });
         }
 
+        public static void DeleteIfEmpty(string path)
+        {
+            Locked(path, () =>
+            {
+                if (!File.Exists(path)) return 0;
+                if (File.ReadAllLines(path, Encoding.UTF8).Length != 0)
+                    throw new InvalidOperationException("Refusing to remove a nonempty state store: " + path);
+                File.Delete(path);
+                if (File.Exists(path)) throw new IOException("Empty state store could not be removed: " + path);
+                return 0;
+            });
+        }
+
         private static void WriteAtomic(string path, string[] lines)
         {
             string directory = Path.GetDirectoryName(Path.GetFullPath(path));
@@ -655,6 +668,13 @@ namespace MichStartupMaster
         public string Command;
         public string Location;
         public string AppName;
+        // Stable application ownership comes from an installed-product path registration, not
+        // from a display-name guess.  The Apps view uses this to keep every executable/service
+        // route owned by one installed application in the same bulk-manage row.
+        public string ApplicationIdentity;
+        public string ApplicationRoot;
+        public string ApplicationIdentityReason;
+        public string RuntimeEvidence;
         public bool Enabled;
         // Configuration is not proof. These fields are rebuilt during each read-only scan.
         public string VerifiedState = "Unknown";
@@ -1223,6 +1243,16 @@ namespace MichStartupMaster
                 : new[] { RegistryView.Registry32 };
         }
 
+        private static RegistryView[] UserStartupRegistryViews()
+        {
+            // HKCU is a symbolic link into HKU and these per-user startup paths are shared
+            // across WOW64 views (none is under the redirected Software\Classes subtree).
+            // Enumerating both logical views therefore creates two UI routes for one physical
+            // value. A bulk action then deletes the shared value through the first row and the
+            // second row fails because that same value is already gone.
+            return new[] { Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Registry32 };
+        }
+
         private static string RegistryViewLabel(RegistryView view)
         {
             return view == RegistryView.Registry32 ? "Registry32" : "Registry64";
@@ -1600,6 +1630,7 @@ namespace MichStartupMaster
             AddLegacyV2Items(items);
             HydrateHumanNames(items);
             ApplyTruthEvidence(items);
+            ApplyRuntimeEvidence(items);
             return Dedupe(items).OrderBy(x => x.Enabled ? 0 : 1).ThenBy(x => x.Source).ThenBy(x => x.Name).ToList();
         }
 
@@ -1645,16 +1676,48 @@ namespace MichStartupMaster
                 item.PresentationState = "Needs verification";
                 item.PresentationReason = "Configured launch mode does not prove startup window or tray presentation";
                 if (item.PopupLabel() == "N/A") { item.PresentationState = "Unsupported"; item.PresentationReason = "This startup surface has no application presentation contract"; }
-                if ((item.Source == "Startup Command" || item.Source == "Startup Approval") && !string.IsNullOrWhiteSpace(item.ApprovalRoot) && item.ApprovalData != null && item.ApprovalData.Length > 0)
+                if ((item.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase))
                 {
-                    item.VerifiedState = item.Enabled ? "Enabled" : "Disabled";
-                    item.EvidenceReason = item.Source == "Startup Command"
-                        ? "Windows reported the startup command and the exact existing Explorer StartupApproved state was read"
-                        : "The exact existing Explorer StartupApproved state was read; Windows did not expose the launch command";
+                    item.EvidenceReason = "The provider failed visibly; no startup-state claim is possible until refresh succeeds";
                     continue;
                 }
-                if (item.Source == "Packaged Startup Task") { item.EvidenceReason = "Manifest declaration and StartupApproved metadata do not prove AppModel StartupTask authority"; continue; }
-                if (item.Source != "Scheduled Task" || !(item.Id ?? "").StartsWith("task|")) continue;
+                if ((item.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase))
+                {
+                    item.VerifiedState = "Disabled";
+                    item.EvidenceReason = "Startup Master preserved this disabled route and validates its exact restore state before any mutation";
+                    continue;
+                }
+                if ((item.Id ?? "").StartsWith("legacy|", StringComparison.OrdinalIgnoreCase) || item.Source == "Legacy v2")
+                {
+                    item.EvidenceReason = "Legacy intent is retained for recovery but no live Windows startup registration exists";
+                    continue;
+                }
+                if (item.Source == "Startup Command")
+                {
+                    item.EvidenceReason = !string.IsNullOrWhiteSpace(item.ApprovalRoot)
+                        ? "Win32_StartupCommand and Explorer StartupApproved are compatibility projections; their state can be stale or conflict with another app-owned startup route"
+                        : "Win32_StartupCommand exposed a launch command whose authoritative registration was not enumerable; configuration state is unknown";
+                    continue;
+                }
+                if (item.Source == "Startup Approval" || item.Source == "Stale Startup Metadata")
+                {
+                    item.EvidenceReason = "Explorer StartupApproved is metadata, not an independently firing startup registration";
+                    continue;
+                }
+                if (item.Source == "Packaged Startup Task") { item.EvidenceReason = "Manifest declaration and StartupApproved metadata do not prove current AppModel StartupTask authority"; continue; }
+
+                if (item.Source != "Scheduled Task" || !(item.Id ?? "").StartsWith("task|"))
+                {
+                    if (IsDirectConfiguredStartupSource(item.Source))
+                    {
+                        item.VerifiedState = item.Enabled ? "Enabled" : "Disabled";
+                        item.EvidenceReason = "Fresh configured state read from the owning Windows startup surface; execution at the next boot/sign-in is not yet observed";
+                    }
+                    else if (item.Source == "Winlogon Notification") item.EvidenceReason = "Legacy Winlogon notification packages are ignored on current Windows; retained as compatibility metadata";
+                    else if (item.Source == "AppInit DLLs") item.EvidenceReason = "AppInit loading is conditional and is disabled by Windows when Secure Boot is enabled";
+                    else item.EvidenceReason = "This registered extension is conditional or demand-loaded; registration alone does not mean it runs at every boot/sign-in";
+                    continue;
+                }
                 try
                 {
                     dynamic scheduler = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service"));
@@ -1673,6 +1736,8 @@ namespace MichStartupMaster
                     { item.VerifiedState = "Drifted"; item.EvidenceReason = "Task action changed between enumeration and readback"; continue; }
                     string target, targetArguments;
                     if (!TryDecodeTrayPayload(item.Command, out target, out targetArguments)) { target = normalizedExecute; targetArguments = arguments; }
+                    target = Environment.ExpandEnvironmentVariables(target ?? "");
+                    normalizedExecute = Environment.ExpandEnvironmentVariables(normalizedExecute ?? "");
                     if (!Path.IsPathRooted(target))
                     { item.VerifiedState = "Drifted"; item.EvidenceReason = "Exact registered launcher or target is not an absolute path"; continue; }
                     // Inventory must never synchronously touch a removable, network, or other
@@ -1689,20 +1754,10 @@ namespace MichStartupMaster
                         || !string.Equals(expected[0].Arguments ?? "", targetArguments, StringComparison.Ordinal)))
                     { item.VerifiedState = "Drifted"; item.EvidenceReason = "Live task target or arguments contradict managed intent"; continue; }
                     bool activeTrigger = false;
-                    string sid = System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
                     for (int i = 1; i <= (int)definition.Triggers.Count; i++)
                     {
                         dynamic trigger = definition.Triggers.Item(i);
                         if (!(bool)trigger.Enabled || ((int)trigger.Type != 8 && (int)trigger.Type != 9)) continue;
-                        if ((int)trigger.Type == 9)
-                        {
-                            string user = Convert.ToString(trigger.UserId);
-                            if (!string.IsNullOrWhiteSpace(user))
-                            {
-                                string triggerSid = user.StartsWith("S-1-") ? user : ((System.Security.Principal.SecurityIdentifier)new System.Security.Principal.NTAccount(user).Translate(typeof(System.Security.Principal.SecurityIdentifier))).Value;
-                                if (!string.Equals(triggerSid, sid, StringComparison.OrdinalIgnoreCase)) continue;
-                            }
-                        }
                         activeTrigger = true;
                     }
                     bool enabled = Convert.ToBoolean(task.Enabled) && activeTrigger;
@@ -1710,7 +1765,31 @@ namespace MichStartupMaster
                     item.VerifiedState = RegistrationVerdict(true, true, true, true, item.Enabled, enabled);
                     item.EvidenceReason = "Fresh exact task action, target, arguments and applicable startup trigger readback; execution at next sign-in remains unverified";
                 }
-                catch (Exception ex) { item.EvidenceReason = "Readback unavailable: " + ex.GetBaseException().Message; }
+                catch (Exception ex) { item.VerifiedState = "Unknown"; item.EvidenceReason = "Readback unavailable: " + ex.GetBaseException().Message; }
+            }
+        }
+
+        private static bool IsDirectConfiguredStartupSource(string source)
+        {
+            switch (source ?? "")
+            {
+                case "Registry Run":
+                case "Registry RunOnce":
+                case "Registry RunOnceEx":
+                case "Registry RunServices":
+                case "Policy Run":
+                case "Legacy Windows Run":
+                case "User Logon Script":
+                case "Startup Folder":
+                case "Windows Service":
+                case "System Driver":
+                case "Winlogon Autostart":
+                case "Boot Execute":
+                case "LSA Startup Package":
+                case "Group Policy Script":
+                    return true;
+                default:
+                    return false;
             }
         }
 
@@ -1732,7 +1811,7 @@ namespace MichStartupMaster
                     gaps.Add(src.Source + " | " + (string.IsNullOrWhiteSpace(src.Name) ? "?" : src.Name) + " | " + (string.IsNullOrWhiteSpace(src.Command) ? "" : src.Command));
                 }
                 string surfaces = string.Join(",", raw.GroupBy(x => x.Source ?? "?").OrderBy(g => g.Key).Select(g => g.Key.Replace(' ', '_') + ":" + g.Count()));
-                string head = "BOOT_AUDIT independent=true independence_scope=enumerators sources=" + raw.Count + " shown=" + shown.Count + " gaps=" + gaps.Count + " errors=" + auditErrors.Count + " surfaces=" + surfaces;
+                string head = "BOOT_AUDIT independent=true independence_scope=authoritative-enumerators sources=" + raw.Count + " shown=" + shown.Count + " gaps=" + gaps.Count + " errors=" + auditErrors.Count + " surfaces=" + surfaces;
                 if (gaps.Count == 0) return head;
                 return head + Environment.NewLine + string.Join(Environment.NewLine, gaps.Take(50));
             }
@@ -1785,7 +1864,12 @@ namespace MichStartupMaster
             var raw = new List<StartupItem>();
             AuditRegistrySources(raw);
             AuditStartupFolders(raw);
-            AddIsolatedProvider(raw, "startup-command-audit", "Independent Startup Command", "Win32_StartupCommand", 10000);
+            // Win32_StartupCommand is a transient compatibility projection, not an
+            // authoritative firing surface, and its worker shares the WMI provider used by the
+            // main scan.  Auditing it a second time would be correlated evidence and could turn
+            // a cache-consistent omission into a false clean bill of health. Native Run/folder
+            // registrations are audited independently above; the WMI projection remains visible
+            // in the main inventory only as explicitly unverified metadata.
             AddIsolatedProvider(raw, "task-audit", "Independent Scheduled Task", "Task definition catalog", 15000);
             AddIsolatedProvider(raw, "service-audit", "Independent Windows Service", "Service Control Manager", 10000);
             AddIsolatedProvider(raw, "driver-audit", "Independent System Driver", "Service Control Manager", 10000);
@@ -1913,31 +1997,40 @@ namespace MichStartupMaster
                 @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
             };
             foreach (RegistryView view in StartupRegistryViews())
+            using (var machineRoot = OpenRegistryRoot(RegistryHive.LocalMachine, view))
             {
                 string viewLabel = RegistryViewLabel(view);
-                using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
-                using (var machineRoot = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+                foreach (string path in runKeys) AuditRegistryValues(raw, machineRoot, path, "Machine", SourceForRegistryPath(path), null, viewLabel);
+                AuditRegistryValues(raw, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", "Machine", "Legacy Windows Run", new[] { "Load", "Run" }, viewLabel);
+                AuditRunOnceEx(raw, machineRoot, "Machine", null, viewLabel);
+                foreach (string path in new[]
                 {
-                    foreach (var pair in new[] { Tuple.Create(userRoot, "User"), Tuple.Create(machineRoot, "Machine") })
-                    {
-                        foreach (string path in runKeys) AuditRegistryValues(raw, pair.Item1, path, pair.Item2, SourceForRegistryPath(path), null, viewLabel);
-                        AuditRegistryValues(raw, pair.Item1, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", pair.Item2, "Legacy Windows Run", new[] { "Load", "Run" }, viewLabel);
-                        AuditRunOnceEx(raw, pair.Item1, pair.Item2, null, viewLabel);
-                        foreach (string path in new[]
-                        {
-                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
-                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
-                        }) AuditRegistryValues(raw, pair.Item1, path, pair.Item2, "Explorer Startup Extension", null, viewLabel);
-                        AddExplorerShellExtensions(raw, pair.Item1, pair.Item2, null, viewLabel, true);
-                        AddInternetExplorerAddons(raw, pair.Item1, pair.Item2, null, viewLabel, true);
-                    }
-                    AuditWinlogonValues(raw, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Machine", new[] { "Shell", "Userinit", "Taskman", "AppSetup", "System" }, viewLabel);
-                    AuditWinlogonValues(raw, userRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "User", new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
-                    AuditRegistryValues(raw, userRoot, @"Environment", "User", "User Logon Script", new[] { "UserInitMprLogonScript" }, viewLabel);
-                    AuditAppInit(raw, machineRoot, viewLabel);
-                    AuditActiveSetup(raw, machineRoot, "Machine", null, viewLabel);
-                    AuditActiveSetup(raw, userRoot, "User", null, viewLabel);
-                }
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
+                }) AuditRegistryValues(raw, machineRoot, path, "Machine", "Explorer Startup Extension", null, viewLabel);
+                AddExplorerShellExtensions(raw, machineRoot, "Machine", null, viewLabel, true);
+                AddInternetExplorerAddons(raw, machineRoot, "Machine", null, viewLabel, true);
+                AuditWinlogonValues(raw, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Machine", new[] { "Shell", "Userinit", "Taskman", "AppSetup", "System" }, viewLabel);
+                AuditAppInit(raw, machineRoot, viewLabel);
+                AuditActiveSetup(raw, machineRoot, "Machine", null, viewLabel);
+            }
+            foreach (RegistryView view in UserStartupRegistryViews())
+            using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
+            {
+                string viewLabel = RegistryViewLabel(view);
+                foreach (string path in runKeys) AuditRegistryValues(raw, userRoot, path, "User", SourceForRegistryPath(path), null, viewLabel);
+                AuditRegistryValues(raw, userRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", "User", "Legacy Windows Run", new[] { "Load", "Run" }, viewLabel);
+                AuditRunOnceEx(raw, userRoot, "User", null, viewLabel);
+                foreach (string path in new[]
+                {
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
+                }) AuditRegistryValues(raw, userRoot, path, "User", "Explorer Startup Extension", null, viewLabel);
+                AddExplorerShellExtensions(raw, userRoot, "User", null, viewLabel, true);
+                AddInternetExplorerAddons(raw, userRoot, "User", null, viewLabel, true);
+                AuditWinlogonValues(raw, userRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "User", new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
+                AuditRegistryValues(raw, userRoot, @"Environment", "User", "User Logon Script", new[] { "UserInitMprLogonScript" }, viewLabel);
+                AuditActiveSetup(raw, userRoot, "User", null, viewLabel);
             }
             AuditRegistryValues(raw, Registry.LocalMachine, @"SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls", "Machine", "AppCert DLLs", null);
             AuditLoadedUserRegistrySources(raw);
@@ -2102,7 +2195,7 @@ namespace MichStartupMaster
                     @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce",
                     @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
                 };
-                foreach (RegistryView view in StartupRegistryViews())
+                foreach (RegistryView view in UserStartupRegistryViews())
                 using (var usersRoot = OpenRegistryRoot(RegistryHive.Users, view))
                 {
                     string viewLabel = RegistryViewLabel(view);
@@ -3186,6 +3279,13 @@ namespace MichStartupMaster
             var mirrored = Dedupe(new List<StartupItem> { mirror, native });
             require(mirrored.Count == 1 && mirrored[0].Source == "Registry Run", "Win32_StartupCommand mirror must collapse into its native registration");
             require(Dedupe(new List<StartupItem> { mirror }).Single().Source == "Startup Command", "a Windows-reported startup command with no enumerable native registration must remain visible");
+            var otherScopeMirror = new StartupItem { Id = "wmi|machine-fixture", Name = "Fixture", Source = "Startup Command", Scope = "Machine", Command = native.Command, Location = "HKLM", Enabled = true };
+            require(Dedupe(new List<StartupItem> { native, otherScopeMirror }).Count == 2, "a same-command WMI row in another scope must not be hidden behind the current-user registration");
+            var argumentCaseMirror = new StartupItem { Id = "wmi|argument-case", Name = "Fixture", Source = "Startup Command", Scope = "User", Command = "\"C:\\Fixture App\\fixture.exe\" --READY", Location = "HKU", Enabled = true };
+            require(Dedupe(new List<StartupItem> { native, argumentCaseMirror }).Count == 2, "case-sensitive startup arguments must not be collapsed as equivalent metadata mirrors");
+            var scriptNative = new StartupItem { Id = "reg|User|script-fixture", Name = "Script fixture", Source = "Registry Run", Scope = "User", Command = @"wscript.exe //B //NoLogo ""C:\Fixture\startup.vbs""", Location = native.Location, Enabled = true };
+            var scriptProjection = new StartupItem { Id = "wmi|script-fixture", Name = scriptNative.Name, Source = "Startup Command", Scope = scriptNative.Scope, Command = scriptNative.Command, Location = "HKU", Enabled = true };
+            require(Dedupe(new List<StartupItem> { scriptNative, scriptProjection }).Count == 1, "an exact PATH-resolved Win32_StartupCommand projection must collapse into its native Run registration");
 
             var task = new StartupItem { Id = @"task|\Fixture", Name = "Fixture", Source = "Scheduled Task", Scope = "User/System", Command = native.Command, Location = @"\Fixture", Enabled = true };
             var independent = Dedupe(new List<StartupItem> { native, task });
@@ -3318,28 +3418,46 @@ namespace MichStartupMaster
 
             var physicalDuplicate = Dedupe(new List<StartupItem> { native, new StartupItem { Id = native.Id, Name = native.Name, Source = native.Source, Scope = native.Scope, Command = native.Command, Location = native.Location, Enabled = true } });
             require(physicalDuplicate.Count == 1, "same physical registration must appear once");
+            var identityConflict = Dedupe(new List<StartupItem> { native, new StartupItem { Id = native.Id, Name = native.Name, Source = native.Source, Scope = native.Scope, Command = @"C:\Fixture\different.exe", Location = native.Location, Enabled = false } });
+            require(identityConflict.Count == 2 && identityConflict.Any(row => row.Source == "Inventory Identity Conflict" && row.StateText() == "Unknown"), "same stable id with conflicting state must produce a visible error instead of silently keeping the first row");
 
             var approvalItems = new List<StartupItem> { new StartupItem { Id = "reg|User|approval", Name = "Fixture", Source = "Registry Run", Scope = "User", Command = native.Command, Location = @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run", Enabled = true, CanDisable = true } };
             ApplyStartupApproved(approvalItems, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", Scope = "User", Kind = "Run", Name = "Fixture", Data = new byte[] { 3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 } } });
             require(approvalItems.Count == 1 && !approvalItems[0].Enabled && !string.IsNullOrWhiteSpace(approvalItems[0].ApprovalPath), "StartupApproved must overlay the real row without a duplicate");
 
             var staleApproval = new List<StartupItem>();
-            ApplyStartupApproved(staleApproval, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "Run", Name = "Removed", Data = new byte[] { 3 } } });
+            ApplyStartupApproved(staleApproval, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "Run", Name = "Removed", Data = new byte[] { 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } });
             require(staleApproval.Count == 1 && staleApproval[0].Source == "Stale Startup Metadata" && staleApproval[0].PopupLabel() == "N/A", "orphaned Run approval metadata must be a non-actionable warning, not an installed startup app");
+            var malformedApproval = new List<StartupItem>();
+            ApplyStartupApproved(malformedApproval, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "Run", Name = "Malformed", Data = new byte[] { 3 } } });
+            require(malformedApproval.Count == 1 && malformedApproval[0].Id.StartsWith("error|Startup Approval|", StringComparison.Ordinal) && malformedApproval[0].StateText() == "Unknown" && !malformedApproval[0].CanDisable, "malformed StartupApproved bytes must remain visible, unknown, and read-only");
             var enabledOrphanApproval = new List<StartupItem>();
-            ApplyStartupApproved(enabledOrphanApproval, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "Run", Name = "LGHUB", Data = new byte[] { 2, 0, 0, 0 } } });
+            ApplyStartupApproved(enabledOrphanApproval, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "Run", Name = "LGHUB", Data = new byte[] { 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } });
             require(enabledOrphanApproval.Count == 1 && enabledOrphanApproval[0].Source == "Startup Approval" && enabledOrphanApproval[0].Enabled && enabledOrphanApproval[0].ApprovalName == "LGHUB", "an enabled orphaned approval must remain visible and retain its exact controllable metadata");
             var wmiApproval = new List<StartupItem> { new StartupItem { Id = "wmi|lghub", Name = "LGHUB", Source = "Startup Command", Scope = "User", Command = "\"C:\\Program Files\\LGHUB\\system_tray\\lghub_system_tray.exe\" --minimized", Location = @"HKU\S-1-5-21-fixture\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", Enabled = true } };
-            ApplyStartupApproved(wmiApproval, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", Scope = "User", Kind = "Run", Name = "LGHUB", Data = new byte[] { 2, 0, 0, 0 } } });
+            ApplyStartupApproved(wmiApproval, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", Scope = "User", Kind = "Run", Name = "LGHUB", Data = new byte[] { 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } });
             require(wmiApproval.Count == 1 && wmiApproval[0].Source == "Startup Command" && wmiApproval[0].Enabled && wmiApproval[0].ApprovalName == "LGHUB", "Windows-reported LGHUB fallback must pair with its exact StartupApproved state without becoming a duplicate");
+            var corroboratedLghub = new List<StartupItem>
+            {
+                new StartupItem { Id = "reg|User|lghub|Registry64", Name = "LGHUB", Source = "Registry Run", Scope = "User", Command = "\"C:\\Program Files\\LGHUB\\system_tray\\lghub_system_tray.exe\" --minimized", Location = @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run [Registry64]", RegistryView = "Registry64", Enabled = true },
+                new StartupItem { Id = "wmi|lghub-corroboration", Name = "LGHUB", Source = "Startup Command", Scope = "User", Command = "\"C:\\Program Files\\LGHUB\\system_tray\\lghub_system_tray.exe\" --minimized", Location = @"HKU\S-1-5-21-fixture\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", Enabled = true }
+            };
+            ApplyStartupApproved(corroboratedLghub, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", Scope = "User", Kind = "Run", Name = "LGHUB", Data = new byte[] { 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } });
+            var corroboratedLghubFinal = Dedupe(corroboratedLghub);
+            require(corroboratedLghubFinal.Count == 1 && corroboratedLghubFinal[0].Source == "Registry Run" && corroboratedLghubFinal[0].ApprovalName == "LGHUB" && !corroboratedLghubFinal.Any(row => row.Source == "Startup Approval"), "a corroborating Win32_StartupCommand projection must not create a false approval ambiguity when the native LGHUB Run route exists");
+            var transientWmiApproval = new List<StartupItem> { new StartupItem { Id = "wmi|lghub-transient", Name = "LGHUB", Source = "Startup Command", Scope = "User", Command = "\"C:\\Program Files\\LGHUB\\system_tray\\lghub_system_tray.exe\" --minimized", Location = @"HKU\S-1-5-21-fixture\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", Enabled = true } };
+            byte[] disabledZeroTimestampApproval = { 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+            ApplyStartupApproved(transientWmiApproval, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run", Scope = "User", Kind = "Run", Name = "LGHUB", Data = disabledZeroTimestampApproval } });
+            ApplyTruthEvidence(transientWmiApproval);
+            require(transientWmiApproval.Count == 1 && transientWmiApproval[0].StateText() == "Unknown" && transientWmiApproval[0].ApprovalData.SequenceEqual(disabledZeroTimestampApproval), "transient Win32_StartupCommand plus disabled approval metadata must stay visible without falsely declaring the whole application disabled");
             var stalePackaged = new List<StartupItem>();
-            ApplyStartupApproved(stalePackaged, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "StartupTasks", Name = "Packaged.Task", Data = new byte[] { 7 } } });
+            ApplyStartupApproved(stalePackaged, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "StartupTasks", Name = "Packaged.Task", Data = new byte[] { 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } });
             require(stalePackaged.Count == 1 && stalePackaged[0].Source == "Stale Startup Metadata" && !stalePackaged[0].Enabled, "orphaned packaged approval bytes must not create a phantom app row");
 
             string manifestFixture = "<Package xmlns='http://schemas.microsoft.com/appx/manifest/foundation/windows10' xmlns:desktop='http://schemas.microsoft.com/appx/manifest/desktop/windows10'><Identity Name='Fixture.Package' Publisher='CN=Fixture' Version='1.0.0.0'/><Properties><DisplayName>Fixture package</DisplayName></Properties><Applications><Application Id='App' Executable='Fixture.exe' EntryPoint='Windows.FullTrustApplication'><Extensions><desktop:Extension Category='windows.startupTask' Executable='Fixture.exe' EntryPoint='Windows.FullTrustApplication'><desktop:StartupTask TaskId='FixtureBoot' Enabled='true' DisplayName='Fixture boot'/></desktop:Extension></Extensions></Application></Applications></Package>";
             var packagedFixture = ParsePackagedStartupManifest(manifestFixture, new PackageManifestLocation { ManifestPath = @"C:\FixturePackage\AppxManifest.xml", PackageFullName = "Fixture.Package_1.0.0.0_x64__publisher", PackageFamilyName = "Fixture.Package_publisher", Scope = "User" });
             require(packagedFixture.Count == 1 && packagedFixture[0].Source == "Packaged Startup Task" && packagedFixture[0].Name == "Fixture.Package_publisher!FixtureBoot", "actual package manifest declaration must create the packaged startup row");
-            ApplyStartupApproved(packagedFixture, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "StartupTasks", Name = "Fixture.Package_publisher!FixtureBoot", Data = new byte[] { 3, 4, 5 } } });
+            ApplyStartupApproved(packagedFixture, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "StartupTasks", Name = "Fixture.Package_publisher!FixtureBoot", Data = new byte[] { 3, 0, 0, 0, 4, 5, 6, 7, 8, 9, 10, 11 } } });
             require(packagedFixture.Count == 1 && !packagedFixture[0].Enabled && !string.IsNullOrWhiteSpace(packagedFixture[0].ApprovalPath), "packaged approval state must overlay the manifest declaration without adding a row");
 
             var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Program.ManagedTaskRoot + "StartupApp" };
@@ -3359,14 +3477,14 @@ namespace MichStartupMaster
             require(StripKnownQuietArguments(@"C:\Fixture\MichStartupMaster.exe", "--start-in-tray") == "", "Window mode must strip the app's native start-hidden flag");
             require(IsQuietLaunch(@"C:\Fixture\Speedy.exe --minimize-to-tray"), "direct native quiet flags must be recognized without a wrapper");
 
-            byte[] approvalFixture = { 7, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67 };
+            byte[] approvalFixture = { 7, 0, 0, 0, 31, 37, 41, 43, 47, 53, 59, 61 };
             byte[] approvalEnabled = ApplyStartupApprovalState(approvalFixture, true);
             byte[] approvalDisabled = ApplyStartupApprovalState(approvalEnabled, false);
             require((approvalEnabled[0] & 1) == 0 && (approvalDisabled[0] & 1) == 1, "StartupApproved state must toggle only its enable bit");
             require(approvalEnabled.Skip(1).SequenceEqual(approvalFixture.Skip(1)) && approvalDisabled.Skip(1).SequenceEqual(approvalFixture.Skip(1)), "StartupApproved timestamps and unknown metadata must remain byte-for-byte intact");
             for (byte startupApprovalState = 0; startupApprovalState <= 7; startupApprovalState++)
             {
-                byte[] stateFixture = { startupApprovalState, 0x11, 0x23, 0x45, 0x67, 0x7F };
+                byte[] stateFixture = { startupApprovalState, 0, 0, 0, 0x11, 0x23, 0x45, 0x67, 0x7F, 0x31, 0x41, 0x59 };
                 byte[] stateEnabled = ApplyStartupApprovalState(stateFixture, true);
                 byte[] stateDisabled = ApplyStartupApprovalState(stateFixture, false);
                 require(!IsStartupApprovalDisabled(stateEnabled) && IsStartupApprovalDisabled(stateDisabled), "StartupApproved decoder/writer must agree for state 0x" + startupApprovalState.ToString("X2"));
@@ -3415,12 +3533,15 @@ namespace MichStartupMaster
             string regKey64 = RegistryProtectionKey("User", Registry.CurrentUser.Name, @"Software\Microsoft\Active Setup\Installed Components", "Fixture", "Registry64");
             require(!string.Equals(regKey32, regKey64, StringComparison.OrdinalIgnoreCase) && regKey32.EndsWith("|Registry32", StringComparison.Ordinal), "Registry32 and Registry64 registrations must have distinct stable identities");
             RegistryView[] providerViews = StartupRegistryViews();
-            require(providerViews.Contains(RegistryView.Registry32) && (!Environment.Is64BitOperatingSystem || providerViews.Contains(RegistryView.Registry64)), "view-sensitive providers must explicitly enumerate every supported registry view");
-            var userLogonFixture = new StartupItem { Id = RegistryProtectionKey("User", Registry.CurrentUser.Name, @"Environment", "UserInitMprLogonScript", "Registry64"), Name = "UserInitMprLogonScript", Source = "User Logon Script", Scope = "User", Command = @"C:\Fixture\logon.cmd", Location = @"HKEY_CURRENT_USER\Environment [Registry64]", Enabled = true, RegistryView = "Registry64" };
-            require(userLogonFixture.Source == "User Logon Script" && userLogonFixture.Id.EndsWith("|Registry64", StringComparison.Ordinal), "UserInitMprLogonScript must be represented as a view-specific provider row");
+            require(providerViews.Contains(RegistryView.Registry32) && (!Environment.Is64BitOperatingSystem || providerViews.Contains(RegistryView.Registry64)), "machine view-sensitive providers must explicitly enumerate every supported registry view");
+            RegistryView[] userProviderViews = UserStartupRegistryViews();
+            string userProviderViewLabel = RegistryViewLabel(userProviderViews.Single());
+            require(userProviderViews.Length == 1 && userProviderViews[0] == (Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Registry32), "shared HKCU/HKU startup keys must be enumerated once through the native view");
+            var userLogonFixture = new StartupItem { Id = RegistryProtectionKey("User", Registry.CurrentUser.Name, @"Environment", "UserInitMprLogonScript", userProviderViewLabel), Name = "UserInitMprLogonScript", Source = "User Logon Script", Scope = "User", Command = @"C:\Fixture\logon.cmd", Location = Registry.CurrentUser.Name + @"\Environment [" + userProviderViewLabel + "]", Enabled = true, RegistryView = userProviderViewLabel };
+            require(userLogonFixture.Source == "User Logon Script" && userLogonFixture.Id.EndsWith("|" + userProviderViewLabel, StringComparison.Ordinal), "UserInitMprLogonScript must retain one stable native-view identity");
             StartupItem providerProtocolFixture;
             require(TryParseProviderRow(SerializeProviderRow(userLogonFixture), out providerProtocolFixture)
-                && providerProtocolFixture.Id == userLogonFixture.Id && providerProtocolFixture.RegistryView == "Registry64", "isolated provider protocol must preserve stable ids and registry-view identity exactly");
+                && providerProtocolFixture.Id == userLogonFixture.Id && providerProtocolFixture.RegistryView == userProviderViewLabel, "isolated provider protocol must preserve stable ids and registry-view identity exactly");
             require(ServiceProtectionKey("driver", "FixtureDrv") == "driver|" + B64("FixtureDrv"), "driver protection identity must round-trip the live encoded ID");
             require(ActiveSetupProtectionKey("Machine", Registry.LocalMachine.Name, @"SOFTWARE\Microsoft\Active Setup\Installed Components\{X}").StartsWith("active|Machine|", StringComparison.Ordinal), "Active Setup protection identity must be canonical");
             require(RootFromName("HKU") == Registry.Users, "loaded-user registry identities must restore through HKEY_USERS");
@@ -3446,6 +3567,9 @@ namespace MichStartupMaster
             require(requiredSources.Distinct(StringComparer.OrdinalIgnoreCase).Count() == requiredSources.Length, "startup surface contract contains duplicate provider names");
             string fixtureJson = ToJson(new List<StartupItem> { native, task, userLogonFixture });
             require(fixtureJson.Contains("\"id\":\"", StringComparison.Ordinal) && new[] { native, task, userLogonFixture }.All(x => !string.IsNullOrWhiteSpace(x.Id)), "list JSON must expose a nonempty stable id for every row");
+            string controlJson = ToJson(new List<StartupItem> { new StartupItem { Id = "fixture|json", Name = "tab\tbackspace\bformfeed\f", Source = "Fixture", Scope = "User", Location = "line1\r\nline2", Status = "consumer\tfilter", Enabled = true } });
+            using (JsonDocument parsedControlJson = JsonDocument.Parse(controlJson))
+                require(parsedControlJson.RootElement.GetArrayLength() == 1 && parsedControlJson.RootElement[0].GetProperty("status").GetString() == "consumer\tfilter", "list JSON must escape every control character and remain parseable");
             string surfaceNames = string.Join(",", requiredSources.Select(source => source.Replace(' ', '_')));
             return "INVENTORY_SELF_TEST kind=fixtures checks=" + checks + " passed=" + checks + " surface_contracts=" + requiredSources.Length
                 + " surface_names=" + surfaceNames + " service_start_modes=" + string.Join(",", serviceStartModes);
@@ -3646,10 +3770,93 @@ namespace MichStartupMaster
 
         private static void HydrateHumanNames(List<StartupItem> items)
         {
+            var ownershipWarnings = new List<StartupItem>();
+            List<InstalledProductPrefix> installedProducts = ReadInstalledProductNamePrefixes(ownershipWarnings);
+            items.AddRange(ownershipWarnings);
             foreach (var item in items)
             {
+                InstalledProductPrefix owner = InstalledProductForItem(item, installedProducts);
+                if (owner != null)
+                {
+                    string root = NormalizeApplicationRoot(owner.Root);
+                    if (!string.IsNullOrWhiteSpace(root))
+                    {
+                        item.ApplicationIdentity = "installed-product:" + CleanName(owner.DisplayName ?? "product").ToLowerInvariant() + "|registration:" + B64(owner.Registration ?? "");
+                        item.ApplicationRoot = NormalizeApplicationRoot(owner.FamilyRoot);
+                        item.ApplicationIdentityReason = "Executable is inside the uniquely owning registered product path " + root + " (" + owner.Registration + ")";
+                        // A registered product name is a stronger application label than a helper
+                        // executable's FileDescription (for example, LGHUB Updater Service).
+                        if (!string.IsNullOrWhiteSpace(owner.DisplayName)) item.AppName = owner.DisplayName.Trim();
+                    }
+                }
                 if (string.IsNullOrWhiteSpace(item.AppName)) item.AppName = FriendlyNameFor(item);
             }
+        }
+
+        private static string NormalizeApplicationRoot(string value)
+        {
+            try
+            {
+                string expanded = Environment.ExpandEnvironmentVariables((value ?? "").Trim().Trim('"'));
+                return string.IsNullOrWhiteSpace(expanded) || !Path.IsPathRooted(expanded) ? "" : Path.GetFullPath(expanded).TrimEnd('\\');
+            }
+            catch { return ""; }
+        }
+
+        private static InstalledProductPrefix InstalledProductForItem(StartupItem item, IEnumerable<InstalledProductPrefix> prefixes)
+        {
+            if (item == null) return null;
+            string target, arguments;
+            try
+            {
+                if (TryFriendlyTarget(item, out target, out arguments)) return InstalledProductForTarget(target, prefixes);
+            }
+            catch { }
+            return InstalledProductForCommand(item.Command, prefixes);
+        }
+
+        private static void ApplyRuntimeEvidence(List<StartupItem> items)
+        {
+            List<NativeProcessInfo> processes;
+            try { processes = NativeProcessCatalog.Snapshot(); }
+            catch { return; }
+            var processPaths = processes.Select(process => new
+            {
+                Process = process,
+                Path = NormalizeObservedPath(process.ExecutablePath)
+            }).Where(process => !string.IsNullOrWhiteSpace(process.Path)).ToList();
+            foreach (StartupItem item in items ?? new List<StartupItem>())
+            {
+                string target = "", arguments = "";
+                try
+                {
+                    if (!TryFriendlyTarget(item, out target, out arguments) || string.IsNullOrWhiteSpace(target))
+                        TrySplitCommand(item.Command ?? "", out target, out arguments);
+                }
+                catch { }
+                string exactPath = NormalizeObservedPath(target);
+                var exact = string.IsNullOrWhiteSpace(exactPath)
+                    ? new List<NativeProcessInfo>()
+                    : processPaths.Where(process => string.Equals(process.Path, exactPath, StringComparison.OrdinalIgnoreCase)).Select(process => process.Process).ToList();
+                string root = NormalizeObservedPath(item.ApplicationRoot);
+                var related = string.IsNullOrWhiteSpace(root)
+                    ? new List<NativeProcessInfo>()
+                    : processPaths.Where(process => process.Path.Equals(root, StringComparison.OrdinalIgnoreCase) || process.Path.StartsWith(root + @"\", StringComparison.OrdinalIgnoreCase)).Select(process => process.Process).ToList();
+                if (exact.Count == 0 && related.Count == 0) continue;
+                string exactText = exact.Count == 0 ? "exact target not currently observed" + (string.IsNullOrWhiteSpace(exactPath) ? "" : " [" + exactPath + "]") : "exact target running pid=" + string.Join(",", exact.Select(process => process.ProcessId));
+                string relatedText = related.Count == 0 ? "" : "; related installed-product processes=" + string.Join(", ", related.OrderBy(process => process.ProcessId).Take(16).Select(process => Path.GetFileName(process.ExecutablePath) + "(" + process.ProcessId + ")"));
+                item.RuntimeEvidence = exactText + relatedText + ". This is a current-process observation, not proof of the next boot.";
+            }
+        }
+
+        private static string NormalizeObservedPath(string value)
+        {
+            try
+            {
+                string expanded = Environment.ExpandEnvironmentVariables((value ?? "").Trim().Trim('"'));
+                return string.IsNullOrWhiteSpace(expanded) || !Path.IsPathRooted(expanded) ? "" : Path.GetFullPath(expanded).TrimEnd('\\');
+            }
+            catch { return ""; }
         }
 
         private static string FriendlyNameFor(StartupItem item)
@@ -3753,31 +3960,23 @@ namespace MichStartupMaster
         private static List<StartupItem> Dedupe(List<StartupItem> items)
         {
             var all = items.ToList();
-            // Native (registry/folder) commands that are already surfaced: WMI Startup Command
-            // rows are only an alternate mirror of the same registrations.
-            var nativeCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in all)
-            {
-                if ((item.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase)) continue;
-                if (item.Source == "Registry Run" || item.Source == "Registry RunOnce" || item.Source == "Registry RunServices" || item.Source == "Policy Run" || item.Source == "Startup Folder")
-                    nativeCommands.Add(CanonicalLaunchKey(item));
-            }
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var nativeRegistrations = all.Where(item => !(item.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase)
+                && (item.Source == "Registry Run" || item.Source == "Startup Folder")).ToList();
+            var seen = new Dictionary<string, StartupItem>(StringComparer.OrdinalIgnoreCase);
             var result = new List<StartupItem>();
+            int conflicts = 0;
             // Live registrations first: they always win over informational/legacy records.
             foreach (var item in all.Where(i => !(i.Id ?? "").StartsWith("disabled|", StringComparison.OrdinalIgnoreCase)))
             {
-                if (item.Source == "Startup Command")
-                {
-                    string nc = CanonicalLaunchKey(item);
-                    if (nativeCommands.Contains(nc)) continue;
-                }
+                if (item.Source == "Startup Command" && nativeRegistrations.Any(native => StartupCommandMirrorsNative(item, native))) continue;
                 // Only collapse the exact same physical registration (or proven metadata mirrors
                 // above).  Two active task/Run/folder sources that launch the same executable are
                 // operationally independent and must remain visible so disabling one cannot leave
                 // a hidden alias that still starts the app.
                 string key = !string.IsNullOrWhiteSpace(item.Id) ? item.Id.ToLowerInvariant() : (item.Source + "|" + item.Location + "|" + item.Name).ToLowerInvariant();
-                if (seen.Add(key)) result.Add(item);
+                StartupItem prior;
+                if (!seen.TryGetValue(key, out prior)) { seen[key] = item; result.Add(item); }
+                else if (!InventoryRowsEquivalent(prior, item)) result.Add(InventoryIdentityConflict(prior, item, ++conflicts));
             }
             // Legacy disabled-store records are informational only: drop them when a live
             // registration already covers the same source + location + name.
@@ -3801,9 +4000,78 @@ namespace MichStartupMaster
                 }
                 if (covered) continue;
                 string key = !string.IsNullOrWhiteSpace(item.Id) ? item.Id.ToLowerInvariant() : (item.Source + "|" + item.Location + "|" + item.Name).ToLowerInvariant();
-                if (seen.Add(key)) result.Add(item);
+                StartupItem prior;
+                if (!seen.TryGetValue(key, out prior)) { seen[key] = item; result.Add(item); }
+                else if (!InventoryRowsEquivalent(prior, item)) result.Add(InventoryIdentityConflict(prior, item, ++conflicts));
             }
             return result;
+        }
+
+        private static bool StartupCommandMirrorsNative(StartupItem projection, StartupItem native)
+        {
+            if (projection == null || native == null || projection.Source != "Startup Command") return false;
+            if (!string.Equals(projection.Name ?? "", native.Name ?? "", StringComparison.OrdinalIgnoreCase)) return false;
+            if (!string.Equals(projection.Scope ?? "", native.Scope ?? "", StringComparison.OrdinalIgnoreCase)) return false;
+            bool projectionFolder = (projection.Location ?? "").IndexOf("Startup", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (projectionFolder != (native.Source == "Startup Folder")) return false;
+            if (!projectionFolder)
+            {
+                bool projection32 = (projection.Location ?? "").IndexOf("Wow6432Node", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool native32 = string.Equals(native.RegistryView, "Registry32", StringComparison.OrdinalIgnoreCase) || (native.Location ?? "").IndexOf("Wow6432Node", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (projection32 != native32) return false;
+            }
+            // WMI often preserves a Run command byte-for-byte, including a PATH-resolved
+            // launcher such as wscript.exe.  Such a launcher is intentionally not converted
+            // to an invented absolute path, but exact command equality still proves that the
+            // WMI row is only a projection, not an independent startup registration.
+            if (string.Equals((projection.Command ?? "").Trim(), (native.Command ?? "").Trim(), StringComparison.Ordinal)) return true;
+            string projectionPath, projectionArgs, nativePath, nativeArgs;
+            if (!TryMirrorCommand(projection, out projectionPath, out projectionArgs) || !TryMirrorCommand(native, out nativePath, out nativeArgs)) return false;
+            return string.Equals(projectionPath, nativePath, StringComparison.OrdinalIgnoreCase) && string.Equals(projectionArgs, nativeArgs, StringComparison.Ordinal);
+        }
+
+        private static bool TryMirrorCommand(StartupItem item, out string target, out string arguments)
+        {
+            target = ""; arguments = "";
+            try
+            {
+                if (item.Source == "Startup Folder" && (item.Command ?? "").EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) ResolveShortcut(item.Command, out target, out arguments);
+                if (string.IsNullOrWhiteSpace(target) && !TryDecodeTrayPayload(item.Command ?? "", out target, out arguments)
+                    && !TrySplitCommand(item.Command ?? "", out target, out arguments)) return false;
+                target = NormalizeObservedPath(target);
+                return !string.IsNullOrWhiteSpace(target);
+            }
+            catch { return false; }
+        }
+
+        private static bool InventoryRowsEquivalent(StartupItem left, StartupItem right)
+        {
+            if (left == null || right == null) return false;
+            return string.Equals(left.Name ?? "", right.Name ?? "", StringComparison.Ordinal)
+                && string.Equals(left.Source ?? "", right.Source ?? "", StringComparison.Ordinal)
+                && string.Equals(left.Scope ?? "", right.Scope ?? "", StringComparison.Ordinal)
+                && string.Equals(left.Command ?? "", right.Command ?? "", StringComparison.Ordinal)
+                && string.Equals(left.Location ?? "", right.Location ?? "", StringComparison.Ordinal)
+                && left.Enabled == right.Enabled;
+        }
+
+        private static StartupItem InventoryIdentityConflict(StartupItem left, StartupItem right, int conflict)
+        {
+            string originalId = left == null ? (right == null ? "" : right.Id) : left.Id;
+            return new StartupItem
+            {
+                Id = "error|Inventory Identity Conflict|" + B64(originalId ?? "") + "|" + conflict,
+                Name = "Conflicting startup identity",
+                Source = "Inventory Identity Conflict",
+                Scope = (right == null ? null : right.Scope) ?? (left == null ? "System" : left.Scope),
+                Location = (right == null ? null : right.Location) ?? (left == null ? "" : left.Location),
+                Command = "Two provider rows used the same stable id but disagreed. First=" + (left == null ? "" : left.Command) + " | second=" + (right == null ? "" : right.Command),
+                Enabled = false,
+                CanDisable = false,
+                VerifiedState = "Unknown",
+                EvidenceReason = "Conflicting provider state was preserved as a visible error instead of silently choosing one row",
+                Status = "Duplicate stable id: " + (originalId ?? "")
+            };
         }
 
         // Normalize a launch command to its lower-cased, collapsed form for duplicate detection.
@@ -3870,7 +4138,7 @@ namespace MichStartupMaster
         {
             try
             {
-                List<Tuple<string, string>> installedProductNames = ReadInstalledProductNamePrefixes();
+                List<InstalledProductPrefix> installedProductNames = ReadInstalledProductNamePrefixes();
                 using (var searcher = new ManagementObjectSearcher("SELECT Name, Command, Location, User, UserSID FROM Win32_StartupCommand"))
                 {
                     foreach (ManagementObject mo in searcher.Get())
@@ -3882,7 +4150,7 @@ namespace MichStartupMaster
                         string sid = Convert.ToString(mo["UserSID"] ?? "");
                         string scope = WmiStartupCommandScope(user, sid, location);
                         string appName = InstalledProductNameForCommand(command, installedProductNames);
-                        items.Add(new StartupItem { Id = "wmi|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(location + "|" + name)), Name = name, AppName = appName, Source = "Startup Command", Scope = scope, Command = command, Location = location, Enabled = true, CanDisable = false, IsManaged = false, Status = "Reported by Windows Win32_StartupCommand fallback" + (string.IsNullOrWhiteSpace(user) ? "" : "; user=" + user) + (string.IsNullOrWhiteSpace(sid) ? "" : "; sid=" + sid) });
+                        items.Add(new StartupItem { Id = "wmi|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(location + "|" + name + "|" + sid + "|" + user + "|" + command)), Name = name, AppName = appName, Source = "Startup Command", Scope = scope, Command = command, Location = location, Enabled = true, CanDisable = false, IsManaged = false, Status = "Reported by Windows Win32_StartupCommand fallback" + (string.IsNullOrWhiteSpace(user) ? "" : "; user=" + user) + (string.IsNullOrWhiteSpace(sid) ? "" : "; sid=" + sid) });
                     }
                 }
             }
@@ -3911,12 +4179,20 @@ namespace MichStartupMaster
             return "Machine/User";
         }
 
-        private static List<Tuple<string, string>> ReadInstalledProductNamePrefixes()
+        private sealed class InstalledProductPrefix
         {
-            var result = new List<Tuple<string, string>>();
+            public string Root;
+            public string FamilyRoot;
+            public string DisplayName;
+            public string Registration;
+        }
+
+        private static List<InstalledProductPrefix> ReadInstalledProductNamePrefixes(List<StartupItem> diagnostics = null)
+        {
+            var result = new List<InstalledProductPrefix>();
             const string uninstallPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
-            foreach (RegistryView view in StartupRegistryViews())
             foreach (RegistryHive hive in new[] { RegistryHive.CurrentUser, RegistryHive.LocalMachine })
+            foreach (RegistryView view in hive == RegistryHive.CurrentUser ? UserStartupRegistryViews() : StartupRegistryViews())
             {
                 try
                 {
@@ -3940,44 +4216,81 @@ namespace MichStartupMaster
                                 if (string.IsNullOrWhiteSpace(prefix) || !Path.IsPathRooted(prefix)) continue;
                                 string full;
                                 try { full = Path.GetFullPath(prefix).TrimEnd('\\'); } catch { continue; }
-                                if (full.Length <= 3) continue;
-                                result.Add(Tuple.Create(full, displayName.Trim()));
+                                if (!IsSpecificInstalledProductRoot(full)) continue;
+                                result.Add(new InstalledProductPrefix
+                                {
+                                    Root = full,
+                                    DisplayName = displayName.Trim(),
+                                    Registration = root.Name + @"\" + uninstallPath + @"\" + childName + (hive == RegistryHive.CurrentUser ? "" : " [" + RegistryViewLabel(view) + "]")
+                                });
                             }
                         }
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    if (diagnostics != null) diagnostics.Add(ErrorItem("Installed Product Ownership", hive.ToString(), uninstallPath + " [" + RegistryViewLabel(view) + "]", ex));
+                }
             }
-            return result.Distinct(new InstalledProductPrefixComparer()).OrderByDescending(value => value.Item1.Length).ToList();
+            result = result.GroupBy(value => (value.Root ?? "") + "\n" + (value.Registration ?? ""), StringComparer.OrdinalIgnoreCase).Select(group => group.First()).ToList();
+            foreach (var registration in result.GroupBy(value => value.Registration ?? "", StringComparer.OrdinalIgnoreCase))
+            {
+                // A single uninstall registration can advertise both InstallLocation and a
+                // deeper DisplayIcon folder. They are aliases of one product identity. Use the
+                // shortest specific registered path for process-family observations while every
+                // matching alias still maps to the exact same product registration.
+                string familyRoot = registration.Select(value => value.Root).Where(IsSpecificInstalledProductRoot).OrderBy(value => value.Length).FirstOrDefault() ?? "";
+                foreach (InstalledProductPrefix value in registration) value.FamilyRoot = familyRoot;
+            }
+            return result.OrderByDescending(value => value.Root.Length).ThenBy(value => value.Registration, StringComparer.OrdinalIgnoreCase).ToList();
         }
 
-        private sealed class InstalledProductPrefixComparer : IEqualityComparer<Tuple<string, string>>
+        private static bool IsSpecificInstalledProductRoot(string value)
         {
-            public bool Equals(Tuple<string, string> left, Tuple<string, string> right)
+            string full = NormalizeApplicationRoot(value);
+            if (string.IsNullOrWhiteSpace(full)) return false;
+            var broadRoots = new[]
             {
-                if (ReferenceEquals(left, right)) return true;
-                if (left == null || right == null) return false;
-                return string.Equals(left.Item1, right.Item1, StringComparison.OrdinalIgnoreCase) && string.Equals(left.Item2, right.Item2, StringComparison.OrdinalIgnoreCase);
-            }
-            public int GetHashCode(Tuple<string, string> value)
-            {
-                if (value == null) return 0;
-                return StringComparer.OrdinalIgnoreCase.GetHashCode((value.Item1 ?? "") + "\n" + (value.Item2 ?? ""));
-            }
+                Path.GetPathRoot(full),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows)
+            }.Select(NormalizeApplicationRoot).Where(root => !string.IsNullOrWhiteSpace(root));
+            return !broadRoots.Contains(full, StringComparer.OrdinalIgnoreCase);
         }
 
-        private static string InstalledProductNameForCommand(string command, IEnumerable<Tuple<string, string>> prefixes)
+        private static string InstalledProductNameForCommand(string command, IEnumerable<InstalledProductPrefix> prefixes)
+        {
+            InstalledProductPrefix owner = InstalledProductForCommand(command, prefixes);
+            return owner == null ? "" : owner.DisplayName ?? "";
+        }
+
+        private static InstalledProductPrefix InstalledProductForCommand(string command, IEnumerable<InstalledProductPrefix> prefixes)
         {
             string target, arguments;
-            if (!TrySplitCommand(command ?? "", out target, out arguments) || string.IsNullOrWhiteSpace(target)) return "";
+            if (!TrySplitCommand(command ?? "", out target, out arguments) || string.IsNullOrWhiteSpace(target)) return null;
+            return InstalledProductForTarget(target, prefixes);
+        }
+
+        private static InstalledProductPrefix InstalledProductForTarget(string target, IEnumerable<InstalledProductPrefix> prefixes)
+        {
+            if (string.IsNullOrWhiteSpace(target)) return null;
             try { target = Path.GetFullPath(Environment.ExpandEnvironmentVariables(target.Trim().Trim('"'))); }
-            catch { return ""; }
-            foreach (Tuple<string, string> candidate in prefixes ?? Enumerable.Empty<Tuple<string, string>>())
+            catch { return null; }
+            var matches = (prefixes ?? Enumerable.Empty<InstalledProductPrefix>()).Where(candidate =>
             {
-                string prefix = (candidate.Item1 ?? "").TrimEnd('\\');
-                if (target.Equals(prefix, StringComparison.OrdinalIgnoreCase) || target.StartsWith(prefix + @"\", StringComparison.OrdinalIgnoreCase)) return candidate.Item2 ?? "";
-            }
-            return "";
+                string prefix = (candidate.Root ?? "").TrimEnd('\\');
+                return target.Equals(prefix, StringComparison.OrdinalIgnoreCase) || target.StartsWith(prefix + @"\", StringComparison.OrdinalIgnoreCase);
+            }).ToList();
+            if (matches.Count == 0) return null;
+            int longest = matches.Max(candidate => (candidate.Root ?? "").Length);
+            var winners = matches.Where(candidate => (candidate.Root ?? "").Length == longest).GroupBy(candidate => candidate.Registration ?? "", StringComparer.OrdinalIgnoreCase).Select(group => group.First()).ToList();
+            // A target claimed equally by different uninstall registrations has no safe bulk
+            // application owner. Fall back to its exact executable identity instead of merging.
+            return winners.Count == 1 ? winners[0] : null;
         }
 
         private static void AddCommonRegistryStartup(List<StartupItem> items)
@@ -3991,20 +4304,21 @@ namespace MichStartupMaster
                 @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
             };
             foreach (RegistryView view in StartupRegistryViews())
-            using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
             using (var machineRoot = OpenRegistryRoot(RegistryHive.LocalMachine, view))
             {
                 string viewLabel = RegistryViewLabel(view);
-                foreach (string subKey in runKeys)
-                {
-                    AddRegistryValues(items, userRoot, subKey, "User", SourceForRegistryPath(subKey), true, "Runs from " + subKey, null, viewLabel);
-                    AddRegistryValues(items, machineRoot, subKey, "Machine", SourceForRegistryPath(subKey), true, "Runs from " + subKey, null, viewLabel);
-                }
+                foreach (string subKey in runKeys) AddRegistryValues(items, machineRoot, subKey, "Machine", SourceForRegistryPath(subKey), true, "Runs from " + subKey, null, viewLabel);
                 AddWinlogonValues(items, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Machine", new[] { "Shell", "Userinit", "Taskman", "AppSetup", "System" }, viewLabel);
-                AddWinlogonValues(items, userRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "User", new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
-                AddRegistryValues(items, userRoot, @"Environment", "User", "User Logon Script", true, "UserInitMprLogonScript runs during interactive logon", new[] { "UserInitMprLogonScript" }, viewLabel);
                 AddAppInit(items, machineRoot, viewLabel);
                 AddActiveSetup(items, machineRoot, "Machine", null, viewLabel);
+            }
+            foreach (RegistryView view in UserStartupRegistryViews())
+            using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
+            {
+                string viewLabel = RegistryViewLabel(view);
+                foreach (string subKey in runKeys) AddRegistryValues(items, userRoot, subKey, "User", SourceForRegistryPath(subKey), true, "Runs from " + subKey, null, viewLabel);
+                AddWinlogonValues(items, userRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "User", new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
+                AddRegistryValues(items, userRoot, @"Environment", "User", "User Logon Script", true, "UserInitMprLogonScript runs during interactive logon", new[] { "UserInitMprLogonScript" }, viewLabel);
                 AddActiveSetup(items, userRoot, "User", null, viewLabel);
             }
         }
@@ -4012,26 +4326,26 @@ namespace MichStartupMaster
         private static void AddRegistryStartupExtensions(List<StartupItem> items)
         {
             foreach (RegistryView view in StartupRegistryViews())
-            using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
             using (var machineRoot = OpenRegistryRoot(RegistryHive.LocalMachine, view))
-            {
-                string viewLabel = RegistryViewLabel(view);
-                foreach (var pair in new[] { Tuple.Create(userRoot, "User"), Tuple.Create(machineRoot, "Machine") })
-                {
-                    RegistryKey root = pair.Item1;
-                    string scope = pair.Item2;
-                    AddRegistryValues(items, root, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", scope, "Legacy Windows Run", true, "Legacy Windows Load/Run logon value", new[] { "Load", "Run" }, viewLabel);
-                    AddRunOnceEx(items, root, scope, null, viewLabel);
-                    foreach (string path in new[]
-                    {
-                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
-                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
-                    }) AddRegistryValues(items, root, path, scope, "Explorer Startup Extension", true, "Explorer loads this COM extension during desktop startup", null, viewLabel);
-                    AddExplorerShellExtensions(items, root, scope, null, viewLabel, false);
-                    AddInternetExplorerAddons(items, root, scope, null, viewLabel, false);
-                }
-            }
+                AddRegistryStartupExtensionsForRoot(items, machineRoot, "Machine", view);
+            foreach (RegistryView view in UserStartupRegistryViews())
+            using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
+                AddRegistryStartupExtensionsForRoot(items, userRoot, "User", view);
             AddRegistryValues(items, Registry.LocalMachine, @"SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls", "Machine", "AppCert DLLs", true, "DLL injected when applications create a process");
+        }
+
+        private static void AddRegistryStartupExtensionsForRoot(List<StartupItem> items, RegistryKey root, string scope, RegistryView view)
+        {
+            string viewLabel = RegistryViewLabel(view);
+            AddRegistryValues(items, root, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", scope, "Legacy Windows Run", true, "Legacy Windows Load/Run logon value", new[] { "Load", "Run" }, viewLabel);
+            AddRunOnceEx(items, root, scope, null, viewLabel);
+            foreach (string path in new[]
+            {
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
+            }) AddRegistryValues(items, root, path, scope, "Explorer Startup Extension", true, "Explorer loads this COM extension during desktop startup", null, viewLabel);
+            AddExplorerShellExtensions(items, root, scope, null, viewLabel, false);
+            AddInternetExplorerAddons(items, root, scope, null, viewLabel, false);
         }
 
         private static void AddLoadedUserRegistryStartup(List<StartupItem> items)
@@ -4046,7 +4360,7 @@ namespace MichStartupMaster
                     @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce",
                     @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
                 };
-                foreach (RegistryView view in StartupRegistryViews())
+                foreach (RegistryView view in UserStartupRegistryViews())
                 using (var usersRoot = OpenRegistryRoot(RegistryHive.Users, view))
                 {
                     string viewLabel = RegistryViewLabel(view);
@@ -5109,7 +5423,63 @@ namespace MichStartupMaster
         {
             foreach (StartupApproval approval in approvals ?? new List<StartupApproval>())
             {
-                StartupItem match = items.FirstOrDefault(item => StartupApprovalMatches(item, approval));
+                bool decodedDisabled;
+                string decodeReason;
+                if (!TryDecodeStartupApproval(approval.Data, out decodedDisabled, out decodeReason))
+                {
+                    items.Add(new StartupItem
+                    {
+                        Id = "error|Startup Approval|" + B64((approval.Root ?? "") + "|" + (approval.Path ?? "") + "|" + (approval.Name ?? "")),
+                        Name = "Unreadable startup approval: " + approval.Name,
+                        AppName = approval.Name,
+                        Source = "Startup Approval",
+                        Scope = approval.Scope,
+                        Command = "Raw bytes: " + (approval.Data == null ? "(null)" : BitConverter.ToString(approval.Data)),
+                        Location = approval.Root + @"\" + approval.Path + " :: " + approval.Name,
+                        Enabled = false,
+                        CanDisable = false,
+                        VerifiedState = "Unknown",
+                        EvidenceReason = decodeReason,
+                        MutationCapability = "ReadOnly",
+                        MutationReason = decodeReason,
+                        Status = "Malformed or unsupported Explorer StartupApproved metadata"
+                    });
+                    continue;
+                }
+                List<StartupItem> matches = items.Where(item => StartupApprovalMatches(item, approval)).ToList();
+                // Win32_StartupCommand is a compatibility projection of Run/Startup-folder
+                // registrations.  When both providers expose the same route, overlay the
+                // approval on the native registration and let Dedupe remove the projection.
+                // Treating that corroborating projection as a second authority produced a
+                // false ambiguity for real apps such as Logitech G HUB.
+                var nativeMatches = matches.Where(candidate => candidate.Source == "Registry Run" || candidate.Source == "Startup Folder").ToList();
+                if (nativeMatches.Count > 0)
+                {
+                    matches = matches.Where(candidate => candidate.Source != "Startup Command"
+                        || !nativeMatches.Any(native => StartupCommandMirrorsNative(candidate, native))).ToList();
+                }
+                if (matches.Count > 1)
+                {
+                    items.Add(new StartupItem
+                    {
+                        Id = "error|Startup Approval Ambiguity|" + B64((approval.Root ?? "") + "|" + (approval.Path ?? "") + "|" + (approval.Name ?? "")),
+                        Name = "Ambiguous startup approval: " + approval.Name,
+                        AppName = approval.Name,
+                        Source = "Startup Approval",
+                        Scope = approval.Scope,
+                        Command = matches.Count + " candidate registrations: " + string.Join(" | ", matches.Select(candidate => candidate.Id)),
+                        Location = approval.Root + @"\" + approval.Path + " :: " + approval.Name,
+                        Enabled = false,
+                        CanDisable = false,
+                        VerifiedState = "Unknown",
+                        EvidenceReason = "One metadata value matched multiple startup registrations; no arbitrary overlay was applied",
+                        MutationCapability = "ReadOnly",
+                        MutationReason = "Refresh or repair the ambiguous registrations before changing this metadata",
+                        Status = "Ambiguous Explorer StartupApproved metadata"
+                    });
+                    continue;
+                }
+                StartupItem match = matches.SingleOrDefault();
                 if (match != null)
                 {
                     match.ApprovalRoot = approval.Root;
@@ -5117,7 +5487,7 @@ namespace MichStartupMaster
                     match.ApprovalName = approval.Name;
                     match.ApprovalData = approval.Data == null ? null : (byte[])approval.Data.Clone();
                     match.ApprovalRegistryView = string.IsNullOrWhiteSpace(approval.RegistryView) ? StartupApprovalRegistryViewLabel() : approval.RegistryView;
-                    bool disabled = IsStartupApprovalDisabled(approval.Data);
+                    bool disabled = decodedDisabled;
                     match.Enabled = !disabled;
                     string accessReason;
                     bool writable;
@@ -5137,7 +5507,7 @@ namespace MichStartupMaster
                 // registry walk nor Win32_StartupCommand exposes its launcher. Never hide that
                 // state from Apps: keep the exact approval value as a controllable route while
                 // being explicit that its launch target is unavailable.
-                bool orphanDisabled = IsStartupApprovalDisabled(approval.Data);
+                bool orphanDisabled = decodedDisabled;
                 if (!orphanDisabled)
                 {
                     string accessReason;
@@ -5231,12 +5601,25 @@ namespace MichStartupMaster
 
         private static bool IsStartupApprovalDisabled(byte[] data)
         {
-            if (data == null || data.Length == 0) return false;
-            // Explorer's state byte is a bit field.  The low bit is the disabled bit for
-            // every currently observed state (00..07), including 01.  Comparing only the
-            // historically common 03/05/07 values made a real 01 entry appear enabled even
-            // though ApplyStartupApprovalState writes that same low-bit representation.
-            return (data[0] & 0x01) != 0;
+            bool disabled;
+            string reason;
+            if (!TryDecodeStartupApproval(data, out disabled, out reason)) throw new InvalidOperationException(reason);
+            return disabled;
+        }
+
+        private static bool TryDecodeStartupApproval(byte[] data, out bool disabled, out string reason)
+        {
+            disabled = false;
+            if (data == null) { reason = "StartupApproved value is null"; return false; }
+            // Current Explorer writes a 4-byte state plus an 8-byte FILETIME. Accept only that
+            // exact shape and the observed 0..7 flag range. Unknown layouts stay visible and
+            // read-only; silently treating their first byte as authority can invert startup.
+            if (data.Length != 12) { reason = "Unsupported StartupApproved byte length " + data.Length + "; expected 12"; return false; }
+            if (data[1] != 0 || data[2] != 0 || data[3] != 0 || (data[0] & 0xF8) != 0)
+            { reason = "Unsupported StartupApproved state field 0x" + BitConverter.ToString(data, 0, 4).Replace("-", ""); return false; }
+            disabled = (data[0] & 0x01) != 0;
+            reason = "Supported 12-byte Explorer StartupApproved state";
+            return true;
         }
 
         private static void SetStartupApproval(StartupItem item, bool enabled)
@@ -5269,7 +5652,9 @@ namespace MichStartupMaster
 
         private static byte[] ApplyStartupApprovalState(byte[] original, bool enabled)
         {
-            if (original == null || original.Length == 0) throw new ArgumentException("Startup approval state is empty", "original");
+            bool ignored;
+            string reason;
+            if (!TryDecodeStartupApproval(original, out ignored, out reason)) throw new ArgumentException(reason, "original");
             byte[] data = (byte[])original.Clone();
             // Explorer encodes disabled in the low bit (03/05/07) and enabled in the
             // corresponding even state. Preserve every other flag and every timestamp/unknown
@@ -5394,7 +5779,12 @@ namespace MichStartupMaster
         {
             if (routes == null) throw new ArgumentNullException("routes");
             List<StartupItem> candidates = routes.Where(item => item != null && item.Enabled != enabledState)
-                .GroupBy(item => item.Id ?? "", StringComparer.OrdinalIgnoreCase)
+                // Provider bugs must never turn one physical registration into two writes.
+                // HKCU/HKU non-Classes keys are shared by the Windows registry redirector, so
+                // Registry32 and Registry64 identities can name the exact same value. Collapse
+                // only those shared physical identities; component routes such as Winlogon and
+                // BootExecute intentionally remain independent mutations.
+                .GroupBy(BulkMutationIdentity, StringComparer.OrdinalIgnoreCase)
                 .Select(group => group.First())
                 .OrderBy(BulkMutationSourceKey, StringComparer.OrdinalIgnoreCase)
                 .ThenByDescending(BulkMutationComponentIndex)
@@ -5439,6 +5829,64 @@ namespace MichStartupMaster
             });
         }
 
+        private static string BulkMutationIdentity(StartupItem item)
+        {
+            string shared = SharedUserRegistryPhysicalIdentity(item);
+            return string.IsNullOrWhiteSpace(shared) ? (item == null ? "" : (item.Id ?? "")) : shared;
+        }
+
+        internal static string SharedUserRegistryPhysicalIdentity(StartupItem item)
+        {
+            if (item == null) return "";
+            string id = item.Id ?? "";
+            string rootName = "", subKey = "", valueName = "";
+            string[] parts = id.Split('|');
+            if (parts.Length >= 5 && string.Equals(parts[0], "reg", StringComparison.OrdinalIgnoreCase))
+            {
+                rootName = UnB64(parts[2]);
+                subKey = UnB64(parts[3]);
+                valueName = UnB64(parts[4]);
+            }
+            else if (parts.Length >= 4 && string.Equals(parts[0], "active", StringComparison.OrdinalIgnoreCase))
+            {
+                rootName = UnB64(parts[2]);
+                subKey = UnB64(parts[3]);
+                valueName = "StubPath";
+            }
+            else if (id.StartsWith("disabled|reg|", StringComparison.OrdinalIgnoreCase))
+            {
+                string[] meta = (item.Status ?? "").Split('\t');
+                if (meta.Length >= 3 && meta[0].StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase))
+                {
+                    rootName = meta[0];
+                    subKey = meta[1];
+                    valueName = meta[2];
+                }
+            }
+            else if (id.StartsWith("disabled|active|", StringComparison.OrdinalIgnoreCase))
+            {
+                string[] meta = (item.Status ?? "").Split('\t');
+                if (meta.Length >= 2 && meta[0].StartsWith("HKEY_", StringComparison.OrdinalIgnoreCase))
+                {
+                    rootName = meta[0];
+                    subKey = meta[1];
+                    valueName = "StubPath";
+                }
+            }
+
+            bool userRoot = string.Equals(rootName, Registry.CurrentUser.Name, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(rootName, "HKCU", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(rootName, Registry.Users.Name, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(rootName, "HKU", StringComparison.OrdinalIgnoreCase);
+            if (!userRoot || string.IsNullOrWhiteSpace(subKey) || string.IsNullOrWhiteSpace(valueName)) return "";
+
+            // Per-user Classes paths are a redirected exception. Everything else collected by
+            // this app below HKCU/HKU is shared and therefore has one physical mutation target.
+            if (Regex.IsMatch(subKey, @"(?:^|\\)Software\\Classes(?:\\|$)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+                || Regex.IsMatch(subKey, @"^[^\\]+_Classes(?:\\|$)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)) return "";
+            return "shared-user-registry|" + rootName.Trim().ToUpperInvariant() + "|" + subKey.Trim().TrimEnd('\\').ToUpperInvariant() + "|" + valueName.Trim().ToUpperInvariant();
+        }
+
         private static string BulkMutationSourceKey(StartupItem item)
         {
             if (item == null) return "";
@@ -5463,6 +5911,7 @@ namespace MichStartupMaster
             string token = Guid.NewGuid().ToString("N");
             string subKey = @"Software\MichStartupMaster\SelfTests\BulkDisable\" + token;
             string valueName = "FirstRoute";
+            string secondValueName = "SecondRoute";
             string approvalName = "ApprovalRoute";
             string command = Q(ProcessExePath()) + " --smoke";
             string taskLocation = Program.ManagedTaskRoot + "BulkDisableMissing_" + token;
@@ -5478,6 +5927,9 @@ namespace MichStartupMaster
             bool storesRestored = false;
             bool enableFailedClosed = false;
             bool enableApprovalRestored = false;
+            bool successfulBulkDisable = false;
+            bool successfulBulkRestore = false;
+            bool sharedPhysicalCollapsed = !Environment.Is64BitOperatingSystem;
             byte[] approvalBefore = { 2, 0, 0, 0, 11, 22, 33, 44 };
             byte[] approvalDisabled = { 3, 0, 0, 0, 55, 66, 77, 88 };
             try
@@ -5486,6 +5938,7 @@ namespace MichStartupMaster
                 using (RegistryKey key = root.CreateSubKey(subKey))
                 {
                     key.SetValue(valueName, command, RegistryValueKind.String);
+                    key.SetValue(secondValueName, command + " --second", RegistryValueKind.String);
                     key.SetValue(approvalName, approvalBefore, RegistryValueKind.Binary);
                 }
 
@@ -5509,6 +5962,13 @@ namespace MichStartupMaster
                     ApprovalRoot = Registry.CurrentUser.Name, ApprovalPath = subKey, ApprovalName = approvalName,
                     ApprovalData = (byte[])approvalBefore.Clone(), ApprovalRegistryView = viewLabel
                 };
+                var secondRegistryRoute = new StartupItem
+                {
+                    Id = "reg|User|" + B64(Registry.CurrentUser.Name) + "|" + B64(subKey) + "|" + B64(secondValueName) + "|" + viewLabel,
+                    Name = "Bulk success registry fixture 2", Source = "Registry Run", Scope = "User", Command = command + " --second",
+                    Location = Registry.CurrentUser.Name + "\\" + subKey + " [" + viewLabel + "]", RegistryView = viewLabel,
+                    Enabled = true, CanDisable = true, MutationCapability = "TransactionalRegistryValue"
+                };
                 try { DisableAllRoutes(new[] { registryRoute, approvalRoute, missingTaskRoute }, false); }
                 catch (InvalidOperationException ex) { failedClosed = ex.Message.IndexOf("every earlier startup route and intent store was restored", StringComparison.OrdinalIgnoreCase) >= 0; }
 
@@ -5519,10 +5979,64 @@ namespace MichStartupMaster
                     byte[] approvalAfter = key == null ? null : key.GetValue(approvalName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as byte[];
                     approvalRestored = approvalAfter != null && approvalAfter.SequenceEqual(approvalBefore);
                 }
+                RestoreInitiallyAbsentEmptySelfTestStores(disabledBefore, enabledBefore, protectedDisabledBefore, protectedQuietBefore);
                 storesRestored = disabledBefore == StoreFingerprint(Program.DisabledStore)
                     && enabledBefore == StoreFingerprint(Program.EnabledStore)
                     && protectedDisabledBefore == StoreFingerprint(Program.ProtectedDisabledStore)
                     && protectedQuietBefore == StoreFingerprint(Program.ProtectedQuietStore);
+
+                // Regression for the real UI failure: Location deliberately contains the
+                // display-only [Registry64/32] suffix. Both distinct values must disable in one
+                // transaction using their encoded identities, then restore exactly without an
+                // exception, duplicate physical route, or leaked intent record.
+                successfulBulkDisable = DisableAllRoutes(new[] { registryRoute, secondRegistryRoute }, false) == 2;
+                using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                using (RegistryKey key = root.OpenSubKey(subKey, false))
+                    successfulBulkDisable = successfulBulkDisable && key != null && key.GetValue(valueName, null) == null && key.GetValue(secondValueName, null) == null;
+                List<StartupItem> successfulDisabledRows = DisabledStoreService.LoadDisabledItems()
+                    .Where(row => row != null && row.Id.StartsWith("disabled|reg|", StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(row.Location, registryRoute.Location, StringComparison.OrdinalIgnoreCase)
+                        && (string.Equals(row.Name, registryRoute.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(row.Name, secondRegistryRoute.Name, StringComparison.OrdinalIgnoreCase)))
+                    .ToList();
+                if (successfulDisabledRows.Count == 2)
+                    foreach (StartupItem disabledRow in successfulDisabledRows) RestoreRegistry(disabledRow);
+                using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                using (RegistryKey key = root.OpenSubKey(subKey, false))
+                    successfulBulkRestore = key != null
+                        && string.Equals(Convert.ToString(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames)), command, StringComparison.Ordinal)
+                        && string.Equals(Convert.ToString(key.GetValue(secondValueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames)), command + " --second", StringComparison.Ordinal);
+
+                // Defense in depth for the exact screenshot regression: even if a future scan
+                // accidentally projects one shared HKCU value through both logical views, bulk
+                // control must perform one physical write and create one reversible record.
+                if (Environment.Is64BitOperatingSystem)
+                {
+                    string otherViewLabel = string.Equals(viewLabel, "Registry64", StringComparison.OrdinalIgnoreCase) ? "Registry32" : "Registry64";
+                    var duplicateViewRoute = new StartupItem
+                    {
+                        Id = "reg|User|" + B64(Registry.CurrentUser.Name) + "|" + B64(subKey) + "|" + B64(valueName) + "|" + otherViewLabel,
+                        Name = registryRoute.Name, Source = registryRoute.Source, Scope = registryRoute.Scope, Command = registryRoute.Command,
+                        Location = Registry.CurrentUser.Name + "\\" + subKey + " [" + otherViewLabel + "]", RegistryView = otherViewLabel,
+                        Enabled = true, CanDisable = true, MutationCapability = "TransactionalRegistryValue"
+                    };
+                    sharedPhysicalCollapsed = DisableAllRoutes(new[] { registryRoute, duplicateViewRoute }, false) == 1;
+                    using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                    using (RegistryKey key = root.OpenSubKey(subKey, false))
+                        sharedPhysicalCollapsed = sharedPhysicalCollapsed && key != null && key.GetValue(valueName, null) == null;
+                    List<StartupItem> collapsedRows = DisabledStoreService.LoadDisabledItems()
+                        .Where(row => row != null && row.Id.StartsWith("disabled|reg|", StringComparison.OrdinalIgnoreCase)
+                            && (row.Status ?? "").Split('\t').Length >= 3
+                            && string.Equals((row.Status ?? "").Split('\t')[1], subKey, StringComparison.OrdinalIgnoreCase)
+                            && string.Equals((row.Status ?? "").Split('\t')[2], valueName, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    sharedPhysicalCollapsed = sharedPhysicalCollapsed && collapsedRows.Count == 1;
+                    if (collapsedRows.Count == 1) RestoreRegistry(collapsedRows[0]);
+                    using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                    using (RegistryKey key = root.OpenSubKey(subKey, false))
+                        sharedPhysicalCollapsed = sharedPhysicalCollapsed && key != null
+                            && string.Equals(Convert.ToString(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames)), command, StringComparison.Ordinal);
+                }
+
                 using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
                 using (RegistryKey key = root.OpenSubKey(subKey, true)) key.SetValue(approvalName, approvalDisabled, RegistryValueKind.Binary);
                 approvalRoute.Enabled = false; approvalRoute.ApprovalData = (byte[])approvalDisabled.Clone(); missingTaskRoute.Enabled = false;
@@ -5534,12 +6048,13 @@ namespace MichStartupMaster
                     byte[] after = key == null ? null : key.GetValue(approvalName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as byte[];
                     enableApprovalRestored = after != null && after.SequenceEqual(approvalDisabled);
                 }
+                RestoreInitiallyAbsentEmptySelfTestStores(disabledBefore, enabledBefore, protectedDisabledBefore, protectedQuietBefore);
                 storesRestored = storesRestored && disabledBefore == StoreFingerprint(Program.DisabledStore)
                     && enabledBefore == StoreFingerprint(Program.EnabledStore)
                     && protectedDisabledBefore == StoreFingerprint(Program.ProtectedDisabledStore)
                     && protectedQuietBefore == StoreFingerprint(Program.ProtectedQuietStore);
-                if (!failedClosed || !registryRestored || !approvalRestored || !enableFailedClosed || !enableApprovalRestored || !storesRestored) throw new InvalidOperationException("BULK_DISABLE_SELF_TEST failed failedClosed=" + failedClosed.ToString().ToLowerInvariant() + " registryRestored=" + registryRestored.ToString().ToLowerInvariant() + " approvalRestored=" + approvalRestored.ToString().ToLowerInvariant() + " enableFailedClosed=" + enableFailedClosed.ToString().ToLowerInvariant() + " enableApprovalRestored=" + enableApprovalRestored.ToString().ToLowerInvariant() + " storesRestored=" + storesRestored.ToString().ToLowerInvariant());
-                return "BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true";
+                if (!failedClosed || !registryRestored || !approvalRestored || !successfulBulkDisable || !successfulBulkRestore || !sharedPhysicalCollapsed || !enableFailedClosed || !enableApprovalRestored || !storesRestored) throw new InvalidOperationException("BULK_DISABLE_SELF_TEST failed failedClosed=" + failedClosed.ToString().ToLowerInvariant() + " registryRestored=" + registryRestored.ToString().ToLowerInvariant() + " approvalRestored=" + approvalRestored.ToString().ToLowerInvariant() + " successfulBulkDisable=" + successfulBulkDisable.ToString().ToLowerInvariant() + " successfulBulkRestore=" + successfulBulkRestore.ToString().ToLowerInvariant() + " sharedPhysicalCollapsed=" + sharedPhysicalCollapsed.ToString().ToLowerInvariant() + " enableFailedClosed=" + enableFailedClosed.ToString().ToLowerInvariant() + " enableApprovalRestored=" + enableApprovalRestored.ToString().ToLowerInvariant() + " storesRestored=" + storesRestored.ToString().ToLowerInvariant());
+                return "BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true successfulBulkDisable=true successfulBulkRestore=true sharedPhysicalCollapsed=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true";
             }
             finally
             {
@@ -5555,6 +6070,14 @@ namespace MichStartupMaster
         {
             if (!File.Exists(path)) return "missing";
             using (var sha = SHA256.Create()) return "present:" + BitConverter.ToString(sha.ComputeHash(File.ReadAllBytes(path))).Replace("-", "");
+        }
+
+        private static void RestoreInitiallyAbsentEmptySelfTestStores(string disabledBefore, string enabledBefore, string protectedDisabledBefore, string protectedQuietBefore)
+        {
+            if (string.Equals(disabledBefore, "missing", StringComparison.Ordinal)) StateStoreFile.DeleteIfEmpty(Program.DisabledStore);
+            if (string.Equals(enabledBefore, "missing", StringComparison.Ordinal)) StateStoreFile.DeleteIfEmpty(Program.EnabledStore);
+            if (string.Equals(protectedDisabledBefore, "missing", StringComparison.Ordinal)) StateStoreFile.DeleteIfEmpty(Program.ProtectedDisabledStore);
+            if (string.Equals(protectedQuietBefore, "missing", StringComparison.Ordinal)) StateStoreFile.DeleteIfEmpty(Program.ProtectedQuietStore);
         }
 
         private static void DisableCore(StartupItem item)
@@ -8129,12 +8652,33 @@ namespace MichStartupMaster
             for (int i = 0; i < items.Count; i++)
             {
                 if (i > 0) sb.Append(','); var x = items[i];
-                sb.Append("{\"enabledEvidence\":\"configuration-only; consult startupState\",\"popupEvidence\":\"configuration-only; consult presentationState\",\"startupState\":\"").Append(Esc(x.StateText())).Append("\",\"startupReason\":\"").Append(Esc(x.EvidenceReason)).Append("\",\"presentationState\":\"").Append(Esc(x.PresentationState)).Append("\",\"presentationReason\":\"").Append(Esc(x.PresentationReason)).Append("\",\"id\":\"").Append(Esc(x.Id)).Append("\",\"name\":\"").Append(Esc(x.Name)).Append("\",\"appName\":\"").Append(Esc(x.HumanName())).Append("\",\"source\":\"").Append(Esc(x.Source)).Append("\",\"scope\":\"").Append(Esc(x.Scope)).Append("\",\"registryView\":\"").Append(Esc(x.RegistryView)).Append("\",\"location\":\"").Append(Esc(x.Location)).Append("\",\"enabled\":").Append(x.Enabled ? "true" : "false").Append(",\"canDisable\":").Append(x.CanDisable ? "true" : "false").Append(",\"mutationCapability\":\"").Append(Esc(x.MutationCapability)).Append("\",\"mutationReason\":\"").Append(Esc(x.MutationReason)).Append("\",\"requiresExpertConfirmation\":").Append(x.RequiresExpertConfirmation ? "true" : "false").Append(",\"requiresElevation\":").Append(x.RequiresElevation ? "true" : "false").Append(",\"requiresReboot\":").Append(x.RequiresReboot ? "true" : "false").Append(",\"externalAuthority\":\"").Append(Esc(x.ExternalAuthority)).Append("\",\"command\":\"").Append(Esc(x.Command)).Append("\",\"status\":\"").Append(Esc(x.Status)).Append("\",\"popup\":\"").Append(x.PopupLabel()).Append("\",\"risk\":\"").Append(Esc(x.RiskLevel())).Append("\",\"riskLabel\":\"").Append(Esc(x.RiskLabel())).Append("\",\"riskReason\":\"").Append(Esc(x.RiskReason())).Append("\",\"advice\":\"").Append(Esc(x.AdviceLevel())).Append("\",\"adviceLabel\":\"").Append(Esc(x.AdviceLabel())).Append("\",\"adviceReason\":\"").Append(Esc(x.AdviceReason())).Append("\"}");
+                sb.Append("{\"enabledEvidence\":\"configuration-only; consult startupState\",\"popupEvidence\":\"configuration-only; consult presentationState\",\"startupState\":\"").Append(Esc(x.StateText())).Append("\",\"startupReason\":\"").Append(Esc(x.EvidenceReason)).Append("\",\"presentationState\":\"").Append(Esc(x.PresentationState)).Append("\",\"presentationReason\":\"").Append(Esc(x.PresentationReason)).Append("\",\"id\":\"").Append(Esc(x.Id)).Append("\",\"name\":\"").Append(Esc(x.Name)).Append("\",\"appName\":\"").Append(Esc(x.HumanName())).Append("\",\"applicationIdentity\":\"").Append(Esc(x.ApplicationIdentity)).Append("\",\"applicationRoot\":\"").Append(Esc(x.ApplicationRoot)).Append("\",\"applicationIdentityReason\":\"").Append(Esc(x.ApplicationIdentityReason)).Append("\",\"runtimeEvidence\":\"").Append(Esc(x.RuntimeEvidence)).Append("\",\"source\":\"").Append(Esc(x.Source)).Append("\",\"scope\":\"").Append(Esc(x.Scope)).Append("\",\"registryView\":\"").Append(Esc(x.RegistryView)).Append("\",\"location\":\"").Append(Esc(x.Location)).Append("\",\"enabled\":").Append(x.Enabled ? "true" : "false").Append(",\"canDisable\":").Append(x.CanDisable ? "true" : "false").Append(",\"mutationCapability\":\"").Append(Esc(x.MutationCapability)).Append("\",\"mutationReason\":\"").Append(Esc(x.MutationReason)).Append("\",\"requiresExpertConfirmation\":").Append(x.RequiresExpertConfirmation ? "true" : "false").Append(",\"requiresElevation\":").Append(x.RequiresElevation ? "true" : "false").Append(",\"requiresReboot\":").Append(x.RequiresReboot ? "true" : "false").Append(",\"externalAuthority\":\"").Append(Esc(x.ExternalAuthority)).Append("\",\"command\":\"").Append(Esc(x.Command)).Append("\",\"status\":\"").Append(Esc(x.Status)).Append("\",\"popup\":\"").Append(x.PopupLabel()).Append("\",\"risk\":\"").Append(Esc(x.RiskLevel())).Append("\",\"riskLabel\":\"").Append(Esc(x.RiskLabel())).Append("\",\"riskReason\":\"").Append(Esc(x.RiskReason())).Append("\",\"advice\":\"").Append(Esc(x.AdviceLevel())).Append("\",\"adviceLabel\":\"").Append(Esc(x.AdviceLabel())).Append("\",\"adviceReason\":\"").Append(Esc(x.AdviceReason())).Append("\"}");
             }
             sb.Append("]"); return sb.ToString();
         }
 
-        private static string Esc(string s) { return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " "); }
+        private static string Esc(string value)
+        {
+            var escaped = new StringBuilder();
+            foreach (char ch in value ?? "")
+            {
+                switch (ch)
+                {
+                    case '\"': escaped.Append("\\\""); break;
+                    case '\\': escaped.Append("\\\\"); break;
+                    case '\b': escaped.Append("\\b"); break;
+                    case '\f': escaped.Append("\\f"); break;
+                    case '\n': escaped.Append("\\n"); break;
+                    case '\r': escaped.Append("\\r"); break;
+                    case '\t': escaped.Append("\\t"); break;
+                    default:
+                        if (ch < 0x20) escaped.Append("\\u").Append(((int)ch).ToString("x4"));
+                        else escaped.Append(ch);
+                        break;
+                }
+            }
+            return escaped.ToString();
+        }
         private static StartupItem ErrorItem(string source, string scope, string location, Exception ex) { return new StartupItem { Id = "error|" + source + "|" + location, Name = "Scan warning", Source = source, Scope = scope, Location = location, Command = ex.Message, Enabled = false, CanDisable = false, Status = "Read failed" }; }
         internal static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "\\\"") + "\""; }
 
@@ -12820,6 +13364,10 @@ namespace MichStartupMaster
             internal bool IsAmbiguous { get { return Routes != null && Routes.Count > 1; } }
             internal bool AllEnabled { get { return Routes != null && Routes.Count > 0 && Routes.All(x => x.StateText() == "Enabled"); } }
             internal bool AllDisabled { get { return Routes != null && Routes.Count > 0 && Routes.All(x => x.StateText() == "Disabled"); } }
+            internal bool AnyEnabled { get { return Routes != null && Routes.Any(x => x.StateText() == "Enabled"); } }
+            // One enabled route is enough for an aggregate application to start.  Exact route
+            // rows still require their one route to be verified enabled.
+            internal bool EffectiveEnabled { get { return IsAppSummary ? AnyEnabled : AllEnabled; } }
             internal bool HasAttention { get { return Routes != null && Routes.Any(x => x.RiskLevel() == "Critical" || x.RiskLevel() == "Review" || x.AdviceLevel() == "Cleanup"); } }
             internal bool HasManaged { get { return Routes != null && Routes.Any(x => x.IsManaged); } }
         }
@@ -12850,7 +13398,7 @@ namespace MichStartupMaster
                 humanReadableNames = true,
                 windowsStartupCommandFallback = true,
                 enabledStartupApprovalsNeverHidden = true,
-                appsAggregatedByCanonicalTarget = true,
+                appsAggregatedByInstalledProductOrCanonicalTarget = true,
                 appsNeverAggregatedByDisplayName = true,
                 allRoutesRemainRouteLevel = true,
                 defaultViewIsCompleteRouteInventory = true,
@@ -12888,6 +13436,10 @@ namespace MichStartupMaster
             int invalid = scanned.Count(item => item == null || string.IsNullOrWhiteSpace(item.Id) || string.IsNullOrWhiteSpace(item.Source) || string.IsNullOrWhiteSpace(item.Location));
             int providerErrors = scanned.Count(item => item != null && (item.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase));
             int duplicateInventoryIds = scanned.Where(item => item != null && !string.IsNullOrWhiteSpace(item.Id)).GroupBy(item => item.Id, StringComparer.OrdinalIgnoreCase).Count(group => group.Count() > 1);
+            int duplicateSharedUserRegistryRoutes = scanned.Select(StartupService.SharedUserRegistryPhysicalIdentity)
+                .Where(identity => !string.IsNullOrWhiteSpace(identity))
+                .GroupBy(identity => identity, StringComparer.OrdinalIgnoreCase)
+                .Count(group => group.Count() > 1);
             int rendered = 0, missing = 0, unexpected = 0, duplicateRenderedIds = 0, aggregateRows = 0, searchMissing = 0, appRoutes = 0, appsMissing = 0;
             string firstSearchMissing = "";
             string firstAppsMissing = "";
@@ -12951,11 +13503,12 @@ namespace MichStartupMaster
             bool bootClean = Regex.IsMatch(boot ?? "", @"(?:^|\s)independent=true(?:\s|$)")
                 && Regex.IsMatch(boot ?? "", @"(?:^|\s)gaps=0(?:\s|$)")
                 && Regex.IsMatch(boot ?? "", @"(?:^|\s)errors=0(?:\s|$)");
-            bool passed = scanned.Count > 0 && invalid == 0 && providerErrors == 0 && duplicateInventoryIds == 0
+            bool passed = scanned.Count > 0 && invalid == 0 && providerErrors == 0 && duplicateInventoryIds == 0 && duplicateSharedUserRegistryRoutes == 0
                 && rendered == scanned.Count && aggregateRows == 0 && missing == 0 && unexpected == 0 && duplicateRenderedIds == 0 && searchMissing == 0 && appsMissing == 0 && bootClean;
             receipt = "LIVE_INVENTORY_VERIFY passed=" + passed.ToString().ToLowerInvariant()
                 + " scanned=" + scanned.Count + " rendered=" + rendered + " invalid=" + invalid
                 + " provider_errors=" + providerErrors + " duplicate_inventory_ids=" + duplicateInventoryIds
+                + " duplicate_shared_user_registry_routes=" + duplicateSharedUserRegistryRoutes
                 + " duplicate_rendered_ids=" + duplicateRenderedIds + " aggregate_rows=" + aggregateRows
                 + " missing=" + missing + " unexpected=" + unexpected + " search_missing=" + searchMissing
                 + " app_routes=" + appRoutes + " apps_missing=" + appsMissing
@@ -13058,15 +13611,18 @@ namespace MichStartupMaster
                     // Aggregation is optional and must never be the first or only presentation.
                     main.SetFilter("Apps");
                     var appRows = main._list.Items.Cast<ListViewItem>().Select(i => (InventoryRow)i.Tag).ToList();
-                    if (appRows.Count != 5) throw new InvalidOperationException("Apps view must render five canonical targets, not " + appRows.Count + " display-name or route rows.");
+                    if (appRows.Count != 6) throw new InvalidOperationException("Apps view must render six application identities, not " + appRows.Count + " display-name or route rows.");
                     if (!IsAppRoute(new StartupItem { Id = "wmi|lghub", Source = "Startup Command" }) || !IsAppRoute(new StartupItem { Id = "startupapproval|lghub", Source = "Startup Approval" })) throw new InvalidOperationException("Windows startup-command fallbacks and enabled approval-only routes must remain visible in Apps.");
+                    if (!IsAppRoute(new StartupItem { Id = "service|lghub", Source = "Windows Service", ApplicationIdentity = @"installed-product:c:\program files\lghub" }) || IsAppRoute(new StartupItem { Id = "service|system", Source = "Windows Service" })) throw new InvalidOperationException("Installed-product services must appear in Apps without flooding it with unowned system services.");
+                    InventoryRow logitech = appRows.Single(row => row.Routes.Any(x => x.Id == "preview|lghub|service"));
+                    if (logitech.Routes.Count != 2 || !logitech.EffectiveEnabled || logitech.AllEnabled || !StatusTextForRow(logitech).StartsWith("● Enabled", StringComparison.Ordinal)) throw new InvalidOperationException("An enabled app-owned service must make the Logitech application visibly enabled even when stale startup-command metadata says disabled.");
                     InventoryRow openSpeedy = appRows.Single(row => row.Routes.Any(x => x.Id == "preview|openspeedy|task"));
                     if (openSpeedy.Routes.Count != 2 || openSpeedy.AllEnabled || openSpeedy.AllDisabled || AggregateModeText(openSpeedy) != "Quiet (tray)") throw new InvalidOperationException("OpenSpeedy routes were not summarized into one correct mixed-state app row.");
                     var twins = appRows.Where(row => string.Equals(row.Primary.HumanName(), "Twin utility", StringComparison.OrdinalIgnoreCase)).ToList();
                     if (twins.Count != 2 || twins.Select(x => x.TargetIdentity).Distinct(StringComparer.OrdinalIgnoreCase).Count() != 2) throw new InvalidOperationException("Same-name apps with different canonical targets were incorrectly merged.");
                     if (main._list.Items.Cast<ListViewItem>().Where(item => string.Equals(((InventoryRow)item.Tag).Primary.HumanName(), "Twin utility", StringComparison.OrdinalIgnoreCase)).Select(item => item.Text).Distinct(StringComparer.OrdinalIgnoreCase).Count() != 2) throw new InvalidOperationException("Same-name distinct targets are not visually disambiguated.");
                     if (main._list.Groups.Count != 0 || main._list.ShowGroups) throw new InvalidOperationException("Native ListView groups can expose unthemed blue pseudo-link headers.");
-                    if (main._visibleValue.Text != appRows.Count.ToString() || main._enabledValue.Text != appRows.Count(x => x.AllEnabled).ToString() || main._disabledValue.Text != appRows.Count(x => x.AllDisabled).ToString() || main._managedValue.Text != appRows.Count(x => x.HasManaged).ToString()) throw new InvalidOperationException("Apps metrics do not describe the rendered aggregate rows.");
+                    if (main._visibleValue.Text != appRows.Count.ToString() || main._enabledValue.Text != appRows.Count(x => x.EffectiveEnabled).ToString() || main._disabledValue.Text != appRows.Count(x => x.AllDisabled).ToString() || main._managedValue.Text != appRows.Count(x => x.HasManaged).ToString()) throw new InvalidOperationException("Apps metrics do not describe the rendered aggregate rows.");
                     if (!main._showAll.Checked || new[] { main._showAll, main._showRisky, main._showCleanup, main._showDisabled }.Count(x => x.Checked) != 1 || main._showAll.AccessibleRole != AccessibleRole.CheckButton) throw new InvalidOperationException("The active filter is not exposed as one checked accessible control.");
                     Size checkedFilterText = TextRenderer.MeasureText("✓  " + main._showAll.Text.Replace("&", ""), main._showAll.Font, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
                     if (main._showAll.Width < checkedFilterText.Width + (int)Math.Round(18 * scale)) throw new InvalidOperationException("The non-color checked filter indicator is clipped at " + scale.ToString("0.0") + " scale.");
@@ -13110,7 +13666,7 @@ namespace MichStartupMaster
                     var externalRoute = new StartupItem { Id = "gpscript|fixture", Name = "Domain script", Source = "Group Policy Script", Location = "Domain GPO", Enabled = true, CanDisable = false, ExternalAuthority = "Domain Group Policy", MutationReason = "Owned by Domain Group Policy; change it through that authority" };
                     if (StateActionReason(externalRoute).IndexOf("Domain Group Policy", StringComparison.OrdinalIgnoreCase) < 0 || DetailBodyFor(externalRoute).IndexOf("Authority: Domain Group Policy", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Externally authoritative routes are presented as generic read-only entries.");
                     checks += 8;
-                    if (!CoverageIsClean("BOOT_AUDIT independent=true independence_scope=enumerators sources=1 shown=1 gaps=0 errors=0 surfaces=Boot_Execute:1\r\nTRAY_AUDIT apps=2 running=2 findings=0 uncertain=0") || CoverageIsClean("BOOT_AUDIT independent=true independence_scope=enumerators sources=1 shown=1 gaps=0 errors=0 surfaces=Boot_Execute:1\r\nTRAY_AUDIT apps=2 running=1 findings=0 uncertain=0") || CoverageIsClean("BOOT_AUDIT independent=true independence_scope=enumerators sources=1 shown=1 gaps=0 errors=0 surfaces=Boot_Execute:1\r\nTRAY_AUDIT apps=2 running=2 findings=0 uncertain=1")) throw new InvalidOperationException("Coverage UI can report complete without every quiet app running and unambiguous.");
+                    if (!CoverageIsClean("BOOT_AUDIT independent=true independence_scope=authoritative-enumerators sources=1 shown=1 gaps=0 errors=0 surfaces=Boot_Execute:1\r\nTRAY_AUDIT apps=2 running=2 findings=0 uncertain=0") || CoverageIsClean("BOOT_AUDIT independent=true independence_scope=authoritative-enumerators sources=1 shown=1 gaps=0 errors=0 surfaces=Boot_Execute:1\r\nTRAY_AUDIT apps=2 running=1 findings=0 uncertain=0") || CoverageIsClean("BOOT_AUDIT independent=true independence_scope=authoritative-enumerators sources=1 shown=1 gaps=0 errors=0 surfaces=Boot_Execute:1\r\nTRAY_AUDIT apps=2 running=2 findings=0 uncertain=1")) throw new InvalidOperationException("Coverage UI can report complete without every quiet app running and unambiguous.");
                     if (Math.Abs(scale - 1f) < .01f)
                     {
                         AssertContrast("Accent active button", StartupUiTheme.ForegroundFor(main.Accent), main.Accent, ref checks); AssertContrast("Enabled active button", StartupUiTheme.ForegroundFor(main.Good), main.Good, ref checks); AssertContrast("Disable active button", StartupUiTheme.ForegroundFor(main.Danger), main.Danger, ref checks); AssertContrast("Warning active button", StartupUiTheme.ForegroundFor(main.Warn), main.Warn, ref checks); AssertContrast("Steel active button", StartupUiTheme.ForegroundFor(main.Steel), main.Steel, ref checks); AssertContrast("Neutral active button", main.TextMain, main.Surface2, ref checks);
@@ -13186,7 +13742,7 @@ namespace MichStartupMaster
                 checks++;
             }
             trace("complete");
-            return "UI_SELF_TEST passed checks=" + checks + " scales=100,150,200 layouts=MainForm,AddStartupForm,EditStartupForm appAggregation=canonicalTarget allRoutes=routeLevel aggregateManageFlow=passed aggregateBulkDisable=transactional aggregateNonBulkActions=failClosed checkedFilters=true contrastAA=true dpiTransitionDrift=none darkChromeRequested=true startInTrayInitialVisible=false stateModeSeparated=true disabledEditFailClosed=true capabilityAwareActions=true expertConfirmation=true externalAuthority=true multiActionFailClosed=true";
+            return "UI_SELF_TEST passed checks=" + checks + " scales=100,150,200 layouts=MainForm,AddStartupForm,EditStartupForm appAggregation=installedProductOrCanonicalTarget allRoutes=routeLevel aggregateManageFlow=passed aggregateBulkDisable=transactional aggregateNonBulkActions=failClosed checkedFilters=true contrastAA=true dpiTransitionDrift=none darkChromeRequested=true startInTrayInitialVisible=false stateModeSeparated=true disabledEditFailClosed=true capabilityAwareActions=true expertConfirmation=true externalAuthority=true multiActionFailClosed=true";
         }
 
         private static List<StartupItem> PreviewItems()
@@ -13197,6 +13753,8 @@ namespace MichStartupMaster
                 new StartupItem { Id = "preview|openspeedy|registry", Name = "OpenSpeedy helper", AppName = "OpenSpeedy helper", Source = "Registry Run", Scope = "User", Command = @"C:\Apps\OpenSpeedy\OpenSpeedy.exe --minimize-to-tray", Location = @"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", Enabled = false, CanDisable = true, IsManaged = false, Status = "Safe preview duplicate route" },
                 new StartupItem { Id = "preview|codex", Name = "Codex", AppName = "Codex", Source = "Startup Folder", Scope = "User", Command = @"C:\Apps\Codex\Codex.exe", Location = @"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview row" },
                 new StartupItem { Id = "preview|updater", Name = "Example Update Task", AppName = "Example updater", Source = "Scheduled Task", Scope = "User", Command = @"C:\Apps\Example\updater.exe --wake", Location = @"\Example\Updater", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview row" },
+                new StartupItem { Id = "preview|lghub|service", Name = "LGHUB Updater Service", AppName = "Logitech G HUB", ApplicationIdentity = @"installed-product:c:\program files\lghub", ApplicationIdentityReason = @"Executable is inside the registered install root C:\Program Files\LGHUB", Source = "Windows Service", Scope = "Machine", Command = "\"C:\\Program Files\\LGHUB\\lghub_updater.exe\" --run-as-service", Location = @"HKLM\SYSTEM\CurrentControlSet\Services\LGHUBUpdaterService", Enabled = true, CanDisable = true, IsManaged = false, Status = "Automatic service; safe preview row" },
+                new StartupItem { Id = "preview|lghub|metadata", Name = "LGHUB", AppName = "Logitech G HUB", ApplicationIdentity = @"installed-product:c:\program files\lghub", ApplicationIdentityReason = @"Executable is inside the registered install root C:\Program Files\LGHUB", Source = "Startup Command", Scope = "User", Command = "\"C:\\Program Files\\LGHUB\\system_tray\\lghub_system_tray.exe\" --minimized", Location = @"HKU\Fixture\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", Enabled = false, CanDisable = true, IsManaged = false, Status = "Stale disabled approval metadata; safe preview row" },
                 new StartupItem { Id = "preview|driver", Name = "ExampleDriver", AppName = "Example system driver", Source = "System Driver", Scope = "Machine", Command = @"C:\Windows\System32\drivers\example.sys", Location = @"HKLM\SYSTEM\CurrentControlSet\Services\ExampleDriver", Enabled = true, CanDisable = false, IsManaged = false, Status = "Safe preview row" },
                 new StartupItem { Id = "preview|twin|one", Name = "Twin utility route one", AppName = "Twin utility", Source = "Scheduled Task", Scope = "User", Command = @"C:\Apps\One\worker.exe", Location = @"\Example\TwinOne", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview same-name distinct target" },
                 new StartupItem { Id = "preview|twin|two", Name = "Twin utility route two", AppName = "Twin utility", Source = "Registry Run", Scope = "User", Command = @"C:\Apps\Two\worker.exe", Location = @"HKCU\Software\Example\TwinTwo", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview same-name distinct target" }
@@ -13639,10 +14197,10 @@ namespace MichStartupMaster
             _tooltip.SetToolTip(_refresh, "Read every startup source again. Refresh never changes startup settings.");
             _tooltip.SetToolTip(_tools, "Coverage, explicit repair, protection, and startup-folder tools.");
             _tooltip.SetToolTip(_search, "Filter by application, registration, source, path, command, or status. Ctrl+F focuses search.");
-            _tooltip.SetToolTip(_showAll, "Summarize app-launching routes by target. This is an optional convenience view.");
+            _tooltip.SetToolTip(_showAll, "Summarize every route owned by one installed app, including app-owned automatic services. One enabled route means the app is enabled at startup.");
             _tooltip.SetToolTip(_showRisky, "Show the complete startup inventory: one row per captured registration, including services, drivers, boot/logon hooks, and system internals.");
             _tooltip.SetToolTip(_showCleanup, "Show high-impact, script-based, or optional-startup items worth reviewing.");
-            _tooltip.SetToolTip(_showDisabled, "Show entries currently kept from startup.");
+            _tooltip.SetToolTip(_showDisabled, "Show routes whose verified startup state is Disabled. Unknown and conflicting routes stay in Needs attention.");
             _tooltip.SetToolTip(_sortBy, "Sort the current view by any column. Alt+S focuses this control.");
             _tooltip.SetToolTip(_sortDirection, "Reverse the current sort direction.");
             _tooltip.SetToolTip(_editSelected, "Edit the selected app path, arguments, and startup mode.");
@@ -13763,7 +14321,7 @@ namespace MichStartupMaster
                 using (var marker = new SolidBrush(item.RiskLevel() == "Critical" ? Danger : Warn)) e.Graphics.FillRectangle(marker, new Rectangle(e.Bounds.X, e.Bounds.Y + 5, 3, Math.Max(1, e.Bounds.Height - 10)));
             }
             Color color = foreground;
-            if (!SystemInformation.HighContrast && !selected && e.ColumnIndex == 1) color = uiRow.AllEnabled ? Good : Muted;
+            if (!SystemInformation.HighContrast && !selected && e.ColumnIndex == 1) color = uiRow.EffectiveEnabled ? Good : Muted;
             if (!SystemInformation.HighContrast && !selected && e.ColumnIndex == 2) color = AggregateModeText(uiRow) == "Quiet (tray)" ? Accent : Muted;
             if (!SystemInformation.HighContrast && !selected && e.ColumnIndex == 4) color = item.RiskLevel() == "Critical" ? StartupUiTheme.DangerText : (uiRow.HasAttention ? Warn : Muted);
             if (!SystemInformation.HighContrast && !selected && (e.ColumnIndex == 3 || e.ColumnIndex == 5)) color = Muted;
@@ -13961,7 +14519,7 @@ namespace MichStartupMaster
             }
             int attention = rows.Count(row => row.HasAttention || (!row.AllEnabled && !row.AllDisabled));
             _summary.Text = _items.Count + " routes captured" + (_lastRefresh.HasValue ? "  ·  scanned " + _lastRefresh.Value.ToString("HH:mm:ss") : "") + (_filterMode == "Apps" ? "  ·  system routes in All routes" : "");
-            _visibleValue.Text = rows.Count.ToString(); _enabledValue.Text = rows.Count(x => x.AllEnabled).ToString(); _disabledValue.Text = rows.Count(x => x.AllDisabled).ToString(); _reviewValue.Text = attention.ToString(); _managedValue.Text = rows.Count(x => x.HasManaged).ToString();
+            _visibleValue.Text = rows.Count.ToString(); _enabledValue.Text = rows.Count(x => x.EffectiveEnabled).ToString(); _disabledValue.Text = rows.Count(x => x.AllDisabled).ToString(); _reviewValue.Text = attention.ToString(); _managedValue.Text = rows.Count(x => x.HasManaged).ToString();
             if (!_isRefreshing)
             {
                 string viewStatus = rows.Count == 0 ? "No matches in this view." : (_filterMode == "Apps" ? "Showing " + rows.Count + " apps representing " + rows.Sum(x => x.Routes.Count) + " startup routes. Open All routes to manage duplicates safely." : (!string.IsNullOrWhiteSpace(_routeTargetFilter) ? "Showing " + rows.Count + " exact routes for " + TargetCaption(_routeTargetFilter) + ". Select one registration to manage it safely." : "Showing " + rows.Count + " startup routes. Refresh is read-only."));
@@ -13979,7 +14537,7 @@ namespace MichStartupMaster
             var rows = new List<InventoryRow>();
             if (_filterMode == "Apps")
             {
-                foreach (var group in eligible.GroupBy(CanonicalTargetIdentity, StringComparer.OrdinalIgnoreCase))
+                foreach (var group in eligible.GroupBy(ApplicationGroupIdentity, StringComparer.OrdinalIgnoreCase))
                 {
                     List<StartupItem> routes = group.ToList();
                     if (!string.IsNullOrWhiteSpace(query) && !routes.Any(x => SearchText(x).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
@@ -14069,7 +14627,7 @@ namespace MichStartupMaster
 
         private static string StatusTextForRow(InventoryRow row)
         {
-            if (row.AllEnabled) return "● Enabled";
+            if (row.EffectiveEnabled) return row.AllEnabled ? "● Enabled" : "● Enabled · mixed routes";
             if (row.AllDisabled) return "○ Disabled";
             if (row.Routes.Any(x => x.StateText() == "Drifted")) return "Drifted";
             if (row.Routes.Any(x => x.StateText() == "Unknown")) return "Unknown";
@@ -14078,7 +14636,7 @@ namespace MichStartupMaster
 
         private static int StatusSortRank(InventoryRow row)
         {
-            if (row.AllEnabled) return 0;
+            if (row.EffectiveEnabled) return 0;
             if (!row.AllDisabled && !row.Routes.Any(x => x.StateText() == "Drifted" || x.StateText() == "Unknown")) return 1;
             if (row.Routes.Any(x => x.StateText() == "Unknown")) return 2;
             if (row.Routes.Any(x => x.StateText() == "Drifted")) return 3;
@@ -14122,6 +14680,12 @@ namespace MichStartupMaster
             return raw.Length == 0 ? "route:" + (item.Id ?? item.Source + "|" + item.Location + "|" + item.Name) : "raw:" + raw;
         }
 
+        private static string ApplicationGroupIdentity(StartupItem item)
+        {
+            if (item != null && !string.IsNullOrWhiteSpace(item.ApplicationIdentity)) return item.ApplicationIdentity;
+            return CanonicalTargetIdentity(item);
+        }
+
         private static string NormalizeTargetIdentity(string target)
         {
             string value = Environment.ExpandEnvironmentVariables((target ?? "").Trim().Trim('"')).Replace('/', '\\');
@@ -14133,6 +14697,12 @@ namespace MichStartupMaster
         {
             string value = identity ?? "";
             if (value.StartsWith("path:", StringComparison.OrdinalIgnoreCase)) value = value.Substring(5);
+            else if (value.StartsWith("installed-product:", StringComparison.OrdinalIgnoreCase))
+            {
+                value = value.Substring("installed-product:".Length);
+                int registration = value.IndexOf("|registration:", StringComparison.OrdinalIgnoreCase);
+                if (registration >= 0) value = value.Substring(0, registration);
+            }
             try { string file = Path.GetFileName(value); if (!string.IsNullOrWhiteSpace(file)) return file; } catch { }
             return value;
         }
@@ -14149,6 +14719,12 @@ namespace MichStartupMaster
         {
             string value = identity ?? "";
             if (value.StartsWith("path:", StringComparison.OrdinalIgnoreCase)) value = value.Substring(5);
+            else if (value.StartsWith("installed-product:", StringComparison.OrdinalIgnoreCase))
+            {
+                value = value.Substring("installed-product:".Length);
+                int registration = value.IndexOf("|registration:", StringComparison.OrdinalIgnoreCase);
+                if (registration >= 0) value = value.Substring(0, registration);
+            }
             try
             {
                 string file = Path.GetFileName(value), directory = Path.GetDirectoryName(value), parent = string.IsNullOrWhiteSpace(directory) ? "" : new DirectoryInfo(directory).Name;
@@ -14182,9 +14758,9 @@ namespace MichStartupMaster
         private bool MatchesFilter(StartupItem item)
         {
             if (_filterMode == "Apps") return IsAppRoute(item);
-            if (_filterMode == "Attention") return item.RiskLevel() == "Critical" || item.RiskLevel() == "Review" || item.AdviceLevel() == "Cleanup";
-            if (_filterMode == "Disabled") return !item.Enabled;
-            if (_filterMode == "All" && !string.IsNullOrWhiteSpace(_routeTargetFilter)) return string.Equals(CanonicalTargetIdentity(item), _routeTargetFilter, StringComparison.OrdinalIgnoreCase);
+            if (_filterMode == "Attention") return item.StateText() == "Unknown" || item.StateText() == "Drifted" || (item.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase) || item.RiskLevel() == "Critical" || item.RiskLevel() == "Review" || item.AdviceLevel() == "Cleanup";
+            if (_filterMode == "Disabled") return item.StateText() == "Disabled";
+            if (_filterMode == "All" && !string.IsNullOrWhiteSpace(_routeTargetFilter)) return string.Equals(ApplicationGroupIdentity(item), _routeTargetFilter, StringComparison.OrdinalIgnoreCase);
             return true;
         }
 
@@ -14192,7 +14768,11 @@ namespace MichStartupMaster
         {
             if (item == null || (item.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase)) return false;
             string source = item.Source ?? "";
-            return source != "Windows Service" && source != "System Driver" && source != "Winlogon Autostart" && source != "Winlogon Notification" && source != "AppInit DLLs" && source != "Active Setup" && source != "Boot Execute" && source != "Image Hijack" && source != "Known DLL" && source != "Network Provider" && source != "Winsock Provider" && source != "Print Monitor" && source != "Media Codec" && source != "WMI Event Consumer" && source != "Group Policy Script" && source != "Explorer Startup Extension" && source != "Explorer Shell Extension" && source != "Internet Explorer Add-on" && source != "AppCert DLLs" && source != "LSA Startup Package" && source != "Stale Startup Metadata";
+            // An automatic service under a registered install root is an application-owned
+            // startup route (LGHUB is a real example). Product ownership is backed by an exact
+            // executable path and is never inferred from a coincidentally similar display name.
+            if (source == "Windows Service") return (item.ApplicationIdentity ?? "").StartsWith("installed-product:", StringComparison.OrdinalIgnoreCase);
+            return source != "System Driver" && source != "Winlogon Autostart" && source != "Winlogon Notification" && source != "AppInit DLLs" && source != "Active Setup" && source != "Boot Execute" && source != "Image Hijack" && source != "Known DLL" && source != "Network Provider" && source != "Winsock Provider" && source != "Print Monitor" && source != "Media Codec" && source != "WMI Event Consumer" && source != "Group Policy Script" && source != "Explorer Startup Extension" && source != "Explorer Shell Extension" && source != "Internet Explorer Add-on" && source != "AppCert DLLs" && source != "LSA Startup Package" && source != "Stale Startup Metadata";
         }
 
         private void SetFilter(string mode)
@@ -14363,6 +14943,8 @@ namespace MichStartupMaster
         {
             if (item == null) return "";
             var lines = new List<string> { "Location: " + (item.Location ?? ""), "Command: " + (item.Command ?? "") };
+            if (!string.IsNullOrWhiteSpace(item.ApplicationIdentityReason)) lines.Add("App ownership: " + item.ApplicationIdentityReason);
+            if (!string.IsNullOrWhiteSpace(item.RuntimeEvidence)) lines.Add("Observed now: " + item.RuntimeEvidence);
             if (!item.Enabled && item.PopupLabel() != "N/A") lines.Add("Enable this startup entry before editing it.");
             if (!string.IsNullOrWhiteSpace(item.MutationReason)) lines.Add("Change access: " + item.MutationReason);
             if (!string.IsNullOrWhiteSpace(item.ExternalAuthority)) lines.Add("Authority: " + item.ExternalAuthority);
@@ -14378,7 +14960,10 @@ namespace MichStartupMaster
             if (!row.IsAmbiguous) return DetailBodyFor(row.Primary);
             int enabled = row.Routes.Count(x => x.StateText() == "Enabled"), disabled = row.Routes.Count(x => x.StateText() == "Disabled");
             string sources = string.Join(", ", row.Routes.Select(x => x.Source).Distinct(StringComparer.OrdinalIgnoreCase));
-            return "Target: " + TargetCaption(row.TargetIdentity) + Environment.NewLine + enabled + " enabled  ·  " + disabled + " disabled  ·  " + (row.Routes.Count - enabled - disabled) + " unverified  ·  " + sources + Environment.NewLine + "Enable or disable every matching route here in one rollback-safe transaction, or open All routes to manage one registration.";
+            int observed = row.Routes.Count(x => !string.IsNullOrWhiteSpace(x.RuntimeEvidence));
+            return "Application: " + row.Primary.HumanName() + Environment.NewLine + enabled + " enabled  ·  " + disabled + " disabled  ·  " + (row.Routes.Count - enabled - disabled) + " unverified  ·  " + sources
+                + (observed == 0 ? "" : Environment.NewLine + observed + " route" + (observed == 1 ? " has" : "s have") + " related processes observed now; this does not prove the next boot.")
+                + Environment.NewLine + "Enable or disable every matching route here in one rollback-safe transaction, or open All routes to manage one registration.";
         }
 
         private void UpdateContextMenu()
