@@ -155,7 +155,7 @@ namespace MichStartupMaster
                 }
                 if (cmd == "--state-store-worker") return StateStoreFile.Worker(args);
                 if (cmd == "--state-store-self-test") { Console.WriteLine(StateStoreFile.SelfTest()); return 0; }
-                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.2.0"); return 0; }
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.2.1"); return 0; }
                 if (cmd == "--list") { Console.WriteLine(StartupService.ToJson(StartupService.ScanAll())); return 0; }
                 if (cmd == "--audit-boot") return CliAuditCoverage(false);
                 if (cmd == "--audit-tray") return CliAuditCoverage(true);
@@ -13646,6 +13646,8 @@ namespace MichStartupMaster
                 startInTrayArgument = "--start-in-tray",
                 startInTrayPrePaintSuppression = true,
                 asyncRefresh = true,
+                trayPreloadsInventory = true,
+                browseDuringRefresh = true,
                 refreshIsReadOnly = true,
                 humanReadableNames = true,
                 windowsStartupCommandFallback = true,
@@ -13705,6 +13707,7 @@ namespace MichStartupMaster
                 if (!identityMatches || (item.RuntimeEvidence ?? "").IndexOf("exact target running pid=", StringComparison.OrdinalIgnoreCase) < 0) runningLauncherPayloadMismatches++;
             }
             int rendered = 0, missing = 0, unexpected = 0, duplicateRenderedIds = 0, aggregateRows = 0, searchMissing = 0, appRoutes = 0, appsMissing = 0;
+            int logitechRoutes = 0, logitechExpectedRows = 0, logitechNameRows = 0, logitechPathRows = 0, logitechMissing = 0;
             string firstSearchMissing = "";
             string firstAppsMissing = "";
             try
@@ -13755,6 +13758,26 @@ namespace MichStartupMaster
                             if (firstAppsMissing.Length == 0) firstAppsMissing = item.HumanName() + " [" + item.Id + "]";
                         }
                     }
+
+                    // This is an explicit live regression gate for the failure that prompted
+                    // 2.2.1: LGHUB was present in the captured disabled-state inventory but
+                    // was not reliably available to the person opening the Apps tab. Prove
+                    // both its human product name and executable-family name find every exact
+                    // Logitech route in the same application grouping used by the real UI.
+                    var liveLogitechRoutes = scanned.Where(item => IsAppRoute(item) && IsLogitechRoute(item)).ToList();
+                    logitechRoutes = liveLogitechRoutes.Count;
+                    if (logitechRoutes > 0)
+                    {
+                        var logitechIds = new HashSet<string>(liveLogitechRoutes.Select(item => item.Id), StringComparer.OrdinalIgnoreCase);
+                        logitechExpectedRows = liveLogitechRoutes.Select(ApplicationGroupIdentity).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+                        var nameMatches = form.BuildVisibleRows("logitech").Where(row => row.Routes.Any(route => logitechIds.Contains(route.Id))).ToList();
+                        var pathMatches = form.BuildVisibleRows("lghub").Where(row => row.Routes.Any(route => logitechIds.Contains(route.Id))).ToList();
+                        logitechNameRows = nameMatches.Count;
+                        logitechPathRows = pathMatches.Count;
+                        var visibleIds = new HashSet<string>(nameMatches.SelectMany(row => row.Routes).Select(route => route.Id), StringComparer.OrdinalIgnoreCase);
+                        visibleIds.UnionWith(pathMatches.SelectMany(row => row.Routes).Select(route => route.Id));
+                        logitechMissing = logitechIds.Count(id => !visibleIds.Contains(id));
+                    }
                 }
             }
             catch (Exception ex)
@@ -13767,9 +13790,10 @@ namespace MichStartupMaster
             bool bootClean = Regex.IsMatch(boot ?? "", @"(?:^|\s)independent=true(?:\s|$)")
                 && Regex.IsMatch(boot ?? "", @"(?:^|\s)gaps=0(?:\s|$)")
                 && Regex.IsMatch(boot ?? "", @"(?:^|\s)errors=0(?:\s|$)");
+            bool logitechVisible = logitechRoutes == 0 || (logitechExpectedRows > 0 && logitechNameRows == logitechExpectedRows && logitechPathRows == logitechExpectedRows && logitechMissing == 0);
             bool passed = scanned.Count > 0 && invalid == 0 && providerErrors == 0 && duplicateInventoryIds == 0 && duplicateSharedUserRegistryRoutes == 0
                 && rendered == scanned.Count && aggregateRows == 0 && missing == 0 && unexpected == 0 && duplicateRenderedIds == 0 && searchMissing == 0 && appsMissing == 0 && bootClean;
-            passed = passed && runningLauncherPayloadMismatches == 0;
+            passed = passed && runningLauncherPayloadMismatches == 0 && logitechVisible;
             receipt = "LIVE_INVENTORY_VERIFY passed=" + passed.ToString().ToLowerInvariant()
                 + " scanned=" + scanned.Count + " rendered=" + rendered + " invalid=" + invalid
                 + " provider_errors=" + providerErrors + " duplicate_inventory_ids=" + duplicateInventoryIds
@@ -13779,6 +13803,9 @@ namespace MichStartupMaster
                 + " app_routes=" + appRoutes + " apps_missing=" + appsMissing
                 + " launcher_payload_routes=" + launcherPayloadRoutes + " running_launcher_payload_routes=" + runningLauncherPayloadRoutes
                 + " running_launcher_payload_mismatches=" + runningLauncherPayloadMismatches
+                + " logitech_routes=" + logitechRoutes + " logitech_expected_app_rows=" + logitechExpectedRows
+                + " logitech_name_rows=" + logitechNameRows + " logitech_lghub_rows=" + logitechPathRows
+                + " logitech_missing=" + logitechMissing + " logitech_visible=" + logitechVisible.ToString().ToLowerInvariant()
                 + (firstSearchMissing.Length == 0 ? "" : " first_search_missing=" + firstSearchMissing)
                 + (firstAppsMissing.Length == 0 ? "" : " first_apps_missing=" + firstAppsMissing)
                 + " boot_audit_clean=" + bootClean.ToString().ToLowerInvariant();
@@ -13892,7 +13919,12 @@ namespace MichStartupMaster
                     if (!IsAppRoute(new StartupItem { Id = "wmi|lghub", Source = "Startup Command" }) || !IsAppRoute(new StartupItem { Id = "startupapproval|lghub", Source = "Startup Approval" })) throw new InvalidOperationException("Windows startup-command fallbacks and enabled approval-only routes must remain visible in Apps.");
                     if (!IsAppRoute(new StartupItem { Id = "service|lghub", Source = "Windows Service", ApplicationIdentity = @"installed-product:c:\program files\lghub" }) || IsAppRoute(new StartupItem { Id = "service|system", Source = "Windows Service" })) throw new InvalidOperationException("Installed-product services must appear in Apps without flooding it with unowned system services.");
                     InventoryRow logitech = appRows.Single(row => row.Routes.Any(x => x.Id == "preview|lghub|service"));
-                    if (logitech.Routes.Count != 2 || !logitech.EffectiveEnabled || logitech.AllEnabled || !StatusTextForRow(logitech).StartsWith("● Enabled", StringComparison.Ordinal)) throw new InvalidOperationException("An enabled app-owned service must make the Logitech application visibly enabled even when stale startup-command metadata says disabled.");
+                    if (logitech.Routes.Count != 2 || !logitech.AllDisabled || StatusTextForRow(logitech).IndexOf("Disabled", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("A fully disabled Logitech application must remain visible in Apps with both exact routes.");
+                    foreach (string query in new[] { "logitech", "lghub" })
+                    {
+                        var logitechSearch = main.BuildVisibleRows(query);
+                        if (logitechSearch.Count != 1 || !string.Equals(logitechSearch[0].TargetIdentity, logitech.TargetIdentity, StringComparison.OrdinalIgnoreCase) || logitechSearch[0].Routes.Count != 2) throw new InvalidOperationException("Apps search did not find the fully disabled Logitech route group by " + query + ".");
+                    }
                     InventoryRow openSpeedy = appRows.Single(row => row.Routes.Any(x => x.Id == "preview|openspeedy|task"));
                     if (openSpeedy.Routes.Count != 2 || openSpeedy.AllEnabled || openSpeedy.AllDisabled || AggregateModeText(openSpeedy) != "Quiet (tray)") throw new InvalidOperationException("OpenSpeedy routes were not summarized into one correct mixed-state app row.");
                     var twins = appRows.Where(row => string.Equals(row.Primary.HumanName(), "Twin utility", StringComparison.OrdinalIgnoreCase)).ToList();
@@ -14030,7 +14062,7 @@ namespace MichStartupMaster
                 new StartupItem { Id = "preview|openspeedy|registry", Name = "OpenSpeedy helper", AppName = "OpenSpeedy helper", Source = "Registry Run", Scope = "User", Command = @"C:\Apps\OpenSpeedy\OpenSpeedy.exe --minimize-to-tray", Location = @"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", Enabled = false, CanDisable = true, IsManaged = false, Status = "Safe preview duplicate route" },
                 new StartupItem { Id = "preview|codex", Name = "Codex", AppName = "Codex", Source = "Startup Folder", Scope = "User", Command = @"C:\Apps\Codex\Codex.exe", Location = @"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview row" },
                 new StartupItem { Id = "preview|updater", Name = "Example Update Task", AppName = "Example updater", Source = "Scheduled Task", Scope = "User", Command = @"C:\Apps\Example\updater.exe --wake", Location = @"\Example\Updater", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview row" },
-                new StartupItem { Id = "preview|lghub|service", Name = "LGHUB Updater Service", AppName = "Logitech G HUB", ApplicationIdentity = @"installed-product:c:\program files\lghub", ApplicationIdentityReason = @"Executable is inside the registered install root C:\Program Files\LGHUB", Source = "Windows Service", Scope = "Machine", Command = "\"C:\\Program Files\\LGHUB\\lghub_updater.exe\" --run-as-service", Location = @"HKLM\SYSTEM\CurrentControlSet\Services\LGHUBUpdaterService", Enabled = true, CanDisable = true, IsManaged = false, Status = "Automatic service; safe preview row" },
+                new StartupItem { Id = "preview|lghub|service", Name = "LGHUB Updater Service", AppName = "Logitech G HUB", ApplicationIdentity = @"installed-product:c:\program files\lghub", ApplicationIdentityReason = @"Executable is inside the registered install root C:\Program Files\LGHUB", Source = "Windows Service", Scope = "Machine", Command = "\"C:\\Program Files\\LGHUB\\lghub_updater.exe\" --run-as-service", Location = @"HKLM\SYSTEM\CurrentControlSet\Services\LGHUBUpdaterService", Enabled = false, CanDisable = true, IsManaged = false, Status = "Disabled service; safe preview row" },
                 new StartupItem { Id = "preview|lghub|metadata", Name = "LGHUB", AppName = "Logitech G HUB", ApplicationIdentity = @"installed-product:c:\program files\lghub", ApplicationIdentityReason = @"Executable is inside the registered install root C:\Program Files\LGHUB", Source = "Startup Command", Scope = "User", Command = "\"C:\\Program Files\\LGHUB\\system_tray\\lghub_system_tray.exe\" --minimized", Location = @"HKU\Fixture\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", Enabled = false, CanDisable = true, IsManaged = false, Status = "Stale disabled approval metadata; safe preview row" },
                 new StartupItem { Id = "preview|driver", Name = "ExampleDriver", AppName = "Example system driver", Source = "System Driver", Scope = "Machine", Command = @"C:\Windows\System32\drivers\example.sys", Location = @"HKLM\SYSTEM\CurrentControlSet\Services\ExampleDriver", Enabled = true, CanDisable = false, IsManaged = false, Status = "Safe preview row" },
                 new StartupItem { Id = "preview|twin|one", Name = "Twin utility route one", AppName = "Twin utility", Source = "Scheduled Task", Scope = "User", Command = @"C:\Apps\One\worker.exe", Location = @"\Example\TwinOne", Enabled = true, CanDisable = true, IsManaged = false, Status = "Safe preview same-name distinct target" },
@@ -14226,7 +14258,10 @@ namespace MichStartupMaster
                 BuildTray();
                 // A hidden logon agent stays genuinely idle. Opening the dashboard performs the
                 // first scan; a visible dashboard then checks at a deliberately slow cadence.
-                Load += (s, e) => { if (!_startInTray) RefreshItems(); };
+                // A boot-resident tray process must not wait for the first window open before
+                // discovering applications. Preload in the background so Apps already contains
+                // disabled and enabled products such as Logitech G HUB when the user opens it.
+                Load += (s, e) => RefreshItems();
                 _watchTimer = new Timer { Interval = 300000 };
                 _watchTimer.Tick += (s, e) => { if (Visible && !_isRefreshing) DetectNewStartupItems(); };
                 _watchTimer.Start();
@@ -14752,8 +14787,11 @@ namespace MichStartupMaster
         {
             _progress.Visible = busy;
             _refresh.Enabled = !busy; _tools.Enabled = !busy; _add.Enabled = !busy;
-            _search.Enabled = !busy; _showAll.Enabled = !busy; _showRisky.Enabled = !busy; _showCleanup.Enabled = !busy; _showDisabled.Enabled = !busy;
-            _list.Enabled = !busy;
+            // Refresh is read-only. Keep the last verified snapshot searchable and allow view
+            // changes while the replacement snapshot is being collected. State-changing
+            // actions still fail closed through _isRefreshing in UpdateButtons and handlers.
+            _search.Enabled = true; _showAll.Enabled = true; _showRisky.Enabled = true; _showCleanup.Enabled = true; _showDisabled.Enabled = true;
+            _list.Enabled = true;
             _refresh.Text = busy ? "Reading..." : "&Refresh";
             if (!string.IsNullOrWhiteSpace(message)) SetStatus(message, Muted);
             if (busy && _items.Count == 0)
@@ -15059,6 +15097,14 @@ namespace MichStartupMaster
             // executable path and is never inferred from a coincidentally similar display name.
             if (source == "Windows Service") return (item.ApplicationIdentity ?? "").StartsWith("installed-product:", StringComparison.OrdinalIgnoreCase);
             return source != "System Driver" && source != "Winlogon Autostart" && source != "Winlogon Notification" && source != "AppInit DLLs" && source != "Active Setup" && source != "Boot Execute" && source != "Image Hijack" && source != "Known DLL" && source != "Network Provider" && source != "Winsock Provider" && source != "Print Monitor" && source != "Media Codec" && source != "WMI Event Consumer" && source != "Group Policy Script" && source != "Explorer Startup Extension" && source != "Explorer Shell Extension" && source != "Internet Explorer Add-on" && source != "AppCert DLLs" && source != "LSA Startup Package" && source != "Stale Startup Metadata";
+        }
+
+        private static bool IsLogitechRoute(StartupItem item)
+        {
+            if (item == null) return false;
+            string text = string.Join(" ", new[] { item.Name, item.AppName, item.Command, item.Location, item.ApplicationIdentity, item.ApplicationRoot }
+                .Concat(item.ApplicationTargets ?? Array.Empty<string>()).Where(value => !string.IsNullOrWhiteSpace(value)));
+            return Regex.IsMatch(text, @"(?:\blogitech\b|\blghub\b)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         }
 
         private void SetFilter(string mode)
