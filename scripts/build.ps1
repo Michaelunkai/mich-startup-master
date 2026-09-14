@@ -501,7 +501,7 @@ function Assert-StagedBehavior {
     $probes = @()
 
     $version = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--version' -TimeoutMilliseconds 30000
-    if ($version.Stdout -notmatch '^MichStartupMaster 2\.1\.0$') { throw "Unexpected staged version receipt: $($version.Stdout)" }
+    if ($version.Stdout -notmatch '^MichStartupMaster 2\.2\.0$') { throw "Unexpected staged version receipt: $($version.Stdout)" }
     $probes += $version
 
     $state = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--state-store-self-test'
@@ -509,7 +509,7 @@ function Assert-StagedBehavior {
     $probes += $state
 
     $truth = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--truth-self-test'
-    if ($truth.Stdout.Trim() -ne 'TRUTH_SELF_TEST checks=11 passed=11 codex=unverified contradictions=drifted missing=unknown') { throw "Startup truth gate failed: $($truth.Stdout)" }
+    if ($truth.Stdout.Trim() -ne 'TRUTH_SELF_TEST checks=12 passed=12 codex=unverified contradictions=drifted missing=unknown') { throw "Startup truth gate failed: $($truth.Stdout)" }
     $probes += $truth
 
     $inventory = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--inventory-self-test'

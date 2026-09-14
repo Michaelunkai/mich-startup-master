@@ -155,7 +155,7 @@ namespace MichStartupMaster
                 }
                 if (cmd == "--state-store-worker") return StateStoreFile.Worker(args);
                 if (cmd == "--state-store-self-test") { Console.WriteLine(StateStoreFile.SelfTest()); return 0; }
-                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.1.0"); return 0; }
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.2.0"); return 0; }
                 if (cmd == "--list") { Console.WriteLine(StartupService.ToJson(StartupService.ScanAll())); return 0; }
                 if (cmd == "--audit-boot") return CliAuditCoverage(false);
                 if (cmd == "--audit-tray") return CliAuditCoverage(true);
@@ -674,6 +674,10 @@ namespace MichStartupMaster
         public string ApplicationIdentity;
         public string ApplicationRoot;
         public string ApplicationIdentityReason;
+        // Exact executable candidates discovered behind a launcher or script.  This is an
+        // in-memory projection only: the physical startup registration remains one row and all
+        // mutations continue to target its original Id/Location exactly once.
+        public string[] ApplicationTargets;
         public string RuntimeEvidence;
         public bool Enabled;
         // Configuration is not proof. These fields are rebuilt during each read-only scan.
@@ -1641,6 +1645,17 @@ namespace MichStartupMaster
             return readbackEnabled ? "Enabled" : "Disabled";
         }
 
+        private static bool ManagedIntentMatches(EnabledStartupService.Row expected, string target, string arguments)
+        {
+            if (expected == null) return false;
+            string intendedTarget = expected.Target ?? "", intendedArguments = expected.Arguments ?? "";
+            string observedTarget = target ?? "", observedArguments = arguments ?? "";
+            QuietLaunchPlanner.NormalizePersistent(ref intendedTarget, ref intendedArguments);
+            QuietLaunchPlanner.NormalizePersistent(ref observedTarget, ref observedArguments);
+            return string.Equals(intendedTarget, observedTarget, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(intendedArguments, observedArguments, StringComparison.Ordinal);
+        }
+
         public static string TruthSelfTest()
         {
             int checks = 0;
@@ -1654,6 +1669,8 @@ namespace MichStartupMaster
             require(RegistrationVerdict(true, true, true, true, false, false) == "Disabled");
             var codex = new StartupItem { Id = @"task|\MichStartupMaster\chatgpt", AppName = "Codex", Enabled = true, Source = "Scheduled Task", Command = "manager.exe --tray-run " + Convert.ToBase64String(Encoding.UTF8.GetBytes(@"C:\Program Files\WindowsApps\OpenAI.Codex_1_x64__publisher\app\ChatGPT.exe" + "\n")) };
             require(codex.StateText() == "Unknown" && codex.PresentationState == "Needs verification");
+            string speedyFixture = @"F:\Apps\OpenSpeedy\Speedy.exe";
+            require(ManagedIntentMatches(new EnabledStartupService.Row { Target = speedyFixture, Arguments = "", Mode = "tray" }, speedyFixture, "--minimize-to-tray"));
             string target, arguments;
             require(TryDecodeTrayPayload(codex.Command, out target, out arguments) && target.EndsWith(@"\app\ChatGPT.exe") && arguments == "");
             codex.VerifiedState = "Enabled";
@@ -1744,15 +1761,19 @@ namespace MichStartupMaster
                     // non-system volume merely to decorate a dashboard row. Such a target is
                     // still visible and its task definition is read back, but availability is
                     // honestly unknown until that volume is responsive.
-                    if (!IsSafeSystemVolumeFileProbe(target) || !IsSafeSystemVolumeFileProbe(normalizedExecute))
-                    { item.VerifiedState = "Unknown"; item.EvidenceReason = "Task definition was read back, but its target is outside the local system volume and was not synchronously probed"; continue; }
-                    if (!File.Exists(target) || !File.Exists(normalizedExecute))
+                    bool targetProbeAllowed = IsSafeSystemVolumeFileProbe(target) && IsSafeSystemVolumeFileProbe(normalizedExecute);
+                    if (targetProbeAllowed && (!File.Exists(target) || !File.Exists(normalizedExecute)))
                     { item.VerifiedState = "Drifted"; item.EvidenceReason = "Exact registered launcher or target is missing or cannot be read"; continue; }
                     var expected = intent.Where(r => string.Equals(string.IsNullOrWhiteSpace(r.TaskLocation) ? r.Location : r.TaskLocation, item.Location, StringComparison.OrdinalIgnoreCase)).ToList();
                     if (expected.Count > 1) throw new InvalidOperationException("Contradictory managed intent records");
-                    if (expected.Count == 1 && (!string.Equals(expected[0].Target, target, StringComparison.OrdinalIgnoreCase)
-                        || !string.Equals(expected[0].Arguments ?? "", targetArguments, StringComparison.Ordinal)))
-                    { item.VerifiedState = "Drifted"; item.EvidenceReason = "Live task target or arguments contradict managed intent"; continue; }
+                    if (expected.Count == 1)
+                    {
+                        // Quiet intent stores user arguments; the generated task action may add a
+                        // native tray switch (OpenSpeedy is the real regression). Compare the
+                        // canonical persistent forms, never the derived presentation argument.
+                        if (!ManagedIntentMatches(expected[0], target, targetArguments))
+                        { item.VerifiedState = "Drifted"; item.EvidenceReason = "Live task target or arguments contradict managed intent"; continue; }
+                    }
                     bool activeTrigger = false;
                     for (int i = 1; i <= (int)definition.Triggers.Count; i++)
                     {
@@ -1763,7 +1784,9 @@ namespace MichStartupMaster
                     bool enabled = Convert.ToBoolean(task.Enabled) && activeTrigger;
                     if (enabled != item.Enabled) { item.VerifiedState = "Drifted"; item.EvidenceReason = "Task enabled flag or applicable logon trigger contradicts inventory"; continue; }
                     item.VerifiedState = RegistrationVerdict(true, true, true, true, item.Enabled, enabled);
-                    item.EvidenceReason = "Fresh exact task action, target, arguments and applicable startup trigger readback; execution at next sign-in remains unverified";
+                    item.EvidenceReason = targetProbeAllowed
+                        ? "Fresh exact task action, target, arguments and applicable startup trigger readback; execution at next sign-in remains unverified"
+                        : "Fresh exact task action, arguments, enabled flag and applicable startup trigger readback; target availability outside the local system volume was not synchronously probed";
                 }
                 catch (Exception ex) { item.VerifiedState = "Unknown"; item.EvidenceReason = "Readback unavailable: " + ex.GetBaseException().Message; }
             }
@@ -3287,6 +3310,44 @@ namespace MichStartupMaster
             var scriptProjection = new StartupItem { Id = "wmi|script-fixture", Name = scriptNative.Name, Source = "Startup Command", Scope = scriptNative.Scope, Command = scriptNative.Command, Location = "HKU", Enabled = true };
             require(Dedupe(new List<StartupItem> { scriptNative, scriptProjection }).Count == 1, "an exact PATH-resolved Win32_StartupCommand projection must collapse into its native Run registration");
 
+            string payloadFixtureRoot = Path.Combine(Path.GetTempPath(), "MichStartupMaster-test-payload-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(payloadFixtureRoot);
+            try
+            {
+                string fallbackScript = Path.Combine(payloadFixtureRoot, "openspeedy-silent.vbs");
+                string primaryPayload = @"F:\study\Platforms\windows\installed\OpenSpeedy\Speedy.exe";
+                string fallbackPayload = @"F:\backup\windowsapps\installed\OpenSpeedy\Speedy.exe";
+                File.WriteAllText(fallbackScript,
+                    "target = \"" + primaryPayload + "\"\r\n"
+                    + "If Not fso.FileExists(target) Then target = \"" + fallbackPayload + "\"\r\n"
+                    + "shell.Run Quote(target), 0, False\r\n", new UTF8Encoding(false));
+                var openSpeedyWrapper = new StartupItem
+                {
+                    Id = @"task|\OpenSpeedy_Tray", Name = "OpenSpeedy_Tray", Source = "Scheduled Task", Scope = "User",
+                    Command = "\"" + Path.Combine(Environment.SystemDirectory, "wscript.exe") + "\" \"" + fallbackScript + "\"", Location = @"\OpenSpeedy_Tray", Enabled = true
+                };
+                List<string> fallbackPayloads = ApplicationPayloadCandidates(openSpeedyWrapper);
+                require(fallbackPayloads.Count == 2 && fallbackPayloads.Contains(primaryPayload, StringComparer.OrdinalIgnoreCase) && fallbackPayloads.Contains(fallbackPayload, StringComparer.OrdinalIgnoreCase), "a script-hosted startup route must expose every exact executable fallback without becoming multiple physical routes");
+                require(string.Equals(SelectObservedApplicationTarget(fallbackPayloads, new[] { fallbackPayload }), fallbackPayload, StringComparison.OrdinalIgnoreCase), "live exact-path evidence must select the executable fallback that is actually running");
+                require(FriendlyNameForPayload(openSpeedyWrapper, fallbackPayload) == "OpenSpeedy", "wrapper/task noise must not hide the real OpenSpeedy application name");
+
+                string trayScript = Path.Combine(payloadFixtureRoot, "trayquiet-start.vbs");
+                File.WriteAllText(trayScript, "' fixture launcher", new UTF8Encoding(false));
+                var directWrapper = new StartupItem { Id = @"task|\Direct", Name = "CustomStartup_OpenSpeedy_fixture", Source = "Scheduled Task", Command = "\"" + Path.Combine(Environment.SystemDirectory, "wscript.exe") + "\" //B //NoLogo \"" + trayScript + "\" \"" + fallbackPayload + "\" 120", Location = @"\Direct", Enabled = true };
+                List<string> directPayloads = ApplicationPayloadCandidates(directWrapper);
+                require(directPayloads.Count == 1 && string.Equals(directPayloads[0], fallbackPayload, StringComparison.OrdinalIgnoreCase), "an executable passed to a generic script host must become the application identity instead of wscript.exe");
+                openSpeedyWrapper.ApplicationTargets = fallbackPayloads.ToArray();
+                SetPortableApplicationIdentity(openSpeedyWrapper, primaryPayload, "fixture fallback");
+                directWrapper.ApplicationTargets = directPayloads.ToArray();
+                SetPortableApplicationIdentity(directWrapper, fallbackPayload, "fixture direct");
+                CorrelateFallbackApplicationIdentities(new[] { openSpeedyWrapper, directWrapper });
+                require(string.Equals(openSpeedyWrapper.ApplicationIdentity, directWrapper.ApplicationIdentity, StringComparison.OrdinalIgnoreCase), "a fallback wrapper and a direct route to one of its exact candidates must group as one app before the process starts");
+                string unrelatedPayload = @"C:\Apps\Unrelated\Other.exe";
+                var unrelatedWrapper = new StartupItem { Id = @"task|\Unrelated", Name = "Unrelated", Source = "Scheduled Task", Command = "\"" + Path.Combine(Environment.SystemDirectory, "wscript.exe") + "\" //B \"" + trayScript + "\" \"" + unrelatedPayload + "\"", Location = @"\Unrelated", Enabled = true };
+                require(!ApplicationPayloadCandidates(unrelatedWrapper).Contains(fallbackPayload, StringComparer.OrdinalIgnoreCase), "two unrelated wscript routes must never merge merely because they share the same host or helper script");
+            }
+            finally { try { Directory.Delete(payloadFixtureRoot, true); } catch { } }
+
             var task = new StartupItem { Id = @"task|\Fixture", Name = "Fixture", Source = "Scheduled Task", Scope = "User/System", Command = native.Command, Location = @"\Fixture", Enabled = true };
             var independent = Dedupe(new List<StartupItem> { native, task });
             require(independent.Count == 2, "independent active Run and task registrations must remain independently controllable");
@@ -3775,7 +3836,12 @@ namespace MichStartupMaster
             items.AddRange(ownershipWarnings);
             foreach (var item in items)
             {
-                InstalledProductPrefix owner = InstalledProductForItem(item, installedProducts);
+                List<string> payloads = ApplicationPayloadCandidates(item);
+                item.ApplicationTargets = payloads.ToArray();
+                string applicationTarget = payloads.FirstOrDefault() ?? "";
+                InstalledProductPrefix owner = !string.IsNullOrWhiteSpace(applicationTarget)
+                    ? InstalledProductForTarget(applicationTarget, installedProducts)
+                    : InstalledProductForItem(item, installedProducts);
                 if (owner != null)
                 {
                     string root = NormalizeApplicationRoot(owner.Root);
@@ -3789,8 +3855,50 @@ namespace MichStartupMaster
                         if (!string.IsNullOrWhiteSpace(owner.DisplayName)) item.AppName = owner.DisplayName.Trim();
                     }
                 }
+                else if (!string.IsNullOrWhiteSpace(applicationTarget))
+                {
+                    SetPortableApplicationIdentity(item, applicationTarget,
+                        payloads.Count > 1
+                            ? "Startup launcher exposes " + payloads.Count + " exact executable candidates; current runtime evidence selects the active fallback when present"
+                            : "Startup registration resolves to this exact executable payload");
+                    if (string.IsNullOrWhiteSpace(item.AppName)) item.AppName = FriendlyNameForPayload(item, applicationTarget);
+                }
                 if (string.IsNullOrWhiteSpace(item.AppName)) item.AppName = FriendlyNameFor(item);
             }
+            CorrelateFallbackApplicationIdentities(items);
+        }
+
+        private static void CorrelateFallbackApplicationIdentities(IEnumerable<StartupItem> items)
+        {
+            var list = (items ?? Enumerable.Empty<StartupItem>()).Where(item => item != null).ToList();
+            var exact = new Dictionary<string, StartupItem>(StringComparer.OrdinalIgnoreCase);
+            foreach (StartupItem item in list.Where(item => item.ApplicationTargets != null && item.ApplicationTargets.Length == 1 && !string.IsNullOrWhiteSpace(item.ApplicationIdentity)))
+            {
+                string target = NormalizeObservedPath(item.ApplicationTargets[0]);
+                if (!string.IsNullOrWhiteSpace(target) && !exact.ContainsKey(target)) exact[target] = item;
+            }
+            foreach (StartupItem item in list.Where(item => item.ApplicationTargets != null && item.ApplicationTargets.Length > 1))
+            {
+                StartupItem owner = null;
+                foreach (string candidate in item.ApplicationTargets)
+                {
+                    if (exact.TryGetValue(NormalizeObservedPath(candidate), out owner)) break;
+                }
+                if (owner == null) continue;
+                item.ApplicationIdentity = owner.ApplicationIdentity;
+                item.ApplicationRoot = owner.ApplicationRoot;
+                item.ApplicationIdentityReason = "Fallback launcher shares an exact executable candidate with route " + (owner.Id ?? owner.Location ?? owner.Name) + ": " + item.ApplicationTargets.First(candidate => string.Equals(NormalizeObservedPath(candidate), NormalizeObservedPath(owner.ApplicationTargets[0]), StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        private static void SetPortableApplicationIdentity(StartupItem item, string target, string reason)
+        {
+            if (item == null) return;
+            string normalized = NormalizeObservedPath(target);
+            if (string.IsNullOrWhiteSpace(normalized)) return;
+            item.ApplicationIdentity = "path:" + normalized.ToLowerInvariant();
+            try { item.ApplicationRoot = NormalizeApplicationRoot(Path.GetDirectoryName(normalized)); } catch { item.ApplicationRoot = ""; }
+            item.ApplicationIdentityReason = reason + ": " + normalized;
         }
 
         private static string NormalizeApplicationRoot(string value)
@@ -3834,6 +3942,18 @@ namespace MichStartupMaster
                         TrySplitCommand(item.Command ?? "", out target, out arguments);
                 }
                 catch { }
+                List<string> payloads = (item.ApplicationTargets ?? new string[0]).Where(value => !string.IsNullOrWhiteSpace(value)).ToList();
+                if (payloads.Count == 0) payloads = ApplicationPayloadCandidates(item);
+                string observedPayload = SelectObservedApplicationTarget(payloads, processPaths.Select(process => process.Path));
+                if (!string.IsNullOrWhiteSpace(observedPayload))
+                {
+                    target = observedPayload;
+                    if (!(item.ApplicationIdentity ?? "").StartsWith("installed-product:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        SetPortableApplicationIdentity(item, observedPayload, "Live exact-path correlation selected the active executable behind this startup launcher");
+                        item.AppName = FriendlyNameForPayload(item, observedPayload);
+                    }
+                }
                 string exactPath = NormalizeObservedPath(target);
                 var exact = string.IsNullOrWhiteSpace(exactPath)
                     ? new List<NativeProcessInfo>()
@@ -3849,6 +3969,17 @@ namespace MichStartupMaster
             }
         }
 
+        private static string SelectObservedApplicationTarget(IEnumerable<string> candidates, IEnumerable<string> observedPaths)
+        {
+            var observed = new HashSet<string>((observedPaths ?? Enumerable.Empty<string>()).Select(NormalizeObservedPath).Where(value => !string.IsNullOrWhiteSpace(value)), StringComparer.OrdinalIgnoreCase);
+            foreach (string candidate in candidates ?? Enumerable.Empty<string>())
+            {
+                string normalized = NormalizeObservedPath(candidate);
+                if (!string.IsNullOrWhiteSpace(normalized) && observed.Contains(normalized)) return normalized;
+            }
+            return "";
+        }
+
         private static string NormalizeObservedPath(string value)
         {
             try
@@ -3859,15 +3990,24 @@ namespace MichStartupMaster
             catch { return ""; }
         }
 
+        internal static bool HasConcreteUserApplicationTarget(StartupItem item)
+        {
+            if (item == null) return false;
+            if ((item.ApplicationIdentity ?? "").StartsWith("installed-product:", StringComparison.OrdinalIgnoreCase)) return true;
+            if (!(item.ApplicationIdentity ?? "").StartsWith("path:", StringComparison.OrdinalIgnoreCase)) return false;
+            string root = NormalizeObservedPath(item.ApplicationRoot);
+            string windows = NormalizeObservedPath(Environment.GetFolderPath(Environment.SpecialFolder.Windows));
+            return !string.IsNullOrWhiteSpace(root) && (string.IsNullOrWhiteSpace(windows)
+                || (!root.Equals(windows, StringComparison.OrdinalIgnoreCase) && !root.StartsWith(windows + @"\", StringComparison.OrdinalIgnoreCase)));
+        }
+
         private static string FriendlyNameFor(StartupItem item)
         {
             if (item == null) return "";
             string target, args;
             if (TryFriendlyTarget(item, out target, out args))
             {
-                string fromFile = FriendlyNameFromFile(target);
-                if (!string.IsNullOrWhiteSpace(fromFile)) return fromFile;
-                return CleanName(SafeFileStem(target));
+                return FriendlyNameForPayload(item, target);
             }
             string cleaned = CleanName(item.Name);
             if (!string.IsNullOrWhiteSpace(cleaned)) return cleaned;
@@ -3885,10 +4025,114 @@ namespace MichStartupMaster
                     if (!string.IsNullOrWhiteSpace(target)) return true;
                 }
                 if (TryDecodeTrayPayload(item.Command ?? "", out target, out args)) return true;
-                if (TrySplitCommand(ExpandPathTokens(item.Command ?? ""), out target, out args)) return true;
+                List<string> payloads = ApplicationPayloadCandidates(item);
+                if (payloads.Count > 0) { target = payloads[0]; return true; }
+                if (TrySplitCommand(ExpandCommandTokens(item.Command ?? ""), out target, out args)) return true;
             }
             catch { }
             return false;
+        }
+
+        private static string FriendlyNameForPayload(StartupItem item, string target)
+        {
+            string fromFile = FriendlyNameFromFile(target);
+            if (!string.IsNullOrWhiteSpace(fromFile)) return fromFile;
+            string route = CleanName(item == null ? "" : item.Name);
+            route = Regex.Replace(route, @"(?i)^MichStartupMaster[\\/\s]+", "");
+            route = Regex.Replace(route, @"(?i)^CustomStartup\s+", "");
+            route = Regex.Replace(route, @"(?i)\b(startup|autostart|tray|silent|launcher|boot)\b", " ");
+            route = Regex.Replace(route, @"\s+", " ").Trim();
+            if (!string.IsNullOrWhiteSpace(route)) return route;
+            try
+            {
+                string directory = Path.GetDirectoryName(target);
+                string parent = string.IsNullOrWhiteSpace(directory) ? "" : new DirectoryInfo(directory).Name;
+                if (!string.IsNullOrWhiteSpace(parent) && !Regex.IsMatch(parent, @"(?i)^(application|app|bin|x64|x86|win32|win64)$")) return CleanName(parent);
+            }
+            catch { }
+            return CleanName(SafeFileStem(target));
+        }
+
+        private static List<string> ApplicationPayloadCandidates(StartupItem item)
+        {
+            var payloads = new List<string>();
+            if (item == null) return payloads;
+            string target = "", arguments = "";
+            try
+            {
+                if (item.Source == "Startup Folder" && (item.Command ?? "").EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+                    ResolveShortcut(item.Command, out target, out arguments);
+                if (string.IsNullOrWhiteSpace(target) && !TryDecodeTrayPayload(item.Command ?? "", out target, out arguments))
+                    TrySplitCommand(ExpandCommandTokens(item.Command ?? ""), out target, out arguments);
+            }
+            catch { }
+
+            if (!string.IsNullOrWhiteSpace(target) && !IsGenericApplicationLauncher(target)) AddApplicationPayload(payloads, target);
+            foreach (string candidate in ExtractLiteralPaths(arguments)) AddApplicationPayload(payloads, candidate);
+
+            var scripts = new List<string>();
+            if (IsScriptPath(target)) scripts.Add(target);
+            scripts.AddRange(ExtractLiteralPaths(arguments).Where(IsScriptPath));
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string script in scripts) AddScriptPayloadCandidates(script, payloads, visited, 0);
+            return payloads.Take(32).ToList();
+        }
+
+        private static bool IsGenericApplicationLauncher(string value)
+        {
+            string file;
+            try { file = Path.GetFileName((value ?? "").Trim().Trim('"')); } catch { file = value ?? ""; }
+            return Regex.IsMatch(file, @"(?i)^(wscript|cscript|powershell|pwsh|cmd|python|pythonw|rundll32|mshta)\.exe$") || IsScriptPath(value);
+        }
+
+        private static bool IsScriptPath(string value)
+        {
+            string extension;
+            try { extension = Path.GetExtension((value ?? "").Trim().Trim('"')); } catch { return false; }
+            return Regex.IsMatch(extension, @"(?i)^\.(ps1|cmd|bat|vbs|vbe|js|jse|wsf|wsh|py|pyw)$");
+        }
+
+        private static bool IsApplicationExecutablePath(string value)
+        {
+            string extension;
+            try { extension = Path.GetExtension((value ?? "").Trim().Trim('"')); } catch { return false; }
+            return Regex.IsMatch(extension, @"(?i)^\.(exe|com|lnk|appref-ms)$");
+        }
+
+        private static void AddApplicationPayload(List<string> payloads, string value)
+        {
+            if (payloads == null || payloads.Count >= 32 || !IsApplicationExecutablePath(value)) return;
+            string normalized = NormalizeObservedPath(ExpandPathTokens((value ?? "").Trim().Trim('"', '\'', ' ', '\t')));
+            if (string.IsNullOrWhiteSpace(normalized) || payloads.Contains(normalized, StringComparer.OrdinalIgnoreCase)) return;
+            payloads.Add(normalized);
+        }
+
+        private static IEnumerable<string> ExtractLiteralPaths(string value)
+        {
+            var result = new List<string>();
+            string text = value ?? "";
+            foreach (Match match in Regex.Matches(text, @"(?<quote>[\""'])(?<path>(?:[A-Za-z]:\\|%[^%\r\n]+%\\)[^\""'\r\n]{1,1024}?\.(?:exe|com|lnk|appref-ms|ps1|cmd|bat|vbs|vbe|js|jse|wsf|wsh|py|pyw))\k<quote>", RegexOptions.IgnoreCase))
+                result.Add(match.Groups["path"].Value);
+            foreach (Match match in Regex.Matches(text, @"(?<![A-Za-z0-9_])(?<path>[A-Za-z]:\\[^\""'\r\n\t]{1,1024}?\.(?:exe|com|lnk|appref-ms|ps1|cmd|bat|vbs|vbe|js|jse|wsf|wsh|py|pyw))(?=\s|$)", RegexOptions.IgnoreCase))
+                result.Add(match.Groups["path"].Value.Trim());
+            return result.Distinct(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static void AddScriptPayloadCandidates(string scriptPath, List<string> payloads, HashSet<string> visited, int depth)
+        {
+            if (depth > 3 || payloads.Count >= 32) return;
+            string script = NormalizeObservedPath(ExpandPathTokens(scriptPath));
+            if (string.IsNullOrWhiteSpace(script) || !visited.Add(script) || !IsSafeSystemVolumeFileProbe(script)) return;
+            try
+            {
+                var info = new FileInfo(script);
+                if (!info.Exists || info.Length > 1024 * 1024) return;
+                string source = File.ReadAllText(script);
+                List<string> literals = ExtractLiteralPaths(source).ToList();
+                foreach (string candidate in literals) AddApplicationPayload(payloads, candidate);
+                foreach (string nested in literals.Where(IsScriptPath)) AddScriptPayloadCandidates(nested, payloads, visited, depth + 1);
+            }
+            catch { }
         }
 
         private static string FriendlyNameFromFile(string path)
@@ -3920,6 +4164,14 @@ namespace MichStartupMaster
         {
             if (string.IsNullOrWhiteSpace(value)) return "";
             return Environment.ExpandEnvironmentVariables(value.Trim('"'));
+        }
+
+        private static string ExpandCommandTokens(string value)
+        {
+            // Command quoting is syntax, not decoration.  Trimming the first/last quote before
+            // parsing turns `"host.exe" "payload.vbs"` into a malformed command and was the
+            // direct cause of script-hosted applications disappearing from Apps.
+            return string.IsNullOrWhiteSpace(value) ? "" : Environment.ExpandEnvironmentVariables(value.Trim());
         }
 
         // The app's primary job is to make every configured route visible. A removable or
@@ -13440,6 +13692,18 @@ namespace MichStartupMaster
                 .Where(identity => !string.IsNullOrWhiteSpace(identity))
                 .GroupBy(identity => identity, StringComparer.OrdinalIgnoreCase)
                 .Count(group => group.Count() > 1);
+            var liveProcessPaths = new HashSet<string>(NativeProcessCatalog.Snapshot().Select(process => NormalizeLiveVerificationPath(process.ExecutablePath)).Where(path => !string.IsNullOrWhiteSpace(path)), StringComparer.OrdinalIgnoreCase);
+            int launcherPayloadRoutes = 0, runningLauncherPayloadRoutes = 0, runningLauncherPayloadMismatches = 0;
+            foreach (StartupItem item in scanned.Where(item => item != null && item.ApplicationTargets != null && item.ApplicationTargets.Length > 0))
+            {
+                launcherPayloadRoutes++;
+                string runningPayload = item.ApplicationTargets.Select(NormalizeLiveVerificationPath).FirstOrDefault(path => liveProcessPaths.Contains(path));
+                if (string.IsNullOrWhiteSpace(runningPayload)) continue;
+                runningLauncherPayloadRoutes++;
+                bool identityMatches = (item.ApplicationIdentity ?? "").StartsWith("installed-product:", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(item.ApplicationIdentity ?? "", "path:" + runningPayload.ToLowerInvariant(), StringComparison.OrdinalIgnoreCase);
+                if (!identityMatches || (item.RuntimeEvidence ?? "").IndexOf("exact target running pid=", StringComparison.OrdinalIgnoreCase) < 0) runningLauncherPayloadMismatches++;
+            }
             int rendered = 0, missing = 0, unexpected = 0, duplicateRenderedIds = 0, aggregateRows = 0, searchMissing = 0, appRoutes = 0, appsMissing = 0;
             string firstSearchMissing = "";
             string firstAppsMissing = "";
@@ -13505,6 +13769,7 @@ namespace MichStartupMaster
                 && Regex.IsMatch(boot ?? "", @"(?:^|\s)errors=0(?:\s|$)");
             bool passed = scanned.Count > 0 && invalid == 0 && providerErrors == 0 && duplicateInventoryIds == 0 && duplicateSharedUserRegistryRoutes == 0
                 && rendered == scanned.Count && aggregateRows == 0 && missing == 0 && unexpected == 0 && duplicateRenderedIds == 0 && searchMissing == 0 && appsMissing == 0 && bootClean;
+            passed = passed && runningLauncherPayloadMismatches == 0;
             receipt = "LIVE_INVENTORY_VERIFY passed=" + passed.ToString().ToLowerInvariant()
                 + " scanned=" + scanned.Count + " rendered=" + rendered + " invalid=" + invalid
                 + " provider_errors=" + providerErrors + " duplicate_inventory_ids=" + duplicateInventoryIds
@@ -13512,10 +13777,22 @@ namespace MichStartupMaster
                 + " duplicate_rendered_ids=" + duplicateRenderedIds + " aggregate_rows=" + aggregateRows
                 + " missing=" + missing + " unexpected=" + unexpected + " search_missing=" + searchMissing
                 + " app_routes=" + appRoutes + " apps_missing=" + appsMissing
+                + " launcher_payload_routes=" + launcherPayloadRoutes + " running_launcher_payload_routes=" + runningLauncherPayloadRoutes
+                + " running_launcher_payload_mismatches=" + runningLauncherPayloadMismatches
                 + (firstSearchMissing.Length == 0 ? "" : " first_search_missing=" + firstSearchMissing)
                 + (firstAppsMissing.Length == 0 ? "" : " first_apps_missing=" + firstAppsMissing)
                 + " boot_audit_clean=" + bootClean.ToString().ToLowerInvariant();
             return passed;
+        }
+
+        private static string NormalizeLiveVerificationPath(string value)
+        {
+            try
+            {
+                string path = Environment.ExpandEnvironmentVariables((value ?? "").Trim().Trim('"'));
+                return string.IsNullOrWhiteSpace(path) || !Path.IsPathRooted(path) ? "" : Path.GetFullPath(path).TrimEnd('\\');
+            }
+            catch { return ""; }
         }
 
         public static MainForm CreatePreview(float scale)
@@ -14628,10 +14905,15 @@ namespace MichStartupMaster
         private static string StatusTextForRow(InventoryRow row)
         {
             if (row.EffectiveEnabled) return row.AllEnabled ? "● Enabled" : "● Enabled · mixed routes";
-            if (row.AllDisabled) return "○ Disabled";
+            if (row.AllDisabled) return row.Routes.Any(RouteRunningNow) ? "○ Disabled · running now" : "○ Disabled";
             if (row.Routes.Any(x => x.StateText() == "Drifted")) return "Drifted";
             if (row.Routes.Any(x => x.StateText() == "Unknown")) return "Unknown";
             return "◐ Mixed";
+        }
+
+        private static bool RouteRunningNow(StartupItem item)
+        {
+            return item != null && (item.RuntimeEvidence ?? "").IndexOf("exact target running pid=", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static int StatusSortRank(InventoryRow row)
@@ -14768,6 +15050,10 @@ namespace MichStartupMaster
         {
             if (item == null || (item.Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase)) return false;
             string source = item.Source ?? "";
+            // Any exact non-Windows executable payload is an application route regardless of
+            // which Windows authority launches it.  This covers portable apps behind WSH,
+            // PowerShell/cmd/Python wrappers, Group Policy, WMI consumers, and user services.
+            if (StartupService.HasConcreteUserApplicationTarget(item)) return true;
             // An automatic service under a registered install root is an application-owned
             // startup route (LGHUB is a real example). Product ownership is backed by an exact
             // executable path and is never inferred from a coincidentally similar display name.

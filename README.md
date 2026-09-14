@@ -1,13 +1,13 @@
-# Mich Startup Master 2.0
+# Mich Startup Master 2.2
 
-Mich Startup Master is a native Windows 11 control center for seeing and managing what starts with Windows. Version 2.1 separates two questions that startup tools often blur together:
+Mich Startup Master is a native Windows 11 control center for seeing and managing what starts with Windows. Version 2.2 separates two questions that startup tools often blur together:
 
 - **State:** should this registration run at boot/sign-in?
 - **Mode:** should the app open a normal window, or start quietly and stay available in the system tray?
 
-The default view is **All routes**: every discovered Windows startup registration is visible immediately, exactly once per registration. Opening the dashboard from its tray icon or using **Clear filters** also resets to that complete route-level view and clears stale search/drill-down state. **Apps** is an optional summary view; it groups exact routes by a proven installed-product path owner (falling back to the canonical launch target), includes app-owned automatic services such as Logitech G HUB's updater, and can enable or disable every matching route for one app in a single rollback-safe transaction. Display-name similarity is never treated as ownership evidence.
+The default view is **All routes**: every discovered Windows startup registration is visible immediately, exactly once per registration. Opening the dashboard from its tray icon or using **Clear filters** also resets to that complete route-level view and clears stale search/drill-down state. **Apps** is an optional summary view; it groups exact routes by a proven installed-product path owner or the real executable behind a launcher, includes app-owned automatic services such as Logitech G HUB's updater, and can enable or disable every matching route for one app in a single rollback-safe transaction. Display-name similarity is never treated as ownership evidence.
 
-## What changed in 2.0
+## What changed in 2.2
 
 - Responsive, high-DPI WinForms UI with a compact header, search, four focused filters, contextual actions, keyboard access, accessible names, and explicit loading/empty/error states.
 - Separate **Enabled/Disabled** and **Window/Quiet (tray)** columns and controls.
@@ -15,6 +15,8 @@ The default view is **All routes**: every discovered Windows startup registratio
 - **Refresh is read-only.** Repair and protection are explicit Tools actions.
 - Exact repeated adds reuse one canonical managed route. The complete inspect/choose/write operation is protected by one cross-process transaction, so simultaneous adds also converge on one route. The boot agent transactionally retires exact duplicates and disabled `Launcher`/`Launch` aliases, including their saved quiet/enabled intent, so they cannot reappear after reboot.
 - The **Apps** tab exposes **Disable all** and **Enable all** for an app with multiple routes. Every route is authorized before the first write; if any route fails, all earlier routes and intent stores are restored.
+- Script-hosted startup routes (`wscript`, `cscript`, PowerShell, cmd, and Python) resolve bounded, literal executable payloads instead of being grouped under the generic host. Multi-path fallback wrappers use exact live-process correlation to select the active executable while retaining one physical registration and one mutation.
+- A disabled registration whose exact payload is still running is shown as **Disabled · running now**, keeping current runtime observation separate from next-boot configuration.
 - StartupApproved metadata is overlaid on its real registry/Startup-folder/Windows startup-command row instead of appearing as a contradictory duplicate. An enabled approval is never hidden even when Windows withholds its launch command.
 - An independent boot audit checks the displayed inventory against separate Windows enumerators.
 - State stores use cross-process locking and atomic replacement.
@@ -40,7 +42,7 @@ The inventory covers the Windows startup surfaces used by this project, includin
 
 `--audit-boot` performs a second enumeration and reports `gaps` and provider `errors`. Quiet coverage separately reports expected apps, running apps, findings, and uncertain tray detection. A clean result requires independent enumeration, `gaps=0`, `errors=0`, `apps=running`, `findings=0`, and `uncertain=0`.
 
-`--verify-live-inventory` is the release check for the visible dashboard: it scans Windows, renders the default **All routes** view, and fails if a row is missing, duplicated, aggregated, invalid, cannot be found by searching its own displayed name, or is contradicted by the independent boot audit.
+`--verify-live-inventory` is the release check for the visible dashboard: it scans Windows, renders the default **All routes** view, and fails if a row is missing, duplicated, aggregated, invalid, cannot be found by searching its own displayed name, is contradicted by the independent boot audit, or a running launcher payload does not correlate to the application identity shown in **Apps**.
 
 Inventory never synchronously probes file metadata on a removable, network, or other non-system volume. Those routes remain visible with their full configured command; task availability is reported as **Unknown** until the storage is responsive instead of freezing the dashboard or declaring the app missing.
 
