@@ -501,7 +501,7 @@ function Assert-StagedBehavior {
     $probes = @()
 
     $version = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--version' -TimeoutMilliseconds 30000
-    if ($version.Stdout -notmatch '^MichStartupMaster 2\.2\.1$') { throw "Unexpected staged version receipt: $($version.Stdout)" }
+    if ($version.Stdout -notmatch '^MichStartupMaster 2\.4\.0$') { throw "Unexpected staged version receipt: $($version.Stdout)" }
     $probes += $version
 
     $state = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--state-store-self-test'
@@ -509,7 +509,7 @@ function Assert-StagedBehavior {
     $probes += $state
 
     $truth = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--truth-self-test'
-    if ($truth.Stdout.Trim() -ne 'TRUTH_SELF_TEST checks=12 passed=12 codex=unverified contradictions=drifted missing=unknown') { throw "Startup truth gate failed: $($truth.Stdout)" }
+    if ($truth.Stdout.Trim() -ne 'TRUTH_SELF_TEST checks=13 passed=13 codex=unverified contradictions=drifted missing=unknown') { throw "Startup truth gate failed: $($truth.Stdout)" }
     $probes += $truth
 
     $inventory = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--inventory-self-test'
@@ -643,8 +643,10 @@ function Assert-StagedBehavior {
 
     $uiContract = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--ui-contract'
     try { $uiJson = $uiContract.Stdout | ConvertFrom-Json -ErrorAction Stop } catch { throw "UI-contract behavior gate is not JSON: $($uiContract.Stdout)" }
-    if ($uiJson.layout -ne 'responsive-native-control-center' -or $uiJson.defaultFilter -ne 'All routes' -or
-        $uiJson.defaultViewIsCompleteRouteInventory -ne $true -or $uiJson.stateModeSeparated -ne $true -or
+    if ($uiJson.layout -ne 'responsive-native-control-center' -or $uiJson.defaultFilter -ne 'Apps' -or
+        $uiJson.defaultViewIsAppsAggregated -ne $true -or $uiJson.stateModeSeparated -ne $true -or
+        $uiJson.scrollPositionPreservedOnRefresh -ne $true -or $uiJson.cliFullControl -ne $true -or
+        $uiJson.cliEveryGuiActionAvailable -ne $true -or $uiJson.cliGuiRealtimeSync -ne $true -or
         $uiJson.startInTrayPrePaintSuppression -ne $true -or $uiJson.refreshIsReadOnly -ne $true -or
         $uiJson.defaultNewMode -ne 'Window' -or $uiJson.appsAggregatedByInstalledProductOrCanonicalTarget -ne $true -or
         $uiJson.appsNeverAggregatedByDisplayName -ne $true -or $uiJson.allRoutesRemainRouteLevel -ne $true -or
@@ -653,7 +655,9 @@ function Assert-StagedBehavior {
         $uiJson.capabilityAwareActions -ne $true -or $uiJson.expertBootChangeConfirmation -ne $true -or
         $uiJson.elevationAndRebootReasons -ne $true -or $uiJson.externalAuthorityState -ne $true -or
         $uiJson.multiActionTasksDisableEditQuietAndRun -ne $true -or
-        @($uiJson.columns) -notcontains 'Status' -or @($uiJson.columns) -notcontains 'Mode') {
+        @($uiJson.columns) -notcontains 'Status' -or @($uiJson.columns) -notcontains 'Mode' -or
+        @($uiJson.filters) -notcontains 'Apps' -or @($uiJson.filters) -notcontains 'Enabled' -or @($uiJson.filters) -notcontains 'Disabled' -or
+        @($uiJson.filters) -contains 'All routes' -or @($uiJson.filters) -contains 'Important' -or @($uiJson.filters) -contains 'Needs attention') {
         throw "UI-contract behavior gate fields failed: $($uiContract.Stdout)"
     }
     $probes += $uiContract

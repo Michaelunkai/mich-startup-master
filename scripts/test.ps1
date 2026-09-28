@@ -1730,6 +1730,7 @@ function Assert-UiContract {
   if (-not $contract.refreshIsReadOnly) { throw 'Refresh must be read-only.' }
   if (-not $contract.sortableColumns -or -not $contract.keyboardAccessibleSorting -or $contract.statusInitialSort -ne 'Enabled first' -or -not $contract.repeatedColumnClickReversesSort) { throw 'Every inventory column must sort by mouse or keyboard, with Enabled first on the initial Status click and reversal on repeat.' }
   if (-not $contract.trayPreloadsInventory -or -not $contract.browseDuringRefresh) { throw 'The tray process must preload inventory and keep Apps/search browsing available during read-only refresh.' }
+  if (-not $contract.scriptEntryPointsOwnIdentity -or -not $contract.codexProjectScriptAggregation -or -not $contract.directAppsSeparateFromAutomation) { throw 'Script startup entry points must own their identity, aggregate by their Codex project, and remain separate from direct child-application startup.' }
   if (-not $contract.humanReadableNames -or -not $contract.appsAggregatedByInstalledProductOrCanonicalTarget -or -not $contract.appsNeverAggregatedByDisplayName -or -not $contract.allRoutesRemainRouteLevel) { throw 'The UI must expose readable names, one installed-product app row when ownership is proven, canonical-target fallback rows, and every exact underlying route.' }
   if (-not $contract.aggregateNonBulkActionsFailClosed -or -not $contract.aggregateBulkDisableTransactional -or -not $contract.aggregateBulkEnableTransactional -or -not $contract.aggregateManageRoutesOneClick) { throw 'Aggregate rows must provide transactional bulk enable/disable while every ambiguous non-bulk action fails closed.' }
   if (-not $contract.contextualActions -or -not $contract.globalToolsInMenu) { throw 'Context actions and global tools must be separated.' }
@@ -1749,8 +1750,11 @@ function Assert-UiContract {
   foreach ($mode in @('Window', 'Quiet (tray)', 'Not supported')) {
     if (@($contract.modeLabels) -notcontains $mode) { throw "UI mode missing: $mode" }
   }
-  foreach ($filter in @('Apps', 'All routes', 'Needs attention', 'Disabled')) {
+  foreach ($filter in @('Apps', 'Enabled', 'Disabled')) {
     if (@($contract.filters) -notcontains $filter) { throw "UI filter missing: $filter" }
+  }
+  foreach ($removed in @('All routes', 'Important', 'Needs attention')) {
+    if (@($contract.filters) -contains $removed) { throw "Removed UI filter still present: $removed" }
   }
   foreach ($tool in @('Add startup', 'Edit startup', 'Disable at boot', 'Enable at boot', 'Quiet (tray)', 'Window mode', 'Run now', 'Open location', 'Copy command', 'Verify coverage', 'Repair startup rules')) {
     if (@($contract.tools) -notcontains $tool) { throw "UI tool missing: $tool" }
@@ -1885,7 +1889,7 @@ function Test-QuietLaunchContract {
 
 function Test-SafeProductContracts {
   $truth = Invoke-AppCommand @('--truth-self-test')
-  Assert-Match $truth.Output '^TRUTH_SELF_TEST checks=12 passed=12 codex=unverified contradictions=drifted missing=unknown' 'Startup truth regression failed.'
+  Assert-Match $truth.Output '^TRUTH_SELF_TEST checks=13 passed=13 codex=unverified contradictions=drifted missing=unknown' 'Startup truth regression failed.'
   "PASS startup-truth $($truth.Output.Trim())"
 
   $inventorySelfTest = Invoke-AppCommand @('--inventory-self-test')
@@ -2026,13 +2030,13 @@ function Test-SafeProductContracts {
     $_.source -eq 'Scheduled Task' -and (([string]$_.name + ' ' + [string]$_.appName + ' ' + [string]$_.command) -match '(?i)openspeedy|(?:^|[\\/])speedy\.exe')
   })
   $openSpeedyReceipt = 'OpenSpeedy=absent(optional)'
-  if ($openSpeedyInventory.Count -ne 0) {
+  if (@($openSpeedyInventory | Where-Object { $_.enabled }).Count -ne 0) {
     $openSpeedyDirect = @($openSpeedyInventory | Where-Object {
       $_.enabled -and [string]$_.command -match '(?i)(?:^|[\\/])(?:Open)?Speedy\.exe(?:"|\s|$)' -and
       [string]$_.command -match '(?i)(^|\s)--minimize-to-tray(\s|$)' -and
       [string]$_.command -notmatch '(?i)--tray-run|wscript\.exe|openspeedy-silent\.vbs'
     })
-    if ($openSpeedyDirect.Count -ne 1) { throw "Expected exactly one enabled direct native OpenSpeedy Quiet route when OpenSpeedy is registered, found $($openSpeedyDirect.Count)." }
+    if ($openSpeedyDirect.Count -ne 1) { throw "Expected exactly one enabled direct native OpenSpeedy Quiet route when OpenSpeedy has an enabled registration, found $($openSpeedyDirect.Count). routes=$($openSpeedyInventory | Select-Object name,appName,enabled,command,location,applicationIdentity | ConvertTo-Json -Compress)" }
     $enabledLegacyOpenSpeedy = @($openSpeedyInventory | Where-Object { $_.enabled -and [string]$_.command -match '(?i)--tray-run|wscript\.exe|openspeedy-silent\.vbs' })
     if ($enabledLegacyOpenSpeedy.Count -ne 0) { throw "An enabled legacy/wrapper OpenSpeedy route remains: $($enabledLegacyOpenSpeedy[0].command)" }
     $openSpeedyItem = $openSpeedyDirect[0]
@@ -2043,6 +2047,8 @@ function Test-SafeProductContracts {
       throw "OpenSpeedy must use its direct native tray launch, not a fallback/wrapper: $($openSpeedyItem.command)"
     }
     $openSpeedyReceipt = "OpenSpeedyTask=$openSpeedyTask directNative=true enabledLegacy=0"
+  } elseif ($openSpeedyInventory.Count -ne 0) {
+    $openSpeedyReceipt = 'OpenSpeedy=disabled(optional) enabledLegacy=0'
   }
   "PASS list items=$($items.Count) sources=$(@($items.source | Sort-Object -Unique).Count) uniqueIds=$($items.Count) stableRouteIds=$stableRouteCount physicalDuplicates=0 $openSpeedyReceipt"
 

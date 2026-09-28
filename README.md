@@ -1,6 +1,6 @@
 # Mich Startup Master 2.2
 
-Mich Startup Master is a native Windows 11 control center for seeing and managing what starts with Windows. Version 2.2.1 separates two questions that startup tools often blur together:
+Mich Startup Master is a native Windows 11 control center for seeing and managing what starts with Windows. Version 2.3 separates two questions that startup tools often blur together:
 
 - **State:** should this registration run at boot/sign-in?
 - **Mode:** should the app open a normal window, or start quietly and stay available in the system tray?
@@ -16,6 +16,7 @@ The default view is **All routes**: every discovered Windows startup registratio
 - Exact repeated adds reuse one canonical managed route. The complete inspect/choose/write operation is protected by one cross-process transaction, so simultaneous adds also converge on one route. The boot agent transactionally retires exact duplicates and disabled `Launcher`/`Launch` aliases, including their saved quiet/enabled intent, so they cannot reappear after reboot.
 - The **Apps** tab exposes **Disable all** and **Enable all** for an app with multiple routes. Every route is authorized before the first write; if any route fails, all earlier routes and intent stores are restored.
 - The tray process preloads the complete inventory before its window is opened. During later read-only refreshes, the last verified snapshot remains searchable and the four view tabs remain usable; all state-changing actions stay locked until the replacement scan finishes.
+- Script-backed startup applications retain the identity of their script or owning Codex project instead of being mislabeled as PowerShell, `cmd.exe`, AutoHotkey, or a temporary child executable. All routes below `%LOCALAPPDATA%\Codex\GameAutoInstall` therefore appear together as **Game Auto Install**, while the direct qBittorrent client remains a separate **qBittorrent** app.
 - Script-hosted startup routes (`wscript`, `cscript`, PowerShell, cmd, and Python) resolve bounded, literal executable payloads instead of being grouped under the generic host. Multi-path fallback wrappers use exact live-process correlation to select the active executable while retaining one physical registration and one mutation.
 - A disabled registration whose exact payload is still running is shown as **Disabled · running now**, keeping current runtime observation separate from next-boot configuration.
 - StartupApproved metadata is overlaid on its real registry/Startup-folder/Windows startup-command row instead of appearing as a contradictory duplicate. An enabled approval is never hidden even when Windows withholds its launch command.
@@ -43,7 +44,7 @@ The inventory covers the Windows startup surfaces used by this project, includin
 
 `--audit-boot` performs a second enumeration and reports `gaps` and provider `errors`. Quiet coverage separately reports expected apps, running apps, findings, and uncertain tray detection. A clean result requires independent enumeration, `gaps=0`, `errors=0`, `apps=running`, `findings=0`, and `uncertain=0`.
 
-`--verify-live-inventory` is the release check for the visible dashboard: it scans Windows, renders the default **All routes** view, and fails if a row is missing, duplicated, aggregated, invalid, cannot be found by searching its own displayed name, is contradicted by the independent boot audit, or a running launcher payload does not correlate to the application identity shown in **Apps**. When Logitech routes exist, the gate additionally proves that both `Logitech` and `LGHUB` searches return every exact route in the expected Apps grouping.
+`--verify-live-inventory` is the release check for the visible dashboard: it scans Windows, renders the default **All routes** view, and fails if a row is missing, duplicated, aggregated, invalid, cannot be found by searching its own displayed name, is contradicted by the independent boot audit, or a running launcher payload does not correlate to the application identity shown in **Apps**. The live gate additionally proves Logitech/LGHUB visibility, Game Auto Install project ownership, direct qBittorrent ownership, and rejects any script application that is still grouped under its interpreter or child payload.
 
 Inventory never synchronously probes file metadata on a removable, network, or other non-system volume. Those routes remain visible with their full configured command; task availability is reported as **Unknown** until the storage is responsive instead of freezing the dashboard or declaring the app missing.
 
@@ -55,11 +56,12 @@ Quiet mode means the app is ready after sign-in without presenting its normal GU
 
 - When an app has a known native tray launch mode, Mich Startup Master uses it directly.
 - OpenSpeedy is normalized to `Speedy.exe --minimize-to-tray`; legacy nested VBS launch chains are removed from the managed route.
+- OpenAI.Codex's `Codex.exe` launcher alias is normalized to the MSIX manifest entry `ChatGPT.exe`, so quiet startup attaches to the single native tray host instead of creating a second launcher/icon.
 - For other apps, the fallback hides only the first startup window batch, and each handle at most once.
 - A window opened manually later is never re-hidden.
 - If the app has no usable native tray entry, a single app-named Startup Master tray controller provides **Open** and **Exit**.
 - Clicking Open while the target is still starting waits for/restores its window; it does not launch a duplicate merely because the window is not ready yet.
-- A short-lived `FooLauncher.exe` handoff is followed only to the deterministic `CustomRuntime\Foo.exe` or sibling `Foo.exe` payload. If that payload is already running, the controller attaches to it instead of invoking the launcher again, and any fallback tray icon comes from the real payload.
+- A short-lived `FooLauncher.exe` handoff is followed only to the deterministic `CustomRuntime\Foo.exe`, `Runtime\Foo.exe`, or sibling `Foo.exe` payload. If that payload is already running, the controller attaches to it instead of invoking the launcher again, and any fallback tray icon comes from the real payload.
 - Process lineage is event-backed, follows fast multi-hop script launchers, and qualifies process generations so a reused PID cannot control an unrelated process.
 
 Managed startup identity is fail-closed: one exact target-and-arguments route has one canonical task. A sole enabled `Foo` route also retires a disabled `FooLauncher`/`FooLaunch` alias, which prevents an old wrapper from later producing a second tray icon. Two differently configured enabled routes for the same logical slot are reported as a conflict and a new third route is refused; the app never guesses which enabled application the user meant to remove.
@@ -81,7 +83,7 @@ The main actions are:
 - **Use Quiet tray / Use Window** — changes startup presentation without conflating it with enabled state.
 - **Run now** — opens the selected app without changing startup configuration.
 - **All routes** — shows services, drivers, logon hooks, policy scripts, and every distinct registration.
-- **Tools** — coverage, explicit repair, explicit disabled-state protection, and Startup-folder access.
+- **Mark and copy any number of routes** — use Control/Shift-click to mark exactly the rows you want, click **Select all visible** (or press `Ctrl+A`) to mark the current tab/search immediately, then press **Copy selected** (or `Ctrl+C`). **Clear selection** starts over without changing a startup setting. Startup-changing controls intentionally lock while more than one row is marked. The Tools menu also offers all-data and visible-data copy actions. Copy output is tab-separated and includes every captured route field—including configured/verified/presentation state, configured command, location, risk, evidence, ownership, mutation metadata, capabilities, and raw StartupApproved metadata—ready to paste into Notepad or Excel.
 
 Machine-wide sources may require an elevated process because Windows protects those registrations.
 
