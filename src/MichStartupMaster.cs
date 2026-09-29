@@ -3220,7 +3220,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             switch (value) { case 0: return "Event"; case 1: return "Time"; case 2: return "Daily"; case 3: return "Weekly"; case 4: return "Monthly"; case 5: return "MonthlyDOW"; case 6: return "Idle"; case 7: return "Registration"; case 8: return "Boot"; case 9: return "Logon"; case 11: return "SessionState"; default: return "Type" + value; }
         }
 
-        private static bool IsStartupTaskTriggerType(int value) { return value == 8 || value == 9; }
+        private static bool IsStartupTaskTriggerType(int value) { return value == 8 || value == 9 || value == 11; }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct ServiceStatusProcess
