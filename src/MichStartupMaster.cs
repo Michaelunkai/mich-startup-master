@@ -2002,6 +2002,14 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     target = Environment.ExpandEnvironmentVariables(target ?? "");
                     normalizedExecute = Environment.ExpandEnvironmentVariables(normalizedExecute ?? "");
                     if (!Path.IsPathRooted(target))
+                    {
+                        try { target = Path.GetFullPath(target); } catch { }
+                    }
+                    if (!Path.IsPathRooted(normalizedExecute))
+                    {
+                        try { normalizedExecute = Path.GetFullPath(normalizedExecute); } catch { }
+                    }
+                    if (!Path.IsPathRooted(target))
                     { item.VerifiedState = "Drifted"; item.EvidenceReason = "Exact registered launcher or target is not an absolute path"; continue; }
                     // Inventory must never synchronously touch a removable, network, or other
                     // non-system volume merely to decorate a dashboard row. Such a target is
@@ -2024,7 +2032,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     for (int i = 1; i <= (int)definition.Triggers.Count; i++)
                     {
                         dynamic trigger = definition.Triggers.Item(i);
-                        if (!(bool)trigger.Enabled || ((int)trigger.Type != 8 && (int)trigger.Type != 9)) continue;
+                        if (!(bool)trigger.Enabled || !IsStartupTaskTriggerType((int)trigger.Type)) continue;
                         activeTrigger = true;
                     }
                     bool enabled = Convert.ToBoolean(task.Enabled) && activeTrigger;
