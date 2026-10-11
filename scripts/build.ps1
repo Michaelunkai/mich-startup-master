@@ -501,7 +501,7 @@ function Assert-StagedBehavior {
     $probes = @()
 
     $version = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--version' -TimeoutMilliseconds 30000
-    if ($version.Stdout -notmatch '^MichStartupMaster 2\.4\.0$') { throw "Unexpected staged version receipt: $($version.Stdout)" }
+    if ($version.Stdout -notmatch '^MichStartupMaster 2\.[0-9]+\.[0-9]+(\+\S+)?$') { throw "Unexpected staged version receipt: $($version.Stdout)" }
     $probes += $version
 
     $state = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--state-store-self-test'

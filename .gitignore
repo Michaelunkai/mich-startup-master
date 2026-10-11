@@ -40,3 +40,5 @@ secrets.*
 Thumbs.db
 .vscode/
 .idea/
+artifacts/*.tsv
+artifacts/*.json

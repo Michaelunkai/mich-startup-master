@@ -1850,6 +1850,39 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             return "Group Policy authority";
         }
 
+        // A disabled record preserves one physical registration that was removed to disable it.
+        // When that exact value exists live again (a vendor installer or updater re-created it),
+        // the live registration is what Windows will actually run: keeping the stale record would
+        // display one physical value twice — once enabled and once disabled — and could steer the
+        // next mutation at the wrong row. The live row is authoritative; retire the stale record
+        // exactly once, transactionally, so the inventory never lies and never duplicates.
+        private static List<StartupItem> RetireDisabledRecordsMatchingLiveRoutes(List<StartupItem> liveItems, List<StartupItem> disabledItems)
+        {
+            if (liveItems == null || liveItems.Count == 0 || disabledItems == null || disabledItems.Count == 0) return disabledItems;
+            var liveIdentities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (StartupItem live in liveItems)
+            {
+                string identity = SharedUserRegistryPhysicalIdentity(live);
+                if (!string.IsNullOrWhiteSpace(identity)) liveIdentities.Add(identity);
+            }
+            if (liveIdentities.Count == 0) return disabledItems;
+            var stale = new List<string>();
+            var kept = new List<StartupItem>();
+            foreach (StartupItem disabled in disabledItems)
+            {
+                string identity = SharedUserRegistryPhysicalIdentity(disabled);
+                if (!string.IsNullOrWhiteSpace(identity) && liveIdentities.Contains(identity)) stale.Add(disabled.Id ?? "");
+                else kept.Add(disabled);
+            }
+            if (stale.Count == 0) return disabledItems;
+            foreach (string id in stale)
+            {
+                try { DisabledStoreService.Remove(id); }
+                catch { kept.Add(disabledItems.First(item => string.Equals(item.Id, id, StringComparison.OrdinalIgnoreCase))); }
+            }
+            return kept;
+        }
+
         public static List<StartupItem> ScanAll()
         {
             var items = new List<StartupItem>();
@@ -1871,7 +1904,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             AddIsolatedProvider(items, "wmi-main", "WMI Event Consumer", @"root\subscription", 10000);
             AddPackagedStartupTasks(items);
             ApplyStartupApproved(items, ReadStartupApproved());
-            items.AddRange(DisabledStoreService.LoadDisabledItems());
+            items.AddRange(RetireDisabledRecordsMatchingLiveRoutes(items, DisabledStoreService.LoadDisabledItems()));
             AddLegacyV2Items(items);
             HydrateHumanNames(items);
             ApplyTruthEvidence(items);
@@ -14647,7 +14680,8 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     || string.Equals(item.ApplicationIdentity ?? "", "path:" + runningPayload.ToLowerInvariant(), StringComparison.OrdinalIgnoreCase);
                 if (!identityMatches || (item.RuntimeEvidence ?? "").IndexOf("exact target running pid=", StringComparison.OrdinalIgnoreCase) < 0) runningLauncherPayloadMismatches++;
             }
-            int rendered = 0, missing = 0, unexpected = 0, duplicateRenderedIds = 0, aggregateRows = 0, searchMissing = 0, appRoutes = 0, appsMissing = 0;
+            int rendered = 0, missing = 0, unexpected = 0, duplicateRenderedIds = 0, aggregateRows = 0, searchMissing = 0, appRoutes = 0, appsMissing = 0, uncoveredRoutes = 0;
+            int enabledDuplicateRoutes = 0, enabledUncoveredRoutes = 0, disabledExpectedRoutes = 0, disabledRenderedRoutes = 0, disabledInvalidRows = 0, disabledDuplicateRoutes = 0, disabledUncoveredRoutes = 0;
             int importantExpected = 0, importantRendered = 0, importantInvalid = 0, exportedRows = 0, exportErrors = 0;
             int logitechRoutes = 0, logitechExpectedRows = 0, logitechNameRows = 0, logitechPathRows = 0, logitechMissing = 0;
             int scriptRoutes = 0, scriptIdentityErrors = 0;
@@ -14672,11 +14706,29 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     var rows = form._list.Items.Cast<ListViewItem>().Select(item => item.Tag as InventoryRow).Where(row => row != null).ToList();
                     rendered = rows.Count;
                     aggregateRows = rows.Count(row => row.IsAppSummary || row.Routes == null || row.Routes.Count != 1);
-                    var expectedIds = new HashSet<string>(scanned.Where(item => item != null && !string.IsNullOrWhiteSpace(item.Id)).Select(item => item.Id), StringComparer.OrdinalIgnoreCase);
-                    var renderedIds = rows.Select(row => row.Primary == null ? "" : (row.Primary.Id ?? "")).Where(id => !string.IsNullOrWhiteSpace(id)).ToList();
-                    missing = expectedIds.Count(id => !renderedIds.Contains(id, StringComparer.OrdinalIgnoreCase));
-                    unexpected = renderedIds.Count(id => !expectedIds.Contains(id));
-                    duplicateRenderedIds = renderedIds.GroupBy(id => id, StringComparer.OrdinalIgnoreCase).Count(group => group.Count() > 1);
+                    // The Apps default view is intentionally application-aggregated and carries
+                    // exactly the application-class routes. Coverage is therefore proven over the
+                    // union of the routes each rendered row carries: every app-class route must
+                    // appear exactly once, as its own row or inside its proven application group.
+                    var appExpectedIds = new HashSet<string>(scanned.Where(item => item != null && IsAppRoute(item) && !string.IsNullOrWhiteSpace(item.Id)).Select(item => item.Id), StringComparer.OrdinalIgnoreCase);
+                    var coveredIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var routeRenderCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var row in rows)
+                    {
+                        if (row.Primary != null && !string.IsNullOrWhiteSpace(row.Primary.Id)) coveredIds.Add(row.Primary.Id);
+                        if (row.Routes == null) continue;
+                        foreach (var route in row.Routes)
+                        {
+                            string routeId = route == null ? "" : (route.Id ?? "");
+                            if (string.IsNullOrWhiteSpace(routeId)) continue;
+                            coveredIds.Add(routeId);
+                            routeRenderCounts[routeId] = (routeRenderCounts.TryGetValue(routeId, out int prior) ? prior : 0) + 1;
+                        }
+                    }
+                    duplicateRenderedIds = routeRenderCounts.Values.Count(count => count > 1);
+                    missing = appExpectedIds.Count(id => !coveredIds.Contains(id));
+                    uncoveredRoutes = missing;
+                    unexpected = coveredIds.Count(id => !appExpectedIds.Contains(id));
                     string liveExport = BuildStartupExportTsv(scanned);
                     exportedRows = liveExport.Split(new[] { "\r\n" }, StringSplitOptions.None).Length - 1;
                     exportErrors = !liveExport.StartsWith("Startup ID\tApplication\tRegistration name\tSource\tScope\tConfigured enabled", StringComparison.Ordinal)
@@ -14684,30 +14736,91 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                         || liveExport.IndexOf("Presentation reason", StringComparison.OrdinalIgnoreCase) < 0 ? 1 : 0;
 
                     // The dashboard search is part of the visibility contract, not a cosmetic
-                    // convenience.  Probe every real row with its own displayed name (falling
-                    // back to its location), so a valid route cannot be collected yet vanish
-                    // when the user types the app name — the GCC regression case.
+                    // convenience.  Probe every real route with its own displayed name (falling
+                    // back to its location) on each view where the route is eligible — the
+                    // aggregated Apps view for application routes, and the route-level
+                    // Enabled/Disabled views for every other registration — so a valid route
+                    // cannot be collected yet vanish when the user types its name.
+                    form.SetFilter("Apps");
                     foreach (var item in scanned.Where(item => item != null && !string.IsNullOrWhiteSpace(item.Id)))
                     {
                         string query = !string.IsNullOrWhiteSpace(item.Name) ? item.Name.Trim() : (item.Location ?? "").Trim();
                         if (query.Length == 0) { searchMissing++; if (firstSearchMissing.Length == 0) firstSearchMissing = item.Id; continue; }
-                        var searchedRows = form.BuildVisibleRows(query);
-                        bool found = searchedRows.Any(row => row.Primary != null && string.Equals(row.Primary.Id, item.Id, StringComparison.OrdinalIgnoreCase));
+                        bool eligibleOnApps = IsAppRoute(item);
+                        bool eligibleOnEnabled = item.Enabled || item.StateText() == "Enabled" || item.StateText() == "Drifted";
+                        bool eligibleOnDisabled = !item.Enabled || item.StateText() == "Disabled";
+                        bool found = false;
+                        foreach (var eligibleTab in new[] { eligibleOnApps ? "Apps" : null, eligibleOnEnabled && !eligibleOnApps ? "Enabled" : null, eligibleOnDisabled && !eligibleOnApps && !eligibleOnEnabled ? "Disabled" : null })
+                        {
+                            if (eligibleTab == null) continue;
+                            form.SetFilter(eligibleTab);
+                            var searchedRows = form.BuildVisibleRows(query);
+                            if (searchedRows.Any(row => row.Routes != null && row.Routes.Any(route => string.Equals(route.Id, item.Id, StringComparison.OrdinalIgnoreCase)))) { found = true; break; }
+                        }
+                        form.SetFilter("Apps");
                         if (!found)
                         {
                             searchMissing++;
                             if (firstSearchMissing.Length == 0) firstSearchMissing = item.Name + " [" + item.Id + "]";
                         }
                     }
+                    form.SetFilter("Apps");
 
-                    // Critical/expert routes must never be diluted into a generic attention
-                    // view.  Verify the actual live Important tab contains every and only the
-                    // routes that require the dedicated red danger tab.
-                    importantExpected = scanned.Count(item => item.Enabled || item.StateText() == "Enabled");
+                    // Every enabled route — application or Windows-internal — must be present on
+                    // the Enabled view exactly once, and every rendered row there must be
+                    // genuinely enabled (one verified enabled route for an application group).
+                    importantExpected = scanned.Count(item => item != null && (item.Enabled || item.StateText() == "Enabled" || item.StateText() == "Drifted"));
                     form.SetFilter("Enabled");
                     var importantRows = form._list.Items.Cast<ListViewItem>().Select(item => item.Tag as InventoryRow).Where(row => row != null).ToList();
                     importantRendered = importantRows.Count;
-                    importantInvalid = importantRows.Count(row => row.IsAppSummary || row.Routes == null || row.Routes.Count != 1 || !(row.EffectiveEnabled));
+                    // Every route carried by an Enabled-tab row must itself belong on this tab.
+                    // A configured-enabled route whose verification is still Unknown or Drifted is
+                    // exactly what this view must surface, not a rendering defect.
+                    importantInvalid = importantRows.Count(row => row.Routes == null || row.Routes.Count == 0
+                        || row.Routes.Any(route => route == null || !(route.Enabled || route.StateText() == "Enabled" || route.StateText() == "Drifted")));
+                    var enabledRenderCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var row in importantRows)
+                    {
+                        if (row.Routes == null) continue;
+                        foreach (var route in row.Routes)
+                        {
+                            string routeId = route == null ? "" : (route.Id ?? "");
+                            if (!string.IsNullOrWhiteSpace(routeId)) enabledRenderCounts[routeId] = (enabledRenderCounts.TryGetValue(routeId, out int prior) ? prior : 0) + 1;
+                        }
+                    }
+                    int enabledDuplicate = enabledRenderCounts.Values.Count(count => count > 1);
+                    int enabledUncovered = importantExpected == 0 ? 0 : scanned.Count(item => item != null && (item.Enabled || item.StateText() == "Enabled" || item.StateText() == "Drifted") && !string.IsNullOrWhiteSpace(item.Id) && !enabledRenderCounts.ContainsKey(item.Id));
+                    enabledDuplicateRoutes = enabledDuplicate;
+                    enabledUncoveredRoutes = enabledUncovered;
+
+                    // Symmetrically, every route that is not enabled must be present on the
+                    // Disabled view exactly once and rendered as actually disabled. Nothing set
+                    // (or not set) to run at boot may be missing from the view that names it.
+                    int disabledExpected = scanned.Count(item => item != null && (!item.Enabled || item.StateText() == "Disabled"));
+                    form.SetFilter("Disabled");
+                    var disabledRows = form._list.Items.Cast<ListViewItem>().Select(item => item.Tag as InventoryRow).Where(row => row != null).ToList();
+                    int disabledRendered = disabledRows.Count;
+                    // Symmetric validity: every route on a Disabled-tab row must genuinely belong
+                    // to the disabled side of the inventory.
+                    int disabledInvalid = disabledRows.Count(row => row.Routes == null || row.Routes.Count == 0
+                        || row.Routes.Any(route => route == null || !(!route.Enabled || route.StateText() == "Disabled")));
+                    var disabledRenderCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var row in disabledRows)
+                    {
+                        if (row.Routes == null) continue;
+                        foreach (var route in row.Routes)
+                        {
+                            string routeId = route == null ? "" : (route.Id ?? "");
+                            if (!string.IsNullOrWhiteSpace(routeId)) disabledRenderCounts[routeId] = (disabledRenderCounts.TryGetValue(routeId, out int prior) ? prior : 0) + 1;
+                        }
+                    }
+                    int disabledDuplicate = disabledRenderCounts.Values.Count(count => count > 1);
+                    int disabledUncovered = disabledExpected == 0 ? 0 : scanned.Count(item => item != null && (!item.Enabled || item.StateText() == "Disabled") && !string.IsNullOrWhiteSpace(item.Id) && !disabledRenderCounts.ContainsKey(item.Id));
+                    disabledExpectedRoutes = disabledExpected;
+                    disabledRenderedRoutes = disabledRendered;
+                    disabledInvalidRows = disabledInvalid;
+                    disabledDuplicateRoutes = disabledDuplicate;
+                    disabledUncoveredRoutes = disabledUncovered;
 
                     // Apps is a convenience view, but it must never become an omission view.
                     // Prove every application-class route is reachable there by its human name;
@@ -14791,15 +14904,21 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             bool gameAutoVisible = gameAutoRoutes == 0 || (gameAutoExpectedRows == 1 && gameAutoNameRows == 1 && gameAutoFitGirlRows == 1 && gameAutoMissing == 0);
             bool qbittorrentVisible = qbittorrentRoutes == 0 || (qbittorrentExpectedRows > 0 && qbittorrentRows == qbittorrentExpectedRows && qbittorrentMissing == 0);
             bool passed = scanned.Count > 0 && invalid == 0 && providerErrors == 0 && duplicateInventoryIds == 0 && duplicateSharedUserRegistryRoutes == 0
-                && rendered == scanned.Count && aggregateRows == 0 && missing == 0 && unexpected == 0 && duplicateRenderedIds == 0 && searchMissing == 0 && appsMissing == 0 && importantRendered == importantExpected && importantInvalid == 0 && exportedRows == scanned.Count && exportErrors == 0 && bootClean;
+                && uncoveredRoutes == 0 && missing == 0 && unexpected == 0 && duplicateRenderedIds == 0 && searchMissing == 0 && appsMissing == 0
+                && importantRendered == importantExpected && importantInvalid == 0 && enabledDuplicateRoutes == 0 && enabledUncoveredRoutes == 0
+                && disabledRenderedRoutes == disabledExpectedRoutes && disabledInvalidRows == 0 && disabledDuplicateRoutes == 0 && disabledUncoveredRoutes == 0
+                && exportedRows == scanned.Count && exportErrors == 0 && bootClean;
             passed = passed && runningLauncherPayloadMismatches == 0 && logitechVisible && scriptIdentityErrors == 0 && gameAutoVisible && qbittorrentVisible;
             receipt = "LIVE_INVENTORY_VERIFY passed=" + passed.ToString().ToLowerInvariant()
                 + " scanned=" + scanned.Count + " rendered=" + rendered + " invalid=" + invalid
                 + " provider_errors=" + providerErrors + " duplicate_inventory_ids=" + duplicateInventoryIds
                 + " duplicate_shared_user_registry_routes=" + duplicateSharedUserRegistryRoutes
                 + " duplicate_rendered_ids=" + duplicateRenderedIds + " aggregate_rows=" + aggregateRows
-                + " missing=" + missing + " unexpected=" + unexpected + " search_missing=" + searchMissing
+                + " missing=" + missing + " uncovered_routes=" + uncoveredRoutes + " unexpected=" + unexpected + " search_missing=" + searchMissing
                 + " enabled_expected=" + importantExpected + " enabled_rendered=" + importantRendered + " enabled_invalid=" + importantInvalid
+                + " enabled_duplicate_routes=" + enabledDuplicateRoutes + " enabled_uncovered_routes=" + enabledUncoveredRoutes
+                + " disabled_expected=" + disabledExpectedRoutes + " disabled_rendered=" + disabledRenderedRoutes + " disabled_invalid=" + disabledInvalidRows
+                + " disabled_duplicate_routes=" + disabledDuplicateRoutes + " disabled_uncovered_routes=" + disabledUncoveredRoutes
                 + " export_rows=" + exportedRows + " export_errors=" + exportErrors
                 + " app_routes=" + appRoutes + " apps_missing=" + appsMissing
                 + " launcher_payload_routes=" + launcherPayloadRoutes + " running_launcher_payload_routes=" + runningLauncherPayloadRoutes
