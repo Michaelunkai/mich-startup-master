@@ -11054,6 +11054,266 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
     // so the user is told the moment something new is set to run at boot. A persisted signature
     // store makes only genuinely new entries toast — the pre-existing inventory is seeded as the
     // baseline on the very first scan and never floods with notifications.
+    // Event-driven change detection for every startup surface Windows can notify about.
+    // A registry Run/StartupApproved value edit, a Startup-folder file change, or a scheduled-task
+    // registration raises one coalesced callback so the resident dashboard re-scans within about
+    // a second of the external change instead of waiting for the next background poll. Surfaces
+    // that have no OS change notification (services, drivers, WMI consumers, policy stores) remain
+    // covered by the polling timer. Every failure path is silent degradation back to that poll.
+    internal sealed class StartupChangeMonitor : IDisposable
+    {
+        private const uint RegNotifyChangeLastSet = 0x00000004;
+        private const uint RegNotifyChangeName = 0x00000008;
+        internal const int CoalesceMilliseconds = 1000;
+        // Continuous churn (for example task last-run-time writes shortly after boot) cannot
+        // trigger more than one full scan per this interval; a single isolated change still
+        // delivers after the quiet period alone.
+        private const int MinimumFireMilliseconds = 5000;
+
+        private readonly Action _changed;
+        private readonly object _gate = new object();
+        private readonly List<RegistryWatch> _registryWatches = new List<RegistryWatch>();
+        private readonly List<FileSystemWatcher> _folderWatchers = new List<FileSystemWatcher>();
+        private System.Threading.Timer _debounce;
+        private long _lastFireTicks;
+        private long _queuedTicks;
+        private bool _disposed;
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        private static extern int RegNotifyChangeKeyValue(Microsoft.Win32.SafeHandles.SafeRegistryHandle hKey, bool watchSubtree, uint dwNotifyFilter, Microsoft.Win32.SafeHandles.SafeWaitHandle hEvent, bool fAsynchronous);
+
+        private sealed class RegistryWatch
+        {
+            internal RegistryKey Key;
+            internal Microsoft.Win32.SafeHandles.SafeRegistryHandle Handle;
+            internal System.Threading.AutoResetEvent Signal;
+            internal System.Threading.RegisteredWaitHandle Wait;
+            internal StartupChangeMonitor Owner;
+
+            internal void Arm()
+            {
+                try
+                {
+                    Signal.Reset();
+                    // A failed arm or re-arm is non-fatal: the polling timer still covers the surface.
+                    RegNotifyChangeKeyValue(Handle, true, RegNotifyChangeLastSet | RegNotifyChangeName, Signal.SafeWaitHandle, true);
+                }
+                catch { }
+            }
+        }
+
+        public StartupChangeMonitor(Action changed)
+        {
+            _changed = changed ?? new Action(() => { });
+        }
+
+        public void Start()
+        {
+            lock (_gate)
+            {
+                if (_disposed) return;
+                _debounce = new System.Threading.Timer(FireFromTimer, null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+                foreach (RegistryView view in Environment.Is64BitOperatingSystem ? new[] { RegistryView.Registry64, RegistryView.Registry32 } : new[] { RegistryView.Registry32 })
+                {
+                    string label = RegistryViewLabel(view);
+                    foreach (string subKey in new[]
+                    {
+                        @"Software\Microsoft\Windows\CurrentVersion\Run",
+                        @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                        @"Software\Microsoft\Windows\CurrentVersion\RunServices",
+                        @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce",
+                        @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
+                        @"Software\Microsoft\Windows\CurrentVersion\RunOnceEx",
+                        @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
+                        @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+                        @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+                        @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+                        @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder32",
+                        @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupTasks"
+                    })
+                    {
+                        WatchRegistry(RegistryHive.LocalMachine, view, subKey, label);
+                    }
+                }
+                foreach (string subKey in new[]
+                {
+                    @"Software\Microsoft\Windows\CurrentVersion\Run",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunServices",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce",
+                    @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
+                    @"Software\Microsoft\Windows\CurrentVersion\RunOnceEx",
+                    @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
+                    @"Environment",
+                    @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+                    @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+                    @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+                    @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder32",
+                    @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupTasks"
+                })
+                {
+                    RegistryView userView = Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Registry32;
+                    WatchRegistry(RegistryHive.CurrentUser, userView, subKey, RegistryViewLabel(userView));
+                }
+                WatchFolder(Environment.GetFolderPath(Environment.SpecialFolder.Startup));
+                WatchFolder(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup));
+                string taskCatalog = Path.Combine(Environment.SystemDirectory, "Tasks");
+                WatchFolder(taskCatalog, true);
+            }
+        }
+
+        private static string RegistryViewLabel(RegistryView view)
+        {
+            return view == RegistryView.Registry32 ? "Registry32" : "Registry64";
+        }
+
+        private void WatchRegistry(RegistryHive hive, RegistryView view, string subKey, string label)
+        {
+            // The key stays open for the monitor lifetime: RegNotifyChangeKeyValue arms against
+            // this key's native handle, and RegistryKey disposal would invalidate that handle.
+            RegistryKey key = null;
+            try
+            {
+                using (var root = RegistryKey.OpenBaseKey(hive, view))
+                {
+                    key = root.OpenSubKey(subKey, false);
+                }
+                if (key == null) return;
+                var watch = new RegistryWatch
+                {
+                    Key = key,
+                    Handle = key.Handle,
+                    Signal = new System.Threading.AutoResetEvent(false),
+                    Owner = this
+                };
+                watch.Arm();
+                watch.Wait = System.Threading.ThreadPool.RegisterWaitForSingleObject(
+                    watch.Signal,
+                    (state, timedOut) =>
+                    {
+                        RegistryWatch fired = (RegistryWatch)state;
+                        if (!timedOut) fired.Arm();
+                        fired.Owner.Poke();
+                    },
+                    watch,
+                    -1,
+                    false);
+                _registryWatches.Add(watch);
+            }
+            catch
+            {
+                try { if (key != null) key.Dispose(); } catch { }
+            }
+        }
+
+        private void WatchFolder(string path, bool recursive = false)
+        {
+            if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path)) return;
+            try
+            {
+                var watcher = new FileSystemWatcher(path)
+                {
+                    IncludeSubdirectories = recursive,
+                    InternalBufferSize = 64 * 1024,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size
+                };
+                watcher.Created += (s, e) => Poke();
+                watcher.Changed += (s, e) => Poke();
+                watcher.Deleted += (s, e) => Poke();
+                watcher.Renamed += (s, e) => Poke();
+                watcher.Error += (s, e) => RestartFolderWatcher(watcher, path, recursive);
+                watcher.EnableRaisingEvents = true;
+                _folderWatchers.Add(watcher);
+            }
+            catch { }
+        }
+
+        private void RestartFolderWatcher(FileSystemWatcher dead, string path, bool recursive)
+        {
+            try { dead.EnableRaisingEvents = false; } catch { }
+            lock (_gate)
+            {
+                if (_disposed) return;
+                try { _folderWatchers.Remove(dead); } catch { }
+                WatchFolder(path, recursive);
+            }
+            Poke();
+        }
+
+        // Any watched surface changed. Restart the coalescing window; event storms cannot wedge
+        // the pipeline because Fire always rearms itself.
+        private void Poke()
+        {
+            if (_disposed) return;
+            try
+            {
+                lock (_gate)
+                {
+                    if (_disposed || _debounce == null) return;
+                    _queuedTicks = DateTime.UtcNow.Ticks;
+                    _debounce.Change(CoalesceMilliseconds, System.Threading.Timeout.Infinite);
+                }
+            }
+            catch { }
+        }
+
+        private void FireFromTimer(object state)
+        {
+            try
+            {
+                long queued;
+                lock (_gate)
+                {
+                    if (_disposed) return;
+                    queued = _queuedTicks;
+                    _queuedTicks = 0;
+                }
+                if (queued == 0) return;
+                long now = DateTime.UtcNow.Ticks;
+                long elapsedMs = (now - _lastFireTicks) / TimeSpan.TicksPerMillisecond;
+                if (_lastFireTicks != 0 && elapsedMs < MinimumFireMilliseconds)
+                {
+                    // Still inside the previous scan's blast radius: hold this burst briefly so
+                    // continuous churn cannot monopolize providers, then deliver it anyway.
+                    lock (_gate)
+                    {
+                        if (_disposed) return;
+                        _queuedTicks = queued;
+                        _debounce.Change(MinimumFireMilliseconds - (int)elapsedMs, System.Threading.Timeout.Infinite);
+                    }
+                    return;
+                }
+                _lastFireTicks = now;
+                _changed();
+            }
+            catch { }
+        }
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                if (_disposed) return;
+                _disposed = true;
+            }
+            try { if (_debounce != null) { _debounce.Change(System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite); _debounce.Dispose(); } } catch { }
+            foreach (RegistryWatch watch in _registryWatches)
+            {
+                try { if (watch.Wait != null) watch.Wait.Unregister(null); } catch { }
+                try { if (watch.Signal != null) watch.Signal.Dispose(); } catch { }
+                try { if (watch.Handle != null) watch.Handle.Dispose(); } catch { }
+                try { if (watch.Key != null) watch.Key.Dispose(); } catch { }
+            }
+            _registryWatches.Clear();
+            foreach (FileSystemWatcher watcher in _folderWatchers)
+            {
+                try { watcher.EnableRaisingEvents = false; } catch { }
+                try { watcher.Dispose(); } catch { }
+            }
+            _folderWatchers.Clear();
+        }
+    }
+
     internal static class StartupWatcher
     {
         // MSM_KNOWN_STORE lets the regression suite point the watcher at an isolated store so a
@@ -14240,6 +14500,8 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         private ProgressBar _progress;
         private NotifyIcon _tray;
         private Timer _watchTimer;
+        private StartupChangeMonitor _changeMonitor;
+        private bool _changeRefreshPending;
         private ToolTip _tooltip;
         private bool _reallyExit;
         private bool _isRefreshing;
@@ -14308,6 +14570,9 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 trayPreloadsInventory = true,
                 backgroundInventoryRefreshMilliseconds = BackgroundInventoryRefreshMilliseconds,
                 hiddenTrayInventoryStaysCurrent = true,
+                changeTriggeredInventoryRefresh = true,
+                changeWatchedSurfaces = new[] { "Registry Run/RunOnce/RunServices/policy keys", "StartupApproved metadata", "Per-user and common Startup folders", "Task Scheduler catalog", "Winlogon" },
+                startupChangeCoalesceMilliseconds = StartupChangeMonitor.CoalesceMilliseconds,
                 browseDuringRefresh = true,
                 refreshIsReadOnly = true,
                 humanReadableNames = true,
@@ -15041,8 +15306,12 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 // a new startup route to become part of the inventory.
                 Load += (s, e) => RefreshItems();
                 _watchTimer = new Timer { Interval = BackgroundInventoryRefreshMilliseconds };
-                _watchTimer.Tick += (s, e) => { if (!_isRefreshing && !_watchScanRunning) DetectNewStartupItems(); };
+                _watchTimer.Tick += (s, e) => RequestBackgroundScan();
                 _watchTimer.Start();
+                // External changes (registry edits, Startup-folder files, task registrations)
+                // trigger a re-scan immediately instead of waiting for the next poll tick.
+                _changeMonitor = new StartupChangeMonitor(OnStartupSurfaceChangedExternally);
+                _changeMonitor.Start();
                 FormClosing += OnClosingToTray;
                 Resize += (s, e) => { if (WindowState == FormWindowState.Minimized) HideToTray(); };
                 Shown += (s, e) => { if (!_startInTray && _search != null) _search.Focus(); };
@@ -15089,6 +15358,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             if (disposing)
             {
                 _refreshVersion++;
+                if (_changeMonitor != null) { _changeMonitor.Dispose(); _changeMonitor = null; }
                 if (_watchTimer != null) { _watchTimer.Stop(); _watchTimer.Dispose(); _watchTimer = null; }
                 if (_tray != null) { _tray.Visible = false; _tray.Dispose(); _tray = null; }
                 if (_tooltip != null) { _tooltip.Dispose(); _tooltip = null; }
@@ -15574,6 +15844,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                         _retry.Visible = true;
                         SetStatus("Refresh failed — the previous inventory is still shown. " + error, Danger);
                         if (_items.Count == 0) ShowEmptyState("Inventory could not be loaded", error, true);
+                        PumpPendingChangeRefresh();
                         return;
                     }
                     _items = t.Result.Item1;
@@ -15581,6 +15852,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     _retry.Visible = false;
                     RenderList(selectedId);
                     NotifyFreshStartupItems(t.Result.Item2);
+                    PumpPendingChangeRefresh();
                 }));
             });
         }
@@ -16664,13 +16936,46 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 BeginInvoke(new Action(() =>
                 {
                     _watchScanRunning = false;
-                    if (t.Exception != null) return;
+                    if (t.Exception != null) { PumpPendingChangeRefresh(); return; }
                     _items = t.Result.Item1;
                     _lastRefresh = DateTime.Now;
                     RenderList();
                     NotifyFreshStartupItems(t.Result.Item2);
+                    PumpPendingChangeRefresh();
                 }));
             });
+        }
+
+        // The change monitor fires on a threadpool thread; marshal the re-scan request onto the
+        // UI thread so it composes with the existing refresh/scan state flags. Before the window
+        // handle exists BeginInvoke is unavailable, so the request is latched and the first
+        // completed refresh replays it.
+        private void OnStartupSurfaceChangedExternally()
+        {
+            if (IsDisposed || Disposing) return;
+            if (!IsHandleCreated) { _changeRefreshPending = true; return; }
+            try { BeginInvoke(new Action(RequestBackgroundScan)); }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+
+        // One entry point for every background scan trigger (watcher event, poll tick). When a
+        // scan is already in flight the request is remembered and replayed when it completes, so
+        // an external change is never silently dropped between polls.
+        private void RequestBackgroundScan()
+        {
+            if (!_runtimeEnabled || IsDisposed) return;
+            if (_isRefreshing || _watchScanRunning) { _changeRefreshPending = true; return; }
+            DetectNewStartupItems();
+        }
+
+        private void PumpPendingChangeRefresh()
+        {
+            if (!_changeRefreshPending) return;
+            _changeRefreshPending = false;
+            if (IsDisposed || !_runtimeEnabled) return;
+            if (_isRefreshing || _watchScanRunning) return;
+            DetectNewStartupItems();
         }
 
         private void NotifyFreshStartupItems(IList<StartupItem> fresh)

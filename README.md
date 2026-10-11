@@ -1,4 +1,4 @@
-# Mich Startup Master 2.2
+# Mich Startup Master 2.5
 
 Mich Startup Master is a native Windows 11 control center for seeing and managing what starts with Windows. Version 2.3 separates two questions that startup tools often blur together:
 
@@ -6,6 +6,10 @@ Mich Startup Master is a native Windows 11 control center for seeing and managin
 - **Mode:** should the app open a normal window, or start quietly and stay available in the system tray?
 
 The default view is **All routes**: every discovered Windows startup registration is visible immediately, exactly once per registration. Opening the dashboard from its tray icon or using **Clear filters** also resets to that complete route-level view and clears stale search/drill-down state. **Apps** is an optional summary view; it groups exact routes by a proven installed-product path owner or the real executable behind a launcher, includes app-owned automatic services such as Logitech G HUB's updater, and can enable or disable every matching route for one app in a single rollback-safe transaction. Display-name similarity is never treated as ownership evidence.
+
+## What changed in 2.5
+
+- **Change-triggered live refresh.** The resident process now watches the registry surfaces it scans (HKCU/HKLM Run, RunOnce, RunServices, policy Run, Winlogon, Environment, and StartupApproved metadata in both registry views), both Startup folders, and the Task Scheduler catalog with native change notifications. An external edit raises one coalesced re-scan within about a second, so the dashboard reflects a startup change made by any program the moment it happens instead of waiting for the 15-second background poll, which remains as a safety net for surfaces without OS notifications (services, drivers, WMI consumers). A change that lands while a scan is already running is never dropped: it is replayed as soon as the in-flight scan completes.
 
 ## What changed in 2.2
 
