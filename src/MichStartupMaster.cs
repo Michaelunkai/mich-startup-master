@@ -2170,7 +2170,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             return false;
         }
 
-        private static string NormBootKey(string value)
+        internal static string NormBootKey(string value)
         {
             if (string.IsNullOrWhiteSpace(value)) return "";
             var sb = new StringBuilder();
@@ -14623,6 +14623,8 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 cliEveryGuiActionAvailable = true,
                 cliGuiRealtimeSync = true,
                 aggregateNonBulkActionsFailClosed = true,
+                startupCommandMirrorsFollowAuthoritativeRoutes = true,
+                appsDisableAtBootNeverBlockedByMirrorRoutes = true,
                 aggregateBulkDisableTransactional = true,
                 aggregateBulkEnableTransactional = true,
                 aggregateManageRoutesOneClick = true,
@@ -15102,6 +15104,33 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     if (main._detailBody.Text.IndexOf("1 enabled", StringComparison.OrdinalIgnoreCase) < 0 || main._detailBody.Text.IndexOf("1 disabled", StringComparison.OrdinalIgnoreCase) < 0 || main._detailBody.Text.IndexOf("rollback-safe transaction", StringComparison.OrdinalIgnoreCase) < 0 || main._selectionMeta.Text.IndexOf("rollback-safe transaction", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Aggregate details omit route counts or transactional bulk-change guidance.");
                     var blockedBulk = new InventoryRow { Routes = new List<StartupItem> { new StartupItem { Id = "preview|bulk|ok", Enabled = true, CanDisable = true }, new StartupItem { Id = "preview|bulk|blocked", Enabled = true, CanDisable = false, ExternalAuthority = "Policy" } }, Primary = openSpeedy.Primary, IsAppSummary = true };
                     if (CanBulkDisable(blockedBulk, true) || BulkStateActionReason(blockedBulk, false).IndexOf("Policy", StringComparison.OrdinalIgnoreCase) < 0) throw new InvalidOperationException("Aggregate bulk disable does not fail closed before writes when one route is externally owned.");
+                    // A Windows startup-command mirror of an authoritative route in the same app
+                    // group must never block Disable/Enable at boot for that app: the mirror has
+                    // no independent existence and follows its twin. This is the exact Ollama
+                    // regression: one Win32_StartupCommand projection of a Startup-folder
+                    // shortcut locked the whole app row behind "Manage routes".
+                    var mirrorGroup = new InventoryRow
+                    {
+                        Routes = new List<StartupItem>
+                        {
+                            new StartupItem { Id = "preview|mirror|lnk", Enabled = true, CanDisable = true, Source = "Startup Folder", Command = "\"F:\\backup\\ollama\\ollama app.exe\"", Location = "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\Ollama.lnk", ApplicationTargets = new[] { "F:\\backup\\ollama\\ollama app.exe" } },
+                            new StartupItem { Id = "preview|mirror|wmi", Enabled = true, CanDisable = false, Source = "Startup Command", Command = "\"F:\\backup\\ollama\\ollama app.exe\" ", Location = "Win32_StartupCommand" }
+                        },
+                        Primary = openSpeedy.Primary, IsAppSummary = true
+                    };
+                    var mirrorCandidates = BulkStateCandidates(mirrorGroup, false);
+                    if (!CanBulkDisable(mirrorGroup, true) || mirrorCandidates.Count != 1 || mirrorCandidates[0].Id != "preview|mirror|lnk"
+                        || BulkStateActionReason(mirrorGroup, false).IndexOf("mirror", StringComparison.OrdinalIgnoreCase) < 0)
+                        throw new InvalidOperationException("A Windows startup-command mirror of an authoritative route blocked Disable at boot for its app row.");
+                    // A mirror whose authoritative registration is not enumerable (no twin row in
+                    // the group) still fails closed: there is no reversible registration behind it.
+                    var orphanMirror = new InventoryRow
+                    {
+                        Routes = new List<StartupItem> { new StartupItem { Id = "preview|mirror|orphan", Enabled = true, CanDisable = false, Source = "Startup Command", Command = "lghub.exe --tray --background", Location = "Win32_StartupCommand" } },
+                        Primary = openSpeedy.Primary, IsAppSummary = true
+                    };
+                    if (CanBulkDisable(orphanMirror, true) || BulkStateCandidates(orphanMirror, false).Count != 1) throw new InvalidOperationException("A startup-command mirror with no authoritative twin must still fail closed.");
+                    checks += 2;
                     ForceLayout(main);
                     var excluded = new HashSet<Control> { main._emptyState, main._progress, main._retry, main._disable, main._enable, main._quietSelected, main._launchSelected };
                     AssertVisibleContainment(main, "MainForm@" + scale.ToString("0.0"), excluded, ref checks);
@@ -16422,8 +16451,12 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             bool app = exact && x.PopupLabel() != "N/A", ready = _runtimeEnabled && !_isRefreshing;
             int enabledRoutes = any ? row.Routes.Count(route => route.Enabled) : 0;
             int disabledRoutes = any ? row.Routes.Count(route => !route.Enabled) : 0;
-            bool bulkDisable = any && row.IsAmbiguous && enabledRoutes > 0;
-            bool bulkEnable = any && row.IsAmbiguous && disabledRoutes > 0;
+            // The bulk state action mutates exactly the authoritative candidates; covered
+            // Windows startup-command mirrors follow their twins and are never counted.
+            int disableCandidates = any && row.IsAmbiguous ? BulkStateCandidates(row, false).Count : 0;
+            int enableCandidates = any && row.IsAmbiguous ? BulkStateCandidates(row, true).Count : 0;
+            bool bulkDisable = disableCandidates > 0;
+            bool bulkEnable = enableCandidates > 0;
             _editSelected.Text = any && row.IsAmbiguous ? "&Manage " + row.Routes.Count + " routes" : "&Edit";
             _editSelected.AccessibleName = any && row.IsAmbiguous ? "Manage " + row.Routes.Count + " startup routes" : "Edit startup";
             _editSelected.Width = Math.Max((int)Math.Round((any && row.IsAmbiguous ? 150 : 90) * _layoutScale), 90);
@@ -16439,10 +16472,10 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             {
                 _editSelected.Enabled = false; _quietSelected.Enabled = false; _launchSelected.Enabled = false; _copySelected.Enabled = false;
             }
-            _disable.Text = bulkDisable ? "&Disable all " + enabledRoutes : "&Disable at boot";
-            _disable.AccessibleName = bulkDisable ? "Disable all " + enabledRoutes + " enabled startup routes" : "Disable at boot";
-            _enable.Text = bulkEnable ? "&Enable all " + disabledRoutes : "&Enable at boot";
-            _enable.AccessibleName = bulkEnable ? "Enable all " + disabledRoutes + " disabled startup routes" : "Enable at boot";
+            _disable.Text = bulkDisable ? "&Disable all " + disableCandidates : "&Disable at boot";
+            _disable.AccessibleName = bulkDisable ? "Disable all " + disableCandidates + " enabled startup routes" : "Disable at boot";
+            _enable.Text = bulkEnable ? "&Enable all " + enableCandidates : "&Enable at boot";
+            _enable.AccessibleName = bulkEnable ? "Enable all " + enableCandidates + " disabled startup routes" : "Enable at boot";
             _disable.Visible = (exact && x.Enabled) || bulkDisable; _enable.Visible = (exact && !x.Enabled) || bulkEnable;
             _quietSelected.Visible = !any || exact; _launchSelected.Visible = !any || exact;
             if (multiple) { _disable.Visible = false; _enable.Visible = false; _quietSelected.Visible = false; _launchSelected.Visible = false; }
@@ -16472,21 +16505,79 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             return CanBulkSetEnabled(row, ready, true);
         }
 
+        // A "Startup Command" row is the Win32_StartupCommand compatibility projection of a
+        // native registration. When its exact command is covered by an authoritative route in
+        // the same application group (a Startup-folder shortcut, Run value, or task launching
+        // the same payload), the mirror has no independent existence: it appears, changes, and
+        // disappears together with its authoritative twin. Such a mirror must never block the
+        // app-level state action, and is never itself mutated. A mirror whose authoritative
+        // registration is not enumerable (no twin row in the group) still blocks, because there
+        // is genuinely no reversible registration behind it.
+        internal static bool IsCoveredStartupCommandMirror(StartupItem route, List<StartupItem> group)
+        {
+            if (route == null || !string.Equals(route.Source, "Startup Command", StringComparison.OrdinalIgnoreCase)) return false;
+            string mirrorCommand = StartupService.NormBootKey(route.Command);
+            if (mirrorCommand.Length <= 8) return false;
+            foreach (StartupItem other in group ?? new List<StartupItem>())
+            {
+                if (other == null || ReferenceEquals(other, route) || string.Equals(other.Source, "Startup Command", StringComparison.OrdinalIgnoreCase)) continue;
+                if (RouteCommandCoversMirror(other, mirrorCommand)) return true;
+            }
+            return false;
+        }
+
+        private static bool RouteCommandCoversMirror(StartupItem candidate, string mirrorCommand)
+        {
+            string commandKey = StartupService.NormBootKey(candidate == null ? "" : candidate.Command);
+            if (commandKey.Length > 8 && (commandKey == mirrorCommand || (commandKey.Length >= mirrorCommand.Length && mirrorCommand.Length > 0 && commandKey.StartsWith(mirrorCommand, StringComparison.Ordinal)))) return true;
+            var targets = candidate == null ? null : candidate.ApplicationTargets;
+            if (targets != null)
+            {
+                foreach (string target in targets)
+                {
+                    string targetKey = StartupService.NormBootKey(target);
+                    if (targetKey.Length <= 8) continue;
+                    if (targetKey == mirrorCommand || mirrorCommand.StartsWith(targetKey, StringComparison.Ordinal)) return true;
+                }
+            }
+            return false;
+        }
+
+        // The exact set of routes one app-level state action mutates: every route on the wrong
+        // side of the requested state, minus covered Windows startup-command mirrors, which
+        // follow their authoritative registrations automatically.
+        private static List<StartupItem> BulkStateCandidates(InventoryRow row, bool enabledState)
+        {
+            if (row == null || row.Routes == null) return new List<StartupItem>();
+            return row.Routes.Where(route => route != null && route.Enabled != enabledState
+                && !IsCoveredStartupCommandMirror(route, row.Routes)).ToList();
+        }
+
         private static bool CanBulkSetEnabled(InventoryRow row, bool ready, bool enabledState)
         {
             if (!ready || row == null || !row.IsAmbiguous) return false;
-            List<StartupItem> candidates = row.Routes.Where(route => route != null && route.Enabled != enabledState).ToList();
+            List<StartupItem> candidates = BulkStateCandidates(row, enabledState);
             return candidates.Count > 0 && candidates.All(route => route.CanDisable && string.IsNullOrWhiteSpace(route.ExternalAuthority));
         }
 
         private static string BulkStateActionReason(InventoryRow row, bool enabledState)
         {
             if (row == null || !row.IsAmbiguous) return "Select an app with multiple startup routes first.";
-            List<StartupItem> candidates = row.Routes.Where(route => route != null && route.Enabled != enabledState).ToList();
-            if (candidates.Count == 0) return "Every startup route for this app is already " + (enabledState ? "enabled." : "disabled.");
+            List<StartupItem> raw = row.Routes.Where(route => route != null && route.Enabled != enabledState).ToList();
+            if (raw.Count == 0) return "Every startup route for this app is already " + (enabledState ? "enabled." : "disabled.");
+            List<StartupItem> candidates = BulkStateCandidates(row, enabledState);
+            if (candidates.Count == 0)
+            {
+                if (raw.All(route => IsCoveredStartupCommandMirror(route, row.Routes)))
+                    return "Every authoritative startup route for this app is already " + (enabledState ? "enabled." : "disabled.") + " The remaining Windows startup-command entries are mirrors that follow their authoritative registrations.";
+                StartupItem firstRaw = raw[0];
+                return "All routes stay unchanged: " + StateActionReason(firstRaw);
+            }
             StartupItem blocked = candidates.FirstOrDefault(route => !string.IsNullOrWhiteSpace(route.ExternalAuthority) || !route.CanDisable);
             if (blocked != null) return "All routes stay unchanged: " + StateActionReason(blocked);
-            return (enabledState ? "Enable" : "Disable") + " all " + candidates.Count + " " + (enabledState ? "disabled" : "enabled") + " routes for this app as one transaction; any failure restores every route.";
+            int mirrorCount = raw.Count - candidates.Count;
+            return (enabledState ? "Enable" : "Disable") + " all " + candidates.Count + " " + (enabledState ? "disabled" : "enabled") + " routes for this app as one transaction; any failure restores every route."
+                + (mirrorCount > 0 ? " " + mirrorCount + " Windows startup-command mirror" + (mirrorCount == 1 ? " is" : "s are") + " grouped with its authoritative route" + (mirrorCount == 1 ? "" : "s") + " and follow" + (mirrorCount == 1 ? "s" : "") + " it automatically." : "");
         }
 
         private static bool CanUseLaunchMode(StartupItem item, bool ready) { return ready && item != null && item.Enabled && item.PopupLabel() != "N/A" && StartupService.CanMutateStartupMode(item); }
@@ -16550,14 +16641,14 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             var selectedRows = SelectedRows(); bool multiple = selectedRows.Count > 1;
             InventoryRow row = selectedRows.FirstOrDefault(); bool exact = row != null && !multiple && !row.IsAmbiguous;
             var x = exact ? row.Primary : null; bool any = x != null; bool app = any && x.PopupLabel() != "N/A"; bool ready = _runtimeEnabled && !_isRefreshing;
-            int enabledRoutes = row == null ? 0 : row.Routes.Count(route => route.Enabled);
-            int disabledRoutes = row == null ? 0 : row.Routes.Count(route => !route.Enabled);
-            bool bulkDisable = row != null && row.IsAmbiguous && enabledRoutes > 0;
-            bool bulkEnable = row != null && row.IsAmbiguous && disabledRoutes > 0;
-            _contextState.Text = bulkDisable ? "Disable all " + enabledRoutes + " enabled routes" : (bulkEnable ? "Enable all " + disabledRoutes + " disabled routes" : (any && x.Enabled ? "Disable at boot" : "Enable at boot"));
+            int disableCandidates = row != null && row.IsAmbiguous ? BulkStateCandidates(row, false).Count : 0;
+            int enableCandidates = row != null && row.IsAmbiguous ? BulkStateCandidates(row, true).Count : 0;
+            bool bulkDisable = disableCandidates > 0;
+            bool bulkEnable = enableCandidates > 0;
+            _contextState.Text = bulkDisable ? "Disable all " + disableCandidates + " enabled routes" : (bulkEnable ? "Enable all " + enableCandidates + " disabled routes" : (any && x.Enabled ? "Disable at boot" : "Enable at boot"));
             _contextState.Enabled = bulkDisable ? CanBulkDisable(row, ready) : (bulkEnable ? CanBulkEnable(row, ready) : ready && any && x.CanDisable && string.IsNullOrWhiteSpace(x.ExternalAuthority));
             _contextEnableAll.Visible = bulkDisable && bulkEnable;
-            _contextEnableAll.Text = "Enable all " + disabledRoutes + " disabled routes";
+            _contextEnableAll.Text = "Enable all " + enableCandidates + " disabled routes";
             _contextEnableAll.Enabled = _contextEnableAll.Visible && CanBulkEnable(row, ready);
             _contextMode.Text = app && StartupService.IsQuietLaunch(x.Command ?? "", x.Location) ? "Use Window mode" : "Use Quiet (tray)";
             _contextMode.Enabled = CanUseLaunchMode(x, ready);
@@ -16580,7 +16671,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
 
         private InventoryRow SelectedRow() { return SelectedRows().FirstOrDefault(); }
         private StartupItem Selected() { InventoryRow row = SelectedRow(); return row == null || row.IsAmbiguous ? null : row.Primary; }
-        private void ToggleSelectedEnabled() { InventoryRow row = SelectedRow(); if (row != null && row.IsAmbiguous) { if (row.Routes.Any(route => route.Enabled)) DisableAllSelectedRoutes(row); else EnableAllSelectedRoutes(row); return; } var x = Selected(); if (x == null || _isRefreshing || !_runtimeEnabled) return; if (x.Enabled) DisableSelected(); else EnableSelected(); }
+        private void ToggleSelectedEnabled() { InventoryRow row = SelectedRow(); if (row != null && row.IsAmbiguous) { if (BulkStateCandidates(row, false).Count > 0 || row.Routes.All(route => route == null || !route.Enabled)) DisableAllSelectedRoutes(row); else EnableAllSelectedRoutes(row); return; } var x = Selected(); if (x == null || _isRefreshing || !_runtimeEnabled) return; if (x.Enabled) DisableSelected(); else EnableSelected(); }
         private void DisableSelected()
         {
             InventoryRow row = SelectedRow();
@@ -16611,8 +16702,10 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         private void DisableAllSelectedRoutes(InventoryRow row)
         {
             if (row == null || !row.IsAmbiguous || _isRefreshing || !_runtimeEnabled) return;
-            List<StartupItem> enabled = row.Routes.Where(route => route != null && route.Enabled).ToList();
-            if (enabled.Count == 0) { SetStatus("Every startup route for this app is already disabled.", Muted); return; }
+            // Only authoritative routes are mutated; a covered Windows startup-command mirror
+            // follows its twin automatically and is never written to.
+            List<StartupItem> enabled = BulkStateCandidates(row, false);
+            if (enabled.Count == 0) { SetStatus(BulkStateActionReason(row, false), Muted); return; }
             if (!CanBulkDisable(row, true)) { SetStatus(BulkStateActionReason(row, false), Warn); return; }
             bool needsElevation = enabled.Any(route => route.RequiresElevation);
             if (needsElevation && !StartupService.IsElevated())
@@ -16695,8 +16788,8 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         private void EnableAllSelectedRoutes(InventoryRow row)
         {
             if (row == null || !row.IsAmbiguous || _isRefreshing || !_runtimeEnabled) return;
-            List<StartupItem> disabled = row.Routes.Where(route => route != null && !route.Enabled).ToList();
-            if (disabled.Count == 0) { SetStatus("Every startup route for this app is already enabled.", Muted); return; }
+            List<StartupItem> disabled = BulkStateCandidates(row, true);
+            if (disabled.Count == 0) { SetStatus(BulkStateActionReason(row, true), Muted); return; }
             if (!CanBulkEnable(row, true)) { SetStatus(BulkStateActionReason(row, true), Warn); return; }
             bool needsElevation = disabled.Any(route => route.RequiresElevation);
             if (needsElevation && !StartupService.IsElevated())
