@@ -2561,7 +2561,8 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             {
                 try
                 {
-                    string xml = File.ReadAllText(location.ManifestPath);
+                    string xml = ReadPackageManifestText(location.ManifestPath);
+                    if (xml == null) continue;
                     raw.AddRange(ParsePackagedStartupManifest(xml, location));
                 }
                 catch (Exception ex)
@@ -2569,6 +2570,17 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     raw.Add(ErrorItem("Independent Packaged Startup Task", location.Scope, location.ManifestPath, ex));
                 }
             }
+        }
+
+        // Opens the manifest instead of probing it first: WindowsApps grants direct reads but
+        // denies the attribute query File.Exists depends on, which silently hid every packaged
+        // startup task (WhatsApp, Codex, Terminal, ...). Returns null only for a manifest that
+        // is genuinely absent; anything else is surfaced to the caller as an error item.
+        private static string ReadPackageManifestText(string manifestPath)
+        {
+            try { return File.ReadAllText(manifestPath); }
+            catch (FileNotFoundException) { return null; }
+            catch (DirectoryNotFoundException) { return null; }
         }
 
         private static List<PackageManifestLocation> EnumeratePackageManifestLocations(List<StartupItem> errors, bool independent)
@@ -2594,7 +2606,10 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                                 packageRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WindowsApps", packageFullName);
                             }
                             string manifest = Path.Combine(packageRoot, "AppxManifest.xml");
-                            if (!File.Exists(manifest)) continue;
+                            // WindowsApps denies existence probes (attribute queries) on package
+                            // files, so File.Exists reports false for manifests that open fine.
+                            // Every registered package is handed to the reader; a genuinely
+                            // missing manifest is skipped silently by ReadPackageManifestText.
                             string family = Convert.ToString(package.GetValue("PackageFamilyName", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
                             if (string.IsNullOrWhiteSpace(family)) family = PackageFamilyFromFullName(packageFullName);
                             string identity = scope + "|" + manifest;
@@ -3842,6 +3857,11 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             require(packagedFixture.Count == 1 && packagedFixture[0].Source == "Packaged Startup Task" && packagedFixture[0].Name == "Fixture.Package_publisher!FixtureBoot", "actual package manifest declaration must create the packaged startup row");
             ApplyStartupApproved(packagedFixture, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "StartupTasks", Name = "Fixture.Package_publisher!FixtureBoot", Data = new byte[] { 3, 0, 0, 0, 4, 5, 6, 7, 8, 9, 10, 11 } } });
             require(packagedFixture.Count == 1 && !packagedFixture[0].Enabled && !string.IsNullOrWhiteSpace(packagedFixture[0].ApprovalPath), "packaged approval state must overlay the manifest declaration without adding a row");
+            require(ReadPackageManifestText(Path.Combine(Path.GetTempPath(), "msm-absent-" + Guid.NewGuid().ToString("N"), "AppxManifest.xml")) == null, "a genuinely missing package manifest must be skipped without creating an error row");
+            string reachableManifest = Path.Combine(Path.GetTempPath(), "msm-present-" + Guid.NewGuid().ToString("N") + ".xml");
+            File.WriteAllText(reachableManifest, manifestFixture);
+            try { require(ReadPackageManifestText(reachableManifest) == manifestFixture, "a WindowsApps-style manifest that exists but blocks existence probes must still be read by direct open"); }
+            finally { try { File.Delete(reachableManifest); } catch { } }
 
             var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Program.ManagedTaskRoot + "StartupApp" };
             Func<string, bool> exists = value => existing.Contains(value);
@@ -4000,12 +4020,13 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             return list;
         }
 
-        private static bool IsDefiniteTrayIconClass(string cls)
+        internal static bool IsDefiniteTrayIconClass(string cls)
         {
             if (string.IsNullOrEmpty(cls)) return false;
             if (cls.IndexOf("SystemTrayIcon", StringComparison.Ordinal) >= 0) return true;      // pystray (icon + menu windows)
             if (cls.IndexOf("TrayIcon", StringComparison.Ordinal) >= 0) return true;            // Qt tray icon message window
             if (cls.IndexOf("NotifyIcon", StringComparison.Ordinal) >= 0) return true;          // Electron / generic
+            if (cls.IndexOf("_Notification_Class", StringComparison.Ordinal) >= 0) return true; // Process Lasso native NotifyIcon host
             if (string.Equals(cls, "AutoHotkey", StringComparison.OrdinalIgnoreCase)) return true; // AutoHotkey script tray icon
             return false;
         }
@@ -6235,7 +6256,12 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         {
             foreach (var location in EnumeratePackageManifestLocations(items, false))
             {
-                try { items.AddRange(ParsePackagedStartupManifest(File.ReadAllText(location.ManifestPath), location)); }
+                try
+                {
+                    string xml = ReadPackageManifestText(location.ManifestPath);
+                    if (xml == null) continue;
+                    items.AddRange(ParsePackagedStartupManifest(xml, location));
+                }
                 catch (Exception ex) { items.Add(ErrorItem("Packaged Startup Task", location.Scope, location.ManifestPath, ex)); }
             }
         }
@@ -11347,6 +11373,114 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         }
     }
 
+    // Persists the first UTC moment every startup identity was observed so the UI can always
+    // sort newest-added-first. Identities reuse StartupWatcher's stable form, and existing
+    // timestamps are never moved, so only genuinely new registrations change the ordering.
+    internal static class StartupFirstSeenStore
+    {
+        private static readonly object _gate = new object();
+        private static Dictionary<string, DateTime> _cache;
+
+        private static string StorePath
+        {
+            get
+            {
+                string overridePath = Environment.GetEnvironmentVariable("MSM_FIRST_SEEN_STORE");
+                if (string.IsNullOrWhiteSpace(overridePath)) return Path.Combine(Program.AppData, "startup-first-seen.tsv");
+                string expanded = Environment.ExpandEnvironmentVariables(overridePath.Trim().Trim('"'));
+                if (!Path.IsPathRooted(expanded)) throw new InvalidOperationException("MSM_FIRST_SEEN_STORE must be an absolute path inside MSM_STATE_ROOT");
+                string full = Path.GetFullPath(expanded);
+                string root = Path.GetFullPath(Program.AppData).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+                if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("MSM_FIRST_SEEN_STORE must stay inside MSM_STATE_ROOT");
+                return full;
+            }
+        }
+
+        private static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s ?? "")); }
+        private static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
+
+        internal static void ResetForTests() { lock (_gate) { _cache = null; } }
+
+        // Records "now" for every identity not seen before. Called with each completed full scan.
+        public static void Observe(IEnumerable<StartupItem> items)
+        {
+            try
+            {
+                lock (_gate)
+                {
+                    var store = _cache ?? Load();
+                    DateTime now = DateTime.UtcNow;
+                    bool changed = false;
+                    foreach (StartupItem item in items ?? Enumerable.Empty<StartupItem>())
+                    {
+                        if (item == null) continue;
+                        string identity = StartupWatcher.Identity(item);
+                        if (store.ContainsKey(identity)) continue;
+                        store[identity] = now;
+                        changed = true;
+                    }
+                    if (changed) Save(store);
+                    _cache = store;
+                }
+            }
+            catch { }
+        }
+
+        public static DateTime UtcOf(StartupItem item)
+        {
+            if (item == null) return DateTime.MinValue;
+            lock (_gate)
+            {
+                var store = _cache ?? Load();
+                _cache = store;
+                DateTime value;
+                return store.TryGetValue(StartupWatcher.Identity(item), out value) ? value : DateTime.MinValue;
+            }
+        }
+
+        internal static void SeedForTests(StartupItem item, DateTime utc)
+        {
+            lock (_gate)
+            {
+                var store = _cache ?? Load();
+                store[StartupWatcher.Identity(item)] = utc;
+                _cache = store;
+            }
+        }
+
+        private static Dictionary<string, DateTime> Load()
+        {
+            var store = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                if (File.Exists(StorePath))
+                {
+                    foreach (string line in StateStoreFile.ReadAllLines(StorePath))
+                    {
+                        string[] parts = line.Split('\t');
+                        long ticks;
+                        if (parts.Length < 2 || !long.TryParse(parts[1], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out ticks)) continue;
+                        string identity = UnB64(parts[0]);
+                        if (!string.IsNullOrWhiteSpace(identity)) store[identity] = new DateTime(ticks, DateTimeKind.Utc);
+                    }
+                }
+            }
+            catch { }
+            return store;
+        }
+
+        private static void Save(Dictionary<string, DateTime> store)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(StorePath) ?? Program.AppData);
+                StateStoreFile.WriteAllLines(StorePath, store.OrderBy(pair => pair.Value).Select(pair => B64(pair.Key) + "\t" + pair.Value.Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToArray());
+            }
+            catch { }
+        }
+    }
+
     internal static class StartupWatcher
     {
         // MSM_KNOWN_STORE lets the regression suite point the watcher at an isolated store so a
@@ -11369,7 +11503,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
 
         // A stable identity for one logical startup entry. It deliberately excludes per-scan noise
         // (case, extra whitespace) so the same entry is never re-reported on later scans.
-        private static string Identity(StartupItem item)
+        internal static string Identity(StartupItem item)
         {
             string name = (item.Name ?? "").Trim();
             string loc = (item.Location ?? "").Trim();
@@ -15239,6 +15373,29 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 if (!hidden.Visible || !hidden.ShowInTaskbar) throw new InvalidOperationException("Explicit main-window activation failed to release the hidden visibility gate.");
                 checks++;
             }
+            if (!StartupService.IsDefiniteTrayIconClass("ProcessLasso_Notification_Class") || StartupService.IsDefiniteTrayIconClass("tooltips_class32") || StartupService.IsDefiniteTrayIconClass("")) throw new InvalidOperationException("Native tray host class recognition must accept Process Lasso's NotifyIcon window and reject generic windows.");
+            checks++;
+            trace("first-seen-order");
+            StartupFirstSeenStore.ResetForTests();
+            var olderRoute = new StartupItem { Id = "reg|firstseen-older", Name = "OlderApp", Source = "Registry Run", Scope = "User", Command = @"C:\Apps\Older\Older.exe", Location = @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run", Enabled = true };
+            var newerRoute = new StartupItem { Id = "reg|firstseen-newer", Name = "NewerApp", Source = "Registry Run", Scope = "User", Command = @"C:\Apps\Newer\Newer.exe", Location = @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run [Registry64]", Enabled = true };
+            StartupFirstSeenStore.SeedForTests(olderRoute, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+            StartupFirstSeenStore.SeedForTests(newerRoute, new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+            using (var ordered = new MainForm(false, false))
+            {
+                ordered.SetFilter("Apps");
+                ordered._items = new List<StartupItem> { olderRoute, newerRoute };
+                ordered.RenderList();
+                var firstApp = ordered._list.Items.Count > 0 ? ordered._list.Items[0].Tag as InventoryRow : null;
+                if (firstApp == null || firstApp.Primary.Id != "reg|firstseen-newer") throw new InvalidOperationException("Newest-added startup item must lead the Apps view.");
+                checks++;
+                ordered.SetFilter("Enabled");
+                ordered.RenderList();
+                var firstRoute = ordered._list.Items.Count > 0 ? ordered._list.Items[0].Tag as InventoryRow : null;
+                if (firstRoute == null || firstRoute.Primary.Id != "reg|firstseen-newer") throw new InvalidOperationException("Newest-added route must lead the route-level views.");
+                checks++;
+            }
+            StartupFirstSeenStore.ResetForTests();
             trace("complete");
             return "UI_SELF_TEST passed checks=" + checks + " scales=100,150,200 layouts=MainForm,AddStartupForm,EditStartupForm appAggregation=installedProductOrCanonicalTarget allRoutes=routeLevel aggregateManageFlow=passed aggregateBulkDisable=transactional aggregateNonBulkActions=failClosed checkedFilters=true contrastAA=true dpiTransitionDrift=none darkChromeRequested=true startInTrayInitialVisible=false stateModeSeparated=true disabledEditFailClosed=true capabilityAwareActions=true expertConfirmation=true externalAuthority=true multiActionFailClosed=true";
         }
@@ -15996,6 +16153,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                         return;
                     }
                     _items = t.Result.Item1;
+                    StartupFirstSeenStore.Observe(_items);
                     _lastRefresh = DateTime.Now;
                     _retry.Visible = false;
                     RenderList(selectedId);
@@ -16105,10 +16263,24 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             }
             var repeatedNames = new HashSet<string>(rows.GroupBy(row => row.Primary.HumanName(), StringComparer.OrdinalIgnoreCase).Where(group => group.Count() > 1).Select(group => group.Key), StringComparer.OrdinalIgnoreCase);
             foreach (InventoryRow row in rows) row.DisplayName = repeatedNames.Contains(row.Primary.HumanName()) ? row.Primary.HumanName() + "  ·  " + TargetDisambiguator(row.TargetIdentity) : row.Primary.HumanName();
-            if (_sortColumn < 0) return rows.OrderBy(x => x.Primary.HumanName(), StringComparer.OrdinalIgnoreCase).ThenBy(x => x.TargetIdentity, StringComparer.OrdinalIgnoreCase).ToList();
+            // Newest-added-first is the standing order: rows observed most recently lead every
+            // view until the user explicitly sorts by a column. Never-recorded routes sort last
+            // by name so a first-seen timestamp is always present for anything rendered.
+            if (_sortColumn < 0) return rows.OrderByDescending(x => NewestFirstSeenUtc(x.Routes)).ThenBy(x => x.Primary.HumanName(), StringComparer.OrdinalIgnoreCase).ThenBy(x => x.TargetIdentity, StringComparer.OrdinalIgnoreCase).ToList();
             var sortKeys = rows.ToDictionary(row => row, row => SortTextForRow(row, _sortColumn, rows));
             rows.Sort((left, right) => CompareInventoryRows(left, right, sortKeys[left], sortKeys[right]));
             return rows;
+        }
+
+        private static DateTime NewestFirstSeenUtc(List<StartupItem> routes)
+        {
+            DateTime newest = DateTime.MinValue;
+            foreach (StartupItem route in routes ?? new List<StartupItem>())
+            {
+                DateTime seen = StartupFirstSeenStore.UtcOf(route);
+                if (seen > newest) newest = seen;
+            }
+            return newest;
         }
 
         private void ApplyColumnSort(int column)
@@ -17150,6 +17322,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     _watchScanRunning = false;
                     if (t.Exception != null) { PumpPendingChangeRefresh(); return; }
                     _items = t.Result.Item1;
+                    StartupFirstSeenStore.Observe(_items);
                     _lastRefresh = DateTime.Now;
                     RenderList();
                     NotifyFreshStartupItems(t.Result.Item2);

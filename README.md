@@ -1,4 +1,4 @@
-# Mich Startup Master 2.5
+# Mich Startup Master 2.6
 
 Mich Startup Master is a native Windows 11 control center for seeing and managing what starts with Windows. Version 2.3 separates two questions that startup tools often blur together:
 
@@ -6,6 +6,13 @@ Mich Startup Master is a native Windows 11 control center for seeing and managin
 - **Mode:** should the app open a normal window, or start quietly and stay available in the system tray?
 
 The default view is **All routes**: every discovered Windows startup registration is visible immediately, exactly once per registration. Opening the dashboard from its tray icon or using **Clear filters** also resets to that complete route-level view and clears stale search/drill-down state. **Apps** is an optional summary view; it groups exact routes by a proven installed-product path owner or the real executable behind a launcher, includes app-owned automatic services such as Logitech G HUB's updater, and can enable or disable every matching route for one app in a single rollback-safe transaction. Display-name similarity is never treated as ownership evidence.
+
+## What changed in 2.6
+
+- **Packaged startup tasks can no longer be missed.** Windows denies existence probes (attribute queries) on files under `C:\Program Files\WindowsApps`, so `File.Exists` reported false for every installed package manifest and the scan silently skipped every packaged StartupTask — WhatsApp, OpenAI Codex, Windows Terminal, the Xbox app and any other Store or MSIX app that registers `windows.startupTask`. The scan now hands every registered package to a direct-open reader: a manifest that exists is always read, a genuinely absent manifest is skipped without noise, and any other read failure still surfaces as an error row so a gap is never silent.
+- **Newest-added-first everywhere.** Every completed scan records the first moment each startup identity was observed into a persistent first-seen store (`startup-first-seen.tsv`). All views — Apps, Enabled, Disabled, and search results — lead with the most recently added item (WhatsApp, Codex, ChatGPT-class additions appear at the top the moment they are installed), with the previous name ordering as a stable tiebreaker. Recorded timestamps are never rewritten, and an explicit column sort still takes precedence.
+
+- **Tray audit recognizes native NotifyIcon hosts.** Process Lasso's tray icon window (`*_Notification_Class`) was invisible to the quiet-coverage audit, falsely reporting a running tray app as having no tray host. The audit now accepts native `*_Notification_Class` tray hosts, so the boot gate reports the truth instead of a false gap.
 
 ## What changed in 2.5
 
