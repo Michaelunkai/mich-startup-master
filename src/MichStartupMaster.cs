@@ -8769,6 +8769,17 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     snapshot._kind = "wmi";
                     return snapshot;
                 }
+                if (id.StartsWith("packaged|", StringComparison.OrdinalIgnoreCase))
+                {
+                    // The AppModel State value is a single HKCU DWORD, so the exact registry
+                    // snapshot covers it — including the case where the value did not exist
+                    // before the mutation (rollback then removes it again instead of writing).
+                    string statePath = PackagedStartupTaskStatePath(item.Name);
+                    if (string.IsNullOrWhiteSpace(statePath)) throw new InvalidOperationException("Packaged startup task identity is incomplete");
+                    snapshot.CaptureRegistry(Registry.CurrentUser, statePath, "State");
+                    snapshot._kind = "registry";
+                    return snapshot;
+                }
                 throw new InvalidOperationException("This startup source cannot be changed transactionally: " + id);
             }
 
