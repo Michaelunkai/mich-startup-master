@@ -1,4 +1,4 @@
-# Mich Startup Master 2.6
+# Mich Startup Master 2.7
 
 Mich Startup Master is a native Windows 11 control center for seeing and managing what starts with Windows. Version 2.3 separates two questions that startup tools often blur together:
 
@@ -6,6 +6,11 @@ Mich Startup Master is a native Windows 11 control center for seeing and managin
 - **Mode:** should the app open a normal window, or start quietly and stay available in the system tray?
 
 The default view is **All routes**: every discovered Windows startup registration is visible immediately, exactly once per registration. Opening the dashboard from its tray icon or using **Clear filters** also resets to that complete route-level view and clears stale search/drill-down state. **Apps** is an optional summary view; it groups exact routes by a proven installed-product path owner or the real executable behind a launcher, includes app-owned automatic services such as Logitech G HUB's updater, and can enable or disable every matching route for one app in a single rollback-safe transaction. Display-name similarity is never treated as ownership evidence.
+
+## What changed in 2.7
+
+- **Packaged task state is now read from the real OS authority.** Explorer's `StartupApproved\StartupTasks` key often does not exist at all, and 2.6 then fell back to the manifest default, marked the row `ExternalAuthority`, and left it permanently non-toggleable — WhatsApp-class apps appeared with the wrong enabled state and could not be enabled or disabled from the app. The scan now reads `HKCU\...\AppModel\SystemAppData\<family>\<task>\State` (the exact value Windows Settings and Task Manager write): State 2 shows as enabled, 0/1 as disabled, and the row is always user-toggleable. Only policy-controlled states (3/4) stay blocked, with the reason shown. Toggling writes that same State value and verifies it after writing.
+- **Packaged surfaces are watched in real time.** The change monitor now watches `AppModel\SystemAppData` and `AppModel\Repository\Packages` under HKCU, so a packaged app that enables or adds its startup task (or a package that installs one) refreshes the view immediately instead of waiting for the next poll.
 
 ## What changed in 2.6
 

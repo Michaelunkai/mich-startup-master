@@ -2647,6 +2647,73 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             return string.IsNullOrWhiteSpace(publisherId) ? value : value.Substring(0, first) + "_" + publisherId;
         }
 
+        // StartupTaskState values reported by the AppModel surface: 0/1 are disabled (1 =
+        // disabled by user), 2 is enabled, 3/4 are policy-controlled on either side.
+        private static string PackagedStartupTaskStatePath(string registrationName)
+        {
+            string name = registrationName ?? "";
+            int bang = name.LastIndexOf('!');
+            if (bang <= 0 || bang == name.Length - 1) return null;
+            return @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\" + name.Substring(0, bang) + @"\" + name.Substring(bang + 1);
+        }
+
+        private static int? ReadPackagedStartupTaskState(string registrationName)
+        {
+            string path = PackagedStartupTaskStatePath(registrationName);
+            if (path == null) return null;
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(path, false))
+                {
+                    if (key == null) return null;
+                    object value = key.GetValue("State", null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                    if (value is int) return (int)value;
+                    int parsed;
+                    if (int.TryParse(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture), out parsed)) return parsed;
+                    return null;
+                }
+            }
+            catch { return null; }
+        }
+
+        internal static void ResolvePackagedStartupTaskAuthority(StartupItem item, int? state)
+        {
+            if (state.HasValue && (state.Value == 3 || state.Value == 4))
+            {
+                // Policy-owned states genuinely sit outside user control; keep them blocked
+                // with the reason instead of pretending a toggle would change the outcome.
+                item.CanDisable = false;
+                item.MutationCapability = "ExternalAuthority";
+                item.MutationReason = "Packaged startup task State=" + state.Value + " is policy-controlled; only the Windows policy authority can change it";
+                item.ExternalAuthority = "Windows packaged startup policy";
+                item.Status = (item.Status ?? "") + "; AppModel State=" + state.Value + " (policy-controlled)";
+                return;
+            }
+            // Without a State value the manifest default governs; with one, it is the truth
+            // even when it contradicts the manifest declaration.
+            item.Enabled = state.HasValue ? state.Value == 2 : item.Enabled;
+            item.CanDisable = true;
+            item.MutationCapability = "AppModelStartupTaskState";
+            item.MutationReason = "Toggle the AppModel SystemAppData State value (2=enabled, 1=disabled by user) — the same value Windows Settings writes";
+            item.Status = (item.Status ?? "") + "; AppModel State=" + (state.HasValue ? state.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "unset (manifest default)");
+        }
+
+        private static void SetPackagedStartupTaskState(StartupItem item, bool enabled)
+        {
+            string path = PackagedStartupTaskStatePath(item == null ? null : item.Name);
+            if (path == null) throw new InvalidOperationException("Packaged startup task identity is incomplete; cannot resolve its State key");
+            int state = enabled ? 2 : 1;
+            using (var key = Registry.CurrentUser.CreateSubKey(path, true))
+            {
+                if (key == null) throw new IOException("Could not open the AppModel startup task state key: " + path);
+                key.SetValue("State", state, RegistryValueKind.DWord);
+                object verified = key.GetValue("State", null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                if (!(verified is int) || (int)verified != state)
+                    throw new IOException("Packaged startup task state did not verify after writing");
+            }
+            item.Enabled = enabled;
+        }
+
         private static List<StartupItem> ParsePackagedStartupManifest(string xml, PackageManifestLocation location)
         {
             var items = new List<StartupItem>();
@@ -2680,7 +2747,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     if (string.IsNullOrWhiteSpace(command)) command = "Package activation " + registrationName + (string.IsNullOrWhiteSpace(entryPoint) ? "" : " (" + entryPoint + ")");
                     string humanName = !string.IsNullOrWhiteSpace(taskDisplay) && !taskDisplay.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase) ? taskDisplay : displayName;
                     if (string.IsNullOrWhiteSpace(humanName) || humanName.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase)) humanName = string.IsNullOrWhiteSpace(packageName) ? taskId : packageName;
-                    items.Add(new StartupItem
+                    var packaged = new StartupItem
                     {
                         Id = "packaged|" + B64(location.Scope) + "|" + B64(location.ManifestPath) + "|" + B64(registrationName),
                         Name = registrationName,
@@ -2692,11 +2759,14 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                         Enabled = manifestEnabled,
                         CanDisable = false,
                         IsManaged = false,
-                        Status = "Declared by package manifest; taskId=" + taskId + "; manifestEnabled=" + manifestEnabled.ToString().ToLowerInvariant() + "; awaiting exact OS authority metadata",
-                        MutationCapability = "ExternalAuthority",
-                        MutationReason = "No exact StartupApproved state was found; use Windows Settings or the packaged app instead of inventing metadata",
-                        ExternalAuthority = "Windows packaged startup authority"
-                    });
+                        Status = "Declared by package manifest; taskId=" + taskId + "; manifestEnabled=" + manifestEnabled.ToString().ToLowerInvariant()
+                    };
+                    // The OS authority for a packaged task is the AppModel SystemAppData State
+                    // value (the same one Windows Settings and Task Manager write), not the
+                    // manifest default. Resolve it here so the row is truthful and user-toggleable
+                    // even when Explorer's StartupApproved\StartupTasks metadata does not exist.
+                    ResolvePackagedStartupTaskAuthority(packaged, ReadPackagedStartupTaskState(registrationName));
+                    items.Add(packaged);
                 }
             }
             return items;
@@ -3855,6 +3925,21 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             string manifestFixture = "<Package xmlns='http://schemas.microsoft.com/appx/manifest/foundation/windows10' xmlns:desktop='http://schemas.microsoft.com/appx/manifest/desktop/windows10'><Identity Name='Fixture.Package' Publisher='CN=Fixture' Version='1.0.0.0'/><Properties><DisplayName>Fixture package</DisplayName></Properties><Applications><Application Id='App' Executable='Fixture.exe' EntryPoint='Windows.FullTrustApplication'><Extensions><desktop:Extension Category='windows.startupTask' Executable='Fixture.exe' EntryPoint='Windows.FullTrustApplication'><desktop:StartupTask TaskId='FixtureBoot' Enabled='true' DisplayName='Fixture boot'/></desktop:Extension></Extensions></Application></Applications></Package>";
             var packagedFixture = ParsePackagedStartupManifest(manifestFixture, new PackageManifestLocation { ManifestPath = @"C:\FixturePackage\AppxManifest.xml", PackageFullName = "Fixture.Package_1.0.0.0_x64__publisher", PackageFamilyName = "Fixture.Package_publisher", Scope = "User" });
             require(packagedFixture.Count == 1 && packagedFixture[0].Source == "Packaged Startup Task" && packagedFixture[0].Name == "Fixture.Package_publisher!FixtureBoot", "actual package manifest declaration must create the packaged startup row");
+            require(packagedFixture[0].Enabled && packagedFixture[0].CanDisable && packagedFixture[0].MutationCapability == "AppModelStartupTaskState" && string.IsNullOrWhiteSpace(packagedFixture[0].ExternalAuthority), "a packaged task with no State value must keep the manifest default and stay user-toggleable");
+            var packagedDisabledState = new StartupItem { Name = "Fixture.Package_publisher!FixtureBoot", Enabled = true };
+            ResolvePackagedStartupTaskAuthority(packagedDisabledState, 1);
+            require(!packagedDisabledState.Enabled && packagedDisabledState.CanDisable && packagedDisabledState.MutationCapability == "AppModelStartupTaskState", "AppModel State=1 (disabled by user) must be reported disabled yet remain toggleable");
+            var packagedEnabledState = new StartupItem { Name = "Fixture.Package_publisher!FixtureBoot", Enabled = false };
+            ResolvePackagedStartupTaskAuthority(packagedEnabledState, 2);
+            require(packagedEnabledState.Enabled && packagedEnabledState.CanDisable && string.IsNullOrWhiteSpace(packagedEnabledState.ExternalAuthority), "AppModel State=2 must be reported enabled and toggleable even when the manifest declared false");
+            var packagedPolicyDisabled = new StartupItem { Name = "Fixture.Package_publisher!FixtureBoot", Enabled = false };
+            ResolvePackagedStartupTaskAuthority(packagedPolicyDisabled, 3);
+            require(!packagedPolicyDisabled.CanDisable && !string.IsNullOrWhiteSpace(packagedPolicyDisabled.ExternalAuthority), "policy-controlled AppModel State=3 must stay blocked with its reason");
+            var packagedPolicyEnabled = new StartupItem { Name = "Fixture.Package_publisher!FixtureBoot", Enabled = true };
+            ResolvePackagedStartupTaskAuthority(packagedPolicyEnabled, 4);
+            require(!packagedPolicyEnabled.CanDisable && !string.IsNullOrWhiteSpace(packagedPolicyEnabled.ExternalAuthority), "policy-controlled AppModel State=4 must stay blocked with its reason");
+            require(PackagedStartupTaskStatePath("Fixture.Package_publisher!FixtureBoot") == @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\Fixture.Package_publisher\FixtureBoot", "the packaged State path must resolve from the family!task identity");
+            require(PackagedStartupTaskStatePath("NoIdentity") == null && PackagedStartupTaskStatePath("A!B!C") != null, "malformed packaged identities must not resolve to a state path");
             ApplyStartupApproved(packagedFixture, new List<StartupApproval> { new StartupApproval { Root = Registry.CurrentUser.Name, Path = "p", Scope = "User", Kind = "StartupTasks", Name = "Fixture.Package_publisher!FixtureBoot", Data = new byte[] { 3, 0, 0, 0, 4, 5, 6, 7, 8, 9, 10, 11 } } });
             require(packagedFixture.Count == 1 && !packagedFixture[0].Enabled && !string.IsNullOrWhiteSpace(packagedFixture[0].ApprovalPath), "packaged approval state must overlay the manifest declaration without adding a row");
             require(ReadPackageManifestText(Path.Combine(Path.GetTempPath(), "msm-absent-" + Guid.NewGuid().ToString("N"), "AppxManifest.xml")) == null, "a genuinely missing package manifest must be skipped without creating an error row");
@@ -6449,13 +6534,9 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     Status = "Stale Explorer StartupApproved metadata; state=0x" + approval.Data[0].ToString("X2") + "; no Windows startup source was found"
                 });
             }
-            foreach (StartupItem packaged in items.Where(item => item.Source == "Packaged Startup Task" && string.IsNullOrWhiteSpace(item.ApprovalRoot)))
-            {
-                packaged.CanDisable = false;
-                packaged.MutationCapability = "ExternalAuthority";
-                packaged.MutationReason = "No existing exact StartupApproved metadata is available; refusing to invent control bytes";
-                packaged.ExternalAuthority = "Windows packaged startup authority";
-            }
+            // Packaged tasks without Explorer metadata are resolved against the AppModel
+            // SystemAppData State authority at parse time (ParsePackagedStartupManifest);
+            // an exact StartupApproved overlay above still takes precedence when it exists.
         }
 
         private static bool StartupApprovalMatches(StartupItem item, StartupApproval approval)
@@ -6990,6 +7071,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 EnabledStartupService.Remove(item);
                 return;
             }
+            if (item.Id.StartsWith("packaged|", StringComparison.OrdinalIgnoreCase)) { SetPackagedStartupTaskState(item, false); EnabledStartupService.Remove(item); return; }
             if (item.Id.StartsWith("winlogon|", StringComparison.OrdinalIgnoreCase)) DisableWinlogonComponent(item);
             else if (item.Id.StartsWith("appinit|", StringComparison.OrdinalIgnoreCase)) DisableAppInit(item);
             else if (item.Id.StartsWith("advanced|", StringComparison.OrdinalIgnoreCase)) DisableAdvancedMultiStringComponent(item);
@@ -7038,6 +7120,13 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 EnabledStartupService.UpsertFromItemChecked(item);
                 // The disabled guard remains authoritative until both the Windows source and
                 // enabled-intent manifest have committed successfully.
+                ProtectedDisabledService.Unprotect(item);
+                return;
+            }
+            if (item.Id.StartsWith("packaged|", StringComparison.OrdinalIgnoreCase))
+            {
+                SetPackagedStartupTaskState(item, true);
+                EnabledStartupService.UpsertFromItemChecked(item);
                 ProtectedDisabledService.Unprotect(item);
                 return;
             }
@@ -11204,6 +11293,8 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     @"Software\Microsoft\Windows\CurrentVersion\RunOnceEx",
                     @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
                     @"Environment",
+                    @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData",
+                    @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages",
                     @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
                     @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
                     @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
