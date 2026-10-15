@@ -1956,7 +1956,13 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             require(codex.PresentationState == "Needs verification");
             codex.VerifiedState = "Drifted";
             require(codex.StateText() == "Drifted" && ToJson(new List<StartupItem> { codex }).Contains("Needs verification"));
-            return "TRUTH_SELF_TEST checks=" + checks + " passed=" + checks + " codex=unverified contradictions=drifted missing=unknown";
+            var packagedTruth = new List<StartupItem> { new StartupItem { Id = "packaged|" + Convert.ToBase64String(Encoding.UTF8.GetBytes("User")) + "|x|y", Source = "Packaged Startup Task", Enabled = true, AppName = "WhatsApp" } };
+            ApplyTruthEvidence(packagedTruth);
+            require(packagedTruth[0].StateText() == "Enabled" && packagedTruth[0].PresentationState != "Unknown");
+            var packagedTruthDisabled = new List<StartupItem> { new StartupItem { Id = "packaged|" + Convert.ToBase64String(Encoding.UTF8.GetBytes("User")) + "|x|z", Source = "Packaged Startup Task", Enabled = false, AppName = "Terminal" } };
+            ApplyTruthEvidence(packagedTruthDisabled);
+            require(packagedTruthDisabled[0].StateText() == "Disabled");
+            return "TRUTH_SELF_TEST checks=" + checks + " passed=" + checks + " codex=unverified contradictions=drifted missing=unknown packaged=verified";
         }
 
         // No writes, no cached successful verdicts, and no process-name inference.
@@ -2000,7 +2006,16 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     item.EvidenceReason = "Explorer StartupApproved is metadata, not an independently firing startup registration";
                     continue;
                 }
-                if (item.Source == "Packaged Startup Task") { item.EvidenceReason = "Manifest declaration and StartupApproved metadata do not prove current AppModel StartupTask authority"; continue; }
+                if (item.Source == "Packaged Startup Task")
+                {
+                    // The row's Enabled flag was resolved from the AppModel SystemAppData State
+                    // authority (or an exact StartupApproved overlay when one exists). That is a
+                    // fresh read of the owning Windows startup surface, so it verifies exactly
+                    // like a Registry Run row instead of hiding in "Unknown"/Attention.
+                    item.VerifiedState = item.Enabled ? "Enabled" : "Disabled";
+                    item.EvidenceReason = "Fresh AppModel StartupTask State read from the packaged startup authority; execution at the next boot/sign-in is not yet observed";
+                    continue;
+                }
 
                 if (item.Source != "Scheduled Task" || !(item.Id ?? "").StartsWith("task|"))
                 {
@@ -2550,6 +2565,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             public string PackageFullName;
             public string PackageFamilyName;
             public string Scope;
+            public string DisplayName;
         }
 
         // StartupApproved\StartupTasks contains only Explorer's state metadata.  A real
@@ -2612,8 +2628,9 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                             // missing manifest is skipped silently by ReadPackageManifestText.
                             string family = Convert.ToString(package.GetValue("PackageFamilyName", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
                             if (string.IsNullOrWhiteSpace(family)) family = PackageFamilyFromFullName(packageFullName);
+                            string displayName = Convert.ToString(package.GetValue("DisplayName", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
                             string identity = scope + "|" + manifest;
-                            if (seen.Add(identity)) result.Add(new PackageManifestLocation { ManifestPath = manifest, PackageFullName = packageFullName, PackageFamilyName = family, Scope = scope });
+                            if (seen.Add(identity)) result.Add(new PackageManifestLocation { ManifestPath = manifest, PackageFullName = packageFullName, PackageFamilyName = family, Scope = scope, DisplayName = displayName });
                         }
                     }
                 }
@@ -2746,6 +2763,12 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     if (!string.IsNullOrWhiteSpace(command) && !Path.IsPathRooted(command)) command = Path.Combine(Path.GetDirectoryName(location.ManifestPath) ?? "", command);
                     if (string.IsNullOrWhiteSpace(command)) command = "Package activation " + registrationName + (string.IsNullOrWhiteSpace(entryPoint) ? "" : " (" + entryPoint + ")");
                     string humanName = !string.IsNullOrWhiteSpace(taskDisplay) && !taskDisplay.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase) ? taskDisplay : displayName;
+                    // The manifest display name is usually an ms-resource string. The package
+                    // repository's DisplayName is the resolved friendly name (e.g. "WhatsApp"
+                    // instead of "5319275A.WhatsAppDesktop_cv1g1gvanyjgm"); prefer it over the
+                    // raw package identity so Apps rows are readable.
+                    if (string.IsNullOrWhiteSpace(humanName) || humanName.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase))
+                        humanName = location.DisplayName ?? "";
                     if (string.IsNullOrWhiteSpace(humanName) || humanName.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase)) humanName = string.IsNullOrWhiteSpace(packageName) ? taskId : packageName;
                     var packaged = new StartupItem
                     {
@@ -4291,7 +4314,12 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     item.ApplicationRoot = packageRoot;
                     item.ApplicationIdentityReason = "Executable belongs to the Windows app package family " + packageName + "; all launchers in that package share one application identity";
                     string friendly = FriendlyNameForPayload(item, applicationTarget);
-                    item.AppName = !string.IsNullOrWhiteSpace(friendly) ? friendly : HumanizeIdentifier(packageName.Replace('.', ' '));
+                    // A manifest-resolved display name ("WhatsApp") is stronger evidence than a
+                    // payload fallback that merely sanitizes the family!task registration string.
+                    // Only rows still carrying that sanitized default get replaced here.
+                    string sanitizedRegistration = CleanName(item.Name);
+                    bool genericAppName = string.IsNullOrWhiteSpace(item.AppName) || string.Equals(item.AppName, sanitizedRegistration, StringComparison.OrdinalIgnoreCase);
+                    if (genericAppName) item.AppName = !string.IsNullOrWhiteSpace(friendly) ? friendly : HumanizeIdentifier(packageName.Replace('.', ' '));
                 }
                 else if (!scriptOwned && owner != null)
                 {
@@ -15951,7 +15979,8 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
 
             AttachTooltips();
             SetFilter("Apps");
-            SetColumnSort(1, true);
+            // _sortColumn stays -1 on launch: newest-added-first is the standing order, and no
+            // column sort may be forced on top of it. A sort begins only when the user picks one.
             UpdateButtons();
             ResumeLayout(true);
         }

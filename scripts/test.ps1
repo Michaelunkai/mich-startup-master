@@ -1889,7 +1889,7 @@ function Test-QuietLaunchContract {
 
 function Test-SafeProductContracts {
   $truth = Invoke-AppCommand @('--truth-self-test')
-  Assert-Match $truth.Output '^TRUTH_SELF_TEST checks=13 passed=13 codex=unverified contradictions=drifted missing=unknown' 'Startup truth regression failed.'
+  Assert-Match $truth.Output '^TRUTH_SELF_TEST checks=15 passed=15 codex=unverified contradictions=drifted missing=unknown packaged=verified' 'Startup truth regression failed.'
   "PASS startup-truth $($truth.Output.Trim())"
 
   $inventorySelfTest = Invoke-AppCommand @('--inventory-self-test')

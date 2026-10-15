@@ -7,6 +7,12 @@ Mich Startup Master is a native Windows 11 control center for seeing and managin
 
 The default view is **All routes**: every discovered Windows startup registration is visible immediately, exactly once per registration. Opening the dashboard from its tray icon or using **Clear filters** also resets to that complete route-level view and clears stale search/drill-down state. **Apps** is an optional summary view; it groups exact routes by a proven installed-product path owner or the real executable behind a launcher, includes app-owned automatic services such as Logitech G HUB's updater, and can enable or disable every matching route for one app in a single rollback-safe transaction. Display-name similarity is never treated as ownership evidence.
 
+## What changed in 2.7.1
+
+- **Packaged rows verify as Enabled/Disabled.** 2.7 read the AppModel State correctly but the truth-evidence layer still stamped every Packaged Startup Task row "Unknown / Needs verification", pushing WhatsApp into Attention instead of the Enabled count. The layer now verifies packaged rows from the same fresh State read.
+- **Newest-added-first is the real launch order.** The dashboard forced a Status column sort on startup, so the newest-first standing order never appeared. The launch sort is now newest-added-first; a column sort begins only when the user picks one.
+- **Friendly packaged names.** Rows use the package repository's resolved DisplayName ("WhatsApp") instead of the raw family!task identity when the manifest name is an ms-resource string.
+
 ## What changed in 2.7
 
 - **Packaged task state is now read from the real OS authority.** Explorer's `StartupApproved\StartupTasks` key often does not exist at all, and 2.6 then fell back to the manifest default, marked the row `ExternalAuthority`, and left it permanently non-toggleable — WhatsApp-class apps appeared with the wrong enabled state and could not be enabled or disabled from the app. The scan now reads `HKCU\...\AppModel\SystemAppData\<family>\<task>\State` (the exact value Windows Settings and Task Manager write): State 2 shows as enabled, 0/1 as disabled, and the row is always user-toggleable. Only policy-controlled states (3/4) stay blocked, with the reason shown. Toggling writes that same State value and verifies it after writing.

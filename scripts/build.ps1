@@ -509,7 +509,7 @@ function Assert-StagedBehavior {
     $probes += $state
 
     $truth = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--truth-self-test'
-    if ($truth.Stdout.Trim() -ne 'TRUTH_SELF_TEST checks=13 passed=13 codex=unverified contradictions=drifted missing=unknown') { throw "Startup truth gate failed: $($truth.Stdout)" }
+    if ($truth.Stdout.Trim() -ne 'TRUTH_SELF_TEST checks=15 passed=15 codex=unverified contradictions=drifted missing=unknown packaged=verified') { throw "Startup truth gate failed: $($truth.Stdout)" }
     $probes += $truth
 
     $inventory = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--inventory-self-test'
