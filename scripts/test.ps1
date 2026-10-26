@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   [switch]$QuietLaunchOnly,
   [switch]$AllowLiveMutation,
@@ -2619,10 +2619,35 @@ function Test-LiveMutationSuite {
   "PASS live-cleanup tasks=$($createdTasks.Count) services=$($createdServices.Count) registryValues=$($registrySnapshots.Count) startupFolder=restored stores=$($stateStoreSnapshots.Count) isolatedStateRoot=removed environments=restored fixture=removed"
 }
 
+  function Test-LiveGateContracts { 
+    $verifySw = [System.Diagnostics.Stopwatch]::StartNew() 
+    $verify = Invoke-AppCommand @('--verify-live-inventory') 
+    $verifySw.Stop() 
+    Assert-Match $verify.Output 'LIVE_INVENTORY_VERIFY passed=true ' 'Live inventory verify gate failed.' 
+    $scanned = [int](Get-ReceiptValue $verify.Output 'scanned') 
+    $missing = [int](Get-ReceiptValue $verify.Output 'missing') 
+    $searchMissing = [int](Get-ReceiptValue $verify.Output 'search_missing') 
+    $enabledExpected = [int](Get-ReceiptValue $verify.Output 'enabled_expected') 
+    $enabledRendered = [int](Get-ReceiptValue $verify.Output 'enabled_rendered')
+    $disabledExpected = [int](Get-ReceiptValue $verify.Output 'disabled_expected') 
+    $disabledRendered = [int](Get-ReceiptValue $verify.Output 'disabled_rendered') 
+    if ($scanned -lt 1 -or $missing -ne 0 -or $searchMissing -ne 0 -or $enabledExpected -ne $enabledRendered -or $disabledExpected -ne $disabledRendered) { 
+      throw "Live inventory verify coverage contract failed: $($verify.Output)" 
+    } 
+    if ($verifySw.Elapsed.TotalSeconds -ge 60) { throw "Live inventory verify completed in $([math]::Round($verifySw.Elapsed.TotalSeconds, 1))s; the visibility probe path regressed past 60s." } 
+    "PASS live-verify-gate scanned=$scanned missing=0 searchMissing=0 enabledMatched=true disabledMatched=true seconds=$([math]::Round($verifySw.Elapsed.TotalSeconds, 1))"
+    $smoke = Invoke-AppCommand @('--smoke') 
+    Assert-Match $smoke.Output 'SMOKE passed=true inventory=\d+ invalid=0 duplicate_ids=0 ' 'Smoke gate regressed.' 
+    'PASS live-smoke-gate invalid=0 duplicate_ids=0' 
+    $audit = Invoke-AppCommand @('--audit-boot') -AllowFailure 
+    Assert-Match $audit.Output 'BOOT_AUDIT independent=true independence_scope=authoritative-enumerators sources=\d+ shown=\d+ gaps=0 errors=0' 'Boot coverage audit reported gaps or errors.' 
+    'PASS live-boot-audit gaps=0 errors=0' 
+  }
   Assert-HarnessIsolationOrder
   $script:RealAppDataEvidenceBefore = Get-AppDataEvidence -Path $script:RealAppDataRoot
   Start-IsolationWriteJournal
   Test-SafeProductContracts
+  Test-LiveGateContracts
   Assert-PureIsolationUnchanged
 
   if ($QuietLaunchOnly) {

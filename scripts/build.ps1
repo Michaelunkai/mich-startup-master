@@ -533,7 +533,7 @@ function Assert-StagedBehavior {
     $probes += $managedDedupe
 
     $bulkDisable = Invoke-StagedCliProbe -ExecutablePath $executable -Arguments '--bulk-disable-self-test'
-    if ($bulkDisable.Stdout.Trim() -ne 'BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true successfulBulkDisable=true successfulBulkRestore=true sharedPhysicalCollapsed=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true') {
+    if ($bulkDisable.Stdout.Trim() -ne 'BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true successfulBulkDisable=true successfulBulkRestore=true sharedPhysicalCollapsed=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true vendorRestoreTolerant=true legacyRecordRetired=true unknownTriggerVisible=true') {
         throw "Transactional bulk state behavior gate failed: $($bulkDisable.Stdout)"
     }
     $probes += $bulkDisable

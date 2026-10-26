@@ -156,7 +156,7 @@ namespace MichStartupMaster
                 }
                 if (cmd == "--state-store-worker") return StateStoreFile.Worker(args);
                 if (cmd == "--state-store-self-test") { Console.WriteLine(StateStoreFile.SelfTest()); return 0; }
-                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.4.0"); return 0; }
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.8.0"); return 0; }
                 if (cmd == "--help" || cmd == "-h" || cmd == "/?" || cmd == "help") { CliShowHelp(); return 0; }
                 if (cmd == "--list") { var items = StartupService.ScanAll().GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
                 if (cmd == "--list-enabled") { var items = StartupService.ScanAll().Where(x => x.Enabled).GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
@@ -1871,6 +1871,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             foreach (StartupItem disabled in disabledItems)
             {
                 string identity = SharedUserRegistryPhysicalIdentity(disabled);
+                if (string.IsNullOrWhiteSpace(identity)) identity = LegacyDisabledRegistryIdentity(disabled, liveItems);
                 if (!string.IsNullOrWhiteSpace(identity) && liveIdentities.Contains(identity)) stale.Add(disabled.Id ?? "");
                 else kept.Add(disabled);
             }
@@ -1881,6 +1882,42 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 catch { kept.Add(disabledItems.First(item => string.Equals(item.Id, id, StringComparison.OrdinalIgnoreCase))); }
             }
             return kept;
+        }
+
+        // Older disabled records store only human fields (Status may lack the HKEY_ registry
+        // metadata that SharedUserRegistryPhysicalIdentity keys on).  A vendor that re-creates
+        // the value (qBittorrent is a real example) must still clear the stale record, or the
+        // inventory would show one live registration twice: once enabled and once disabled.
+        private static string LegacyDisabledRegistryIdentity(StartupItem disabled, List<StartupItem> liveItems)
+        {
+            if (disabled == null || string.IsNullOrWhiteSpace(disabled.Id)) return "";
+            string id = disabled.Id;
+            if (!id.StartsWith("disabled|reg|", StringComparison.OrdinalIgnoreCase)) return "";
+            string name = (disabled.Name ?? "").Trim();
+            Match locationMatch = Regex.Match(disabled.Location ?? "",
+                @"^(?<root>HKEY_[A-Z_]+|HKCU|HKU|HKLM)\\(?<subkey>[^:]+?)(?:\s+\[(Registry\d+)\])?$",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            if (locationMatch.Success && name.Length > 0)
+            {
+                string root = locationMatch.Groups["root"].Value.Trim().ToUpperInvariant();
+                string subKey = locationMatch.Groups["subkey"].Value.Trim().TrimEnd('\\').ToUpperInvariant();
+                return "shared-user-registry|" + root + "|" + subKey + "|" + name.ToUpperInvariant();
+            }
+            // Last resort when even the location text is unusable: one exact command match
+            // against a live same-name registration is enough to prove the record stale,
+            // because distinct programs rarely share both a value name and a full command.
+            string command = NormBootKey(disabled.Command ?? "");
+            if (command.Length < 8 || name.Length == 0) return "";
+            foreach (StartupItem live in liveItems)
+            {
+                if (live == null || string.IsNullOrWhiteSpace(live.Id)) continue;
+                if (live.Source != disabled.Source) continue;
+                if (!string.Equals((live.Name ?? "").Trim(), name, StringComparison.OrdinalIgnoreCase)) continue;
+                if (NormBootKey(live.Command ?? "") != command) continue;
+                string liveIdentity = SharedUserRegistryPhysicalIdentity(live);
+                if (!string.IsNullOrWhiteSpace(liveIdentity)) return liveIdentity;
+            }
+            return "";
         }
 
         public static List<StartupItem> ScanAll()
@@ -2844,6 +2881,11 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             public bool Enabled = true;
             public string Delay = "";
             public string UserId = "";
+            // True only when the COM provider refused to report this trigger's type or enabled
+            // state.  An unreadable state is not a verified false: the task stays visible and
+            // never argues "Disabled" from missing evidence alone.
+            public bool TypeUnknown;
+            public bool EnabledUnknown;
         }
 
         private sealed class ScheduledTaskActionSnapshot
@@ -2980,19 +3022,23 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                         {
                             triggerObject = triggers.Item(i);
                             dynamic trigger = triggerObject;
-                            int triggerType = Convert.ToInt32(trigger.Type);
+                            int triggerType;
+                            bool typeUnknown = false;
+                            try { triggerType = Convert.ToInt32(trigger.Type); }
+                            catch (Exception ex) { triggerType = -1; typeUnknown = true; triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Type", ex)); }
                             string triggerId = "";
                             try { triggerId = Convert.ToString(trigger.Id ?? ""); }
-                            catch (Exception ex) { if (IsStartupTaskTriggerType(triggerType)) triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Id", ex)); }
-                            bool enabled = false;
+                            catch (Exception ex) { if (IsStartupTaskTriggerType(triggerType) || typeUnknown) triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Id", ex)); }
+                            bool enabled = true;
+                            bool enabledUnknown = false;
                             try { enabled = Convert.ToBoolean(trigger.Enabled); }
-                            catch (Exception ex) { if (IsStartupTaskTriggerType(triggerType)) triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Enabled", ex)); }
+                            catch (Exception ex) { enabledUnknown = true; if (IsStartupTaskTriggerType(triggerType) || typeUnknown) triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Enabled", ex)); }
                             string delay = "";
                             try { delay = Convert.ToString(trigger.Delay ?? ""); }
-                            catch (Exception ex) { if (IsStartupTaskTriggerType(triggerType)) triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Delay", ex)); }
+                            catch (Exception ex) { if (IsStartupTaskTriggerType(triggerType) || typeUnknown) triggerErrors.Add(Tuple.Create("Trigger[" + i + "].Delay", ex)); }
                             string userId = "";
-                            if (triggerType == 9) try { userId = Convert.ToString(trigger.UserId ?? ""); } catch (Exception ex) { triggerErrors.Add(Tuple.Create("Trigger[" + i + "].UserId", ex)); }
-                            snapshot.Triggers.Add(new ScheduledTaskTriggerSnapshot { Index = i, Type = triggerType, Id = triggerId, Enabled = enabled, Delay = delay, UserId = userId });
+                            if (triggerType == 9 && !typeUnknown) try { userId = Convert.ToString(trigger.UserId ?? ""); } catch (Exception ex) { triggerErrors.Add(Tuple.Create("Trigger[" + i + "].UserId", ex)); }
+                            snapshot.Triggers.Add(new ScheduledTaskTriggerSnapshot { Index = i, Type = triggerType, Id = triggerId, Enabled = enabled, EnabledUnknown = enabledUnknown, TypeUnknown = typeUnknown, Delay = delay, UserId = userId });
                         }
                         catch (Exception ex) { triggerErrors.Add(Tuple.Create("Trigger[" + i + "]", ex)); }
                         finally { ReleaseComObject(triggerObject); }
@@ -3001,7 +3047,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 catch (Exception ex) { rows.Add(ScheduledTaskReadWarning(taskPath, "Trigger collection", ex)); return null; }
                 finally { ReleaseComObject(triggersObject); triggersObject = null; }
 
-                bool startup = snapshot.Triggers.Any(trigger => IsStartupTaskTriggerType(trigger.Type));
+                bool startup = snapshot.Triggers.Any(trigger => IsStartupTaskTriggerType(trigger.Type) || trigger.TypeUnknown);
                 foreach (var error in triggerErrors) rows.Add(ScheduledTaskReadWarning(taskPath, error.Item1, error.Item2));
                 if (!startup) return null;
 
@@ -3208,13 +3254,15 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         {
             if (rows == null || seen == null || snapshot == null) return false;
             string taskPath = NormalizeScheduledTaskPath(snapshot.Path);
-            var startupTriggers = snapshot.Triggers.Where(trigger => IsStartupTaskTriggerType(trigger.Type)).ToList();
+            // A trigger whose type could not be read is kept as a candidate: an unreadable COM
+            // state must never silently omit an enabled registration from the inventory.
+            var startupTriggers = snapshot.Triggers.Where(trigger => IsStartupTaskTriggerType(trigger.Type) || trigger.TypeUnknown).ToList();
             if (string.IsNullOrWhiteSpace(taskPath) || startupTriggers.Count == 0 || !seen.Add(taskPath)) return false;
-            bool enabledStartupTrigger = startupTriggers.Any(trigger => trigger.Enabled);
+            bool enabledStartupTrigger = startupTriggers.Any(trigger => trigger.EnabledUnknown || trigger.Enabled);
             bool enabled = snapshot.TaskEnabled && enabledStartupTrigger;
             string kinds = string.Join("+", snapshot.Triggers.Select(trigger => TaskTriggerName(trigger.Type)).Distinct(StringComparer.OrdinalIgnoreCase));
             string triggerDetails = string.Join(" || ", snapshot.Triggers.Select(trigger => TaskTriggerName(trigger.Type)
-                + "(index=" + trigger.Index + ";enabled=" + trigger.Enabled.ToString().ToLowerInvariant()
+                + "(index=" + trigger.Index + ";enabled=" + (trigger.EnabledUnknown ? "unknown" : trigger.Enabled.ToString().ToLowerInvariant())
                 + (string.IsNullOrWhiteSpace(trigger.Id) ? "" : ";id=" + TaskDetailValue(trigger.Id))
                 + ";delay=" + TaskDetailValue(trigger.Delay)
                 + (string.IsNullOrWhiteSpace(trigger.UserId) ? "" : ";userId=" + TaskDetailValue(trigger.UserId)) + ")"));
@@ -5307,9 +5355,23 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             {
                 string viewLabel = RegistryViewLabel(view);
                 foreach (string subKey in runKeys) AddRegistryValues(items, machineRoot, subKey, "Machine", SourceForRegistryPath(subKey), true, "Runs from " + subKey, null, viewLabel);
-                AddWinlogonValues(items, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Machine", new[] { "Shell", "Userinit", "Taskman", "AppSetup", "System" }, viewLabel);
+                // Terminal Server Startup Programs
+                AddRegistryValues(items, machineRoot, @"SYSTEM\CurrentControlSet\Control\Terminal Server\Wds\rdpwd\StartupPrograms", "Machine", "Terminal Server Startup", true, "Programs started when a Terminal Services session begins", null, viewLabel);
+                // Winlogon core values (including VmApplet)
+                AddWinlogonValues(items, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Machine", new[] { "Shell", "Userinit", "Taskman", "AppSetup", "System", "VmApplet" }, viewLabel);
+                // SafeBoot AlternateShell
+                AddRegistryValues(items, machineRoot, @"SYSTEM\CurrentControlSet\Control\SafeBoot\AlternateShell", "Machine", "SafeBoot AlternateShell", true, "Command shell used in Safe Boot", new[] { "AlternateShell" }, viewLabel);
+                // IconServiceLib
+                AddRegistryValues(items, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows\IconServiceLib", "Machine", "Icon Service Library", true, "Icon codec service DLL", null, viewLabel);
+                // BootExecute
+                AddRegistryValues(items, machineRoot, @"SYSTEM\CurrentControlSet\Control\Session Manager", "Machine", "Boot Execute", true, "Boot-time execute commands", new[] { "BootExecute", "SetupExecute", "Execute", "S0InitialCommand" }, viewLabel);
+                // LSA Packages
+                AddRegistryValues(items, machineRoot, @"SYSTEM\CurrentControlSet\Control\Lsa", "Machine", "LSA Startup Package", true, "LSA authentication/notification/security packages", new[] { "Authentication Packages", "Notification Packages", "Security Packages" }, viewLabel);
+                AddWinlogonValues(items, machineRoot, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "Machine", new[] { "Shell", "Userinit", "Taskman", "AppSetup", "System", "VmApplet" }, viewLabel);
                 AddAppInit(items, machineRoot, viewLabel);
                 AddActiveSetup(items, machineRoot, "Machine", null, viewLabel);
+                // Wow6432Node Active Setup
+                AddActiveSetup(items, machineRoot, "Machine", @"SOFTWARE\Wow6432Node\Microsoft\Active Setup\Installed Components", viewLabel);
             }
             foreach (RegistryView view in UserStartupRegistryViews())
             using (var userRoot = OpenRegistryRoot(RegistryHive.CurrentUser, view))
@@ -5341,8 +5403,17 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             foreach (string path in new[]
             {
                 @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
-                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler",
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects"
             }) AddRegistryValues(items, root, path, scope, "Explorer Startup Extension", true, "Explorer loads this COM extension during desktop startup", null, viewLabel);
+            // Protocol Filters and Handlers
+            AddRegistrySubKeyDefaultValues(items, root, @"SOFTWARE\Classes\Protocols\Filter", scope, "Protocol Filter", false, "Protocol filter handler", viewLabel);
+            AddRegistrySubKeyDefaultValues(items, root, @"SOFTWARE\Classes\Protocols\Handler", scope, "Protocol Handler", false, "Protocol handler", viewLabel);
+            // ShellServiceObjects
+            AddRegistrySubKeyDefaultValues(items, root, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects", scope, "Explorer Startup Extension", false, "Explorer loads this COM extension during desktop startup", viewLabel);
+            // Context Menu Handlers
+            AddRegistrySubKeyDefaultValues(items, root, @"Software\Classes\*\ShellEx\ContextMenuHandlers", scope, "Context Menu Handler", false, "File context menu handler", viewLabel);
+            AddRegistrySubKeyDefaultValues(items, root, @"Software\Classes\Drive\ShellEx\ContextMenuHandlers", scope, "Context Menu Handler", false, "Drive context menu handler", viewLabel);
             AddExplorerShellExtensions(items, root, scope, null, viewLabel, false);
             AddInternetExplorerAddons(items, root, scope, null, viewLabel, false);
         }
@@ -5363,24 +5434,33 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 using (var usersRoot = OpenRegistryRoot(RegistryHive.Users, view))
                 {
                     string viewLabel = RegistryViewLabel(view);
-                    foreach (var hive in LoadedUserHives())
-                    {
-                        string prefix = hive.Item1 + @"\";
-                        string scope = hive.Item2;
-                        foreach (string path in runKeys) AddRegistryValues(items, usersRoot, prefix + path, scope, SourceForRegistryPath(path), true, "Runs for loaded profile " + scope, null, viewLabel);
-                        AddRegistryValues(items, usersRoot, prefix + @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", scope, "Legacy Windows Run", true, "Legacy Windows Load/Run value for " + scope, new[] { "Load", "Run" }, viewLabel);
-                        AddWinlogonValues(items, usersRoot, prefix + @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", scope, new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
-                        AddRegistryValues(items, usersRoot, prefix + @"Environment", scope, "User Logon Script", true, "UserInitMprLogonScript for " + scope, new[] { "UserInitMprLogonScript" }, viewLabel);
-                        AddRunOnceEx(items, usersRoot, scope, prefix + @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx", viewLabel);
-                        foreach (string path in new[]
+foreach (var hive in LoadedUserHives())
                         {
-                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
-                            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"
-                        }) AddRegistryValues(items, usersRoot, prefix + path, scope, "Explorer Startup Extension", true, "Explorer startup extension for " + scope, null, viewLabel);
-                        AddExplorerShellExtensions(items, usersRoot, scope, prefix, viewLabel, false);
-                        AddInternetExplorerAddons(items, usersRoot, scope, prefix, viewLabel, false);
-                        AddActiveSetup(items, usersRoot, scope, prefix + @"SOFTWARE\Microsoft\Active Setup\Installed Components", viewLabel);
-                    }
+                            string prefix = hive.Item1 + @"\";
+                            string scope = hive.Item2;
+                            foreach (string path in runKeys) AddRegistryValues(items, usersRoot, prefix + path, scope, SourceForRegistryPath(path), true, "Runs for loaded profile " + scope, null, viewLabel);
+                            AddRegistryValues(items, usersRoot, prefix + @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", scope, "Legacy Windows Run", true, "Legacy Windows Load/Run value for " + scope, new[] { "Load", "Run" }, viewLabel);
+                            AddWinlogonValues(items, usersRoot, prefix + @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", scope, new[] { "Shell", "Userinit", "Taskman" }, viewLabel);
+                            AddRegistryValues(items, usersRoot, prefix + @"Environment", scope, "User Logon Script", true, "UserInitMprLogonScript for " + scope, new[] { "UserInitMprLogonScript" }, viewLabel);
+                            AddRunOnceEx(items, usersRoot, scope, prefix + @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnceEx", viewLabel);
+                            foreach (string path in new[]
+                            {
+                                @"SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad",
+                                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler",
+                                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects"
+                            }) AddRegistryValues(items, usersRoot, prefix + path, scope, "Explorer Startup Extension", true, "Explorer startup extension for " + scope, null, viewLabel);
+                            // Protocol Filters and Handlers
+                            AddRegistrySubKeyDefaultValues(items, usersRoot, prefix + @"SOFTWARE\Classes\Protocols\Filter", scope, "Protocol Filter", false, "Protocol filter handler", viewLabel);
+                            AddRegistrySubKeyDefaultValues(items, usersRoot, prefix + @"SOFTWARE\Classes\Protocols\Handler", scope, "Protocol Handler", false, "Protocol handler", viewLabel);
+                            // ShellServiceObjects
+                            AddRegistrySubKeyDefaultValues(items, usersRoot, prefix + @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects", scope, "Explorer Startup Extension", false, "Explorer loads this COM extension during desktop startup", viewLabel);
+                            // Context Menu Handlers
+                            AddRegistrySubKeyDefaultValues(items, usersRoot, prefix + @"Software\Classes\*\ShellEx\ContextMenuHandlers", scope, "Context Menu Handler", false, "File context menu handler", viewLabel);
+                            AddRegistrySubKeyDefaultValues(items, usersRoot, prefix + @"Software\Classes\Drive\ShellEx\ContextMenuHandlers", scope, "Context Menu Handler", false, "Drive context menu handler", viewLabel);
+                            AddExplorerShellExtensions(items, usersRoot, scope, prefix, viewLabel, false);
+                            AddInternetExplorerAddons(items, usersRoot, scope, prefix, viewLabel, false);
+                            AddActiveSetup(items, usersRoot, scope, prefix + @"SOFTWARE\Microsoft\Active Setup\Installed Components", viewLabel);
+                        }
                 }
             }
             catch (Exception ex) { items.Add(ErrorItem("Loaded-user registry", "Other users", Registry.Users.Name, ex)); }
@@ -5456,15 +5536,6 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             catch (Exception ex) { items.Add(ErrorItem("AppInit DLLs", "Machine", machineRoot.Name + @"\" + subKey + " [" + viewLabel + "]", ex)); }
         }
 
-        private static string SourceForRegistryPath(string subKey)
-        {
-            if (subKey.IndexOf("RunOnceEx", StringComparison.OrdinalIgnoreCase) >= 0) return "Registry RunOnceEx";
-            if (subKey.IndexOf("RunOnce", StringComparison.OrdinalIgnoreCase) >= 0) return "Registry RunOnce";
-            if (subKey.IndexOf("RunServices", StringComparison.OrdinalIgnoreCase) >= 0) return "Registry RunServices";
-            if (subKey.IndexOf(@"Policies\Explorer\Run", StringComparison.OrdinalIgnoreCase) >= 0) return "Policy Run";
-            return "Registry Run";
-        }
-
         private static void AddRegistryValues(List<StartupItem> items, RegistryKey root, string subKey, string scope, string source, bool canEditValue, string status, string[] valueFilter = null, string viewLabel = null)
         {
             try
@@ -5485,6 +5556,61 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 }
             }
             catch (Exception ex) { items.Add(ErrorItem(source, scope, root.Name + @"\" + subKey, ex)); }
+        }
+
+        // Enumerate subkeys and read their default (empty) value, used for keys like Protocol Filter/Handler,
+        // ShellServiceObjects, and Context Menu Handlers where each subkey represents an entry.
+        private static void AddRegistrySubKeyDefaultValues(List<StartupItem> items, RegistryKey root, string parentPath, string scope, string source, bool canEditValue, string status, string viewLabel = null)
+        {
+            try
+            {
+                using (var parent = root.OpenSubKey(parentPath, false))
+                {
+                    if (parent == null) return;
+                    foreach (string childName in parent.GetSubKeyNames())
+                    {
+                        string childPath = parentPath + @"\" + childName;
+                        try
+                        {
+                            using (var child = root.OpenSubKey(childPath, false))
+                            {
+                                if (child == null) continue;
+                                string defaultValue = Convert.ToString(child.GetValue("", null, RegistryValueOptions.DoNotExpandEnvironmentNames) ?? "");
+                                if (string.IsNullOrWhiteSpace(defaultValue)) continue;
+                                string encodedName = Convert.ToBase64String(Encoding.UTF8.GetBytes(childName));
+                                string id = "reg|" + scope + "|" + B64(root.Name) + "|" + B64(childPath) + "|" + encodedName + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "|" + viewLabel);
+                                items.Add(new StartupItem
+                                {
+                                    Id = id,
+                                    Name = childName,
+                                    Source = source,
+                                    Scope = scope,
+                                    Command = defaultValue,
+                                    Location = root.Name + @"\" + childPath + (string.IsNullOrWhiteSpace(viewLabel) ? "" : " [" + viewLabel + "]"),
+                                    Enabled = true,
+                                    CanDisable = false, // Subkey deletion is not a safe mutation
+                                    IsManaged = false,
+                                    Status = status + (string.IsNullOrWhiteSpace(viewLabel) ? "" : "; " + viewLabel),
+                                    RegistryView = viewLabel,
+                                    MutationCapability = "ReadOnly",
+                                    MutationReason = "This entry is a subkey registration; disabling requires removing the subkey which may affect system components"
+                                });
+                            }
+                        }
+                        catch (Exception ex) { items.Add(ErrorItem(source, scope, root.Name + @"\" + childPath, ex)); }
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem(source, scope, root.Name + @"\" + parentPath, ex)); }
+        }
+
+        private static string SourceForRegistryPath(string subKey)
+        {
+            if (subKey.IndexOf("RunOnceEx", StringComparison.OrdinalIgnoreCase) >= 0) return "Registry RunOnceEx";
+            if (subKey.IndexOf("RunOnce", StringComparison.OrdinalIgnoreCase) >= 0) return "Registry RunOnce";
+            if (subKey.IndexOf("RunServices", StringComparison.OrdinalIgnoreCase) >= 0) return "Registry RunServices";
+            if (subKey.IndexOf(@"Policies\Explorer\Run", StringComparison.OrdinalIgnoreCase) >= 0) return "Policy Run";
+            return "Registry Run";
         }
 
         private static void AddWinlogonValues(List<StartupItem> items, RegistryKey root, string subKey, string scope, string[] valueFilter, string viewLabel)
@@ -7053,8 +7179,70 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     && enabledBefore == StoreFingerprint(Program.EnabledStore)
                     && protectedDisabledBefore == StoreFingerprint(Program.ProtectedDisabledStore)
                     && protectedQuietBefore == StoreFingerprint(Program.ProtectedQuietStore);
-                if (!failedClosed || !registryRestored || !approvalRestored || !successfulBulkDisable || !successfulBulkRestore || !sharedPhysicalCollapsed || !enableFailedClosed || !enableApprovalRestored || !storesRestored) throw new InvalidOperationException("BULK_DISABLE_SELF_TEST failed failedClosed=" + failedClosed.ToString().ToLowerInvariant() + " registryRestored=" + registryRestored.ToString().ToLowerInvariant() + " approvalRestored=" + approvalRestored.ToString().ToLowerInvariant() + " successfulBulkDisable=" + successfulBulkDisable.ToString().ToLowerInvariant() + " successfulBulkRestore=" + successfulBulkRestore.ToString().ToLowerInvariant() + " sharedPhysicalCollapsed=" + sharedPhysicalCollapsed.ToString().ToLowerInvariant() + " enableFailedClosed=" + enableFailedClosed.ToString().ToLowerInvariant() + " enableApprovalRestored=" + enableApprovalRestored.ToString().ToLowerInvariant() + " storesRestored=" + storesRestored.ToString().ToLowerInvariant());
-                return "BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true successfulBulkDisable=true successfulBulkRestore=true sharedPhysicalCollapsed=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true";
+
+                // Coverage regression 2.8.0: a vendor that re-creates a disabled Run value
+                // (qBittorrent is the real instance) must never make the app unable to restore,
+                // show one physical value twice, or keep a stale disabled record alive.
+                bool vendorRestoreTolerant = false;
+                bool legacyRecordRetired = false;
+                bool unknownTriggerVisible = false;
+                string vendorSubKey = subKey + "\\VendorRestore";
+                string vendorValueName = "VendorRoute";
+                try
+                {
+                    using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                    using (var key = root.CreateSubKey(vendorSubKey)) key.SetValue(vendorValueName, command, RegistryValueKind.String);
+                    DisabledStoreService.Add("reg", vendorValueName, "User", command, Registry.CurrentUser.Name + "\\" + vendorSubKey + " [" + viewLabel + "]",
+                        string.Join("\t", Registry.CurrentUser.Name, vendorSubKey, vendorValueName, RegistryValueKind.String.ToString(), "Registry Run", B64(SerializeRegistryValue(command, RegistryValueKind.String)), viewLabel));
+                    StartupItem vendorDisabledRow = DisabledStoreService.LoadDisabledItems().First(row => string.Equals(row.Name, vendorValueName, StringComparison.OrdinalIgnoreCase));
+                    var vendorLive = new StartupItem
+                    {
+                        Id = "reg|User|" + B64(Registry.CurrentUser.Name) + "|" + B64(vendorSubKey) + "|" + B64(vendorValueName) + "|" + viewLabel,
+                        Name = vendorValueName, Source = "Registry Run", Scope = "User", Command = command,
+                        Location = Registry.CurrentUser.Name + "\\" + vendorSubKey + " [" + viewLabel + "]", RegistryView = viewLabel,
+                        Enabled = true, CanDisable = true
+                    };
+                    // 1) Retirement: a stale disabled record matching a live physical value is retired exactly once.
+                    vendorRestoreTolerant = RetireDisabledRecordsMatchingLiveRoutes(new List<StartupItem> { vendorLive }, DisabledStoreService.LoadDisabledItems())
+                        .All(row => !string.Equals(row.Id, vendorDisabledRow.Id, StringComparison.OrdinalIgnoreCase));
+                    DisabledStoreService.Remove(vendorDisabledRow.Id);
+                    // 2) Re-enable must survive a live value written by the vendor, preserving the vendor content.
+                    DisabledStoreService.Add("reg", vendorValueName, "User", "stale-original-command", vendorDisabledRow.Location,
+                        string.Join("\t", Registry.CurrentUser.Name, vendorSubKey, vendorValueName, RegistryValueKind.String.ToString(), "Registry Run", B64(SerializeRegistryValue("stale-original-command", RegistryValueKind.String)), viewLabel));
+                    var vendorDisabledAgain = DisabledStoreService.LoadDisabledItems().First(row => string.Equals(row.Name, vendorValueName, StringComparison.OrdinalIgnoreCase) && string.Equals(row.Command, "stale-original-command", StringComparison.OrdinalIgnoreCase));
+                    RestoreRegistry(vendorDisabledAgain);
+                    string liveNow;
+                    using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                    using (RegistryKey key = root.OpenSubKey(vendorSubKey, false))
+                        liveNow = Convert.ToString(key.GetValue(vendorValueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    vendorRestoreTolerant = vendorRestoreTolerant
+                        && string.Equals(liveNow, command, StringComparison.Ordinal)
+                        && !DisabledStoreService.LoadDisabledItems().Any(row => string.Equals(row.Id, vendorDisabledAgain.Id, StringComparison.OrdinalIgnoreCase));
+                    // 3) A legacy record without registry metadata retires by its location identity.
+                    var legacyDisabled = new StartupItem
+                    {
+                        Id = "disabled|reg|" + token, Name = vendorValueName, Source = "Registry Run", Scope = "User",
+                        Command = command, Location = Registry.CurrentUser.Name + "\\" + vendorSubKey + " [" + viewLabel + "]", Status = "", Enabled = false, CanDisable = true
+                    };
+                    legacyRecordRetired = RetireDisabledRecordsMatchingLiveRoutes(new List<StartupItem> { vendorLive }, new List<StartupItem> { legacyDisabled }).Count == 0;
+                    // 4) A task trigger that COM could not read keeps the task visible and enabled.
+                    var unknownTriggerRows = new List<StartupItem>();
+                    var unknownSnapshot = new ScheduledTaskInventorySnapshot
+                    {
+                        Path = @"\Fixture\UnknownTrigger", TaskEnabled = true, StateLabel = "Ready",
+                        Triggers = { new ScheduledTaskTriggerSnapshot { Index = 1, Type = -1, TypeUnknown = true, EnabledUnknown = true } }
+                    };
+                    unknownTriggerVisible = TryAppendScheduledTaskSnapshot(unknownTriggerRows, new HashSet<string>(StringComparer.OrdinalIgnoreCase), unknownSnapshot)
+                        && unknownTriggerRows.Count == 1 && unknownTriggerRows[0].Enabled;
+                }
+                finally
+                {
+                    DisabledStoreService.Remove("disabled|reg|" + token);
+                    try { DisabledStoreService.Remove(DisabledStoreService.LoadDisabledItems().First(row => string.Equals(row.Name, vendorValueName, StringComparison.OrdinalIgnoreCase)).Id); } catch { }
+                    try { using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view)) root.DeleteSubKeyTree(vendorSubKey, false); } catch { }
+                }
+                if (!vendorRestoreTolerant || !legacyRecordRetired || !unknownTriggerVisible) throw new InvalidOperationException("BULK_DISABLE_SELF_TEST coverage2.8.0 failed vendorRestoreTolerant=" + vendorRestoreTolerant.ToString().ToLowerInvariant() + " legacyRecordRetired=" + legacyRecordRetired.ToString().ToLowerInvariant() + " unknownTriggerVisible=" + unknownTriggerVisible.ToString().ToLowerInvariant());
+                return "BULK_DISABLE_SELF_TEST passed=true failedClosed=true registryRestored=true approvalRestored=true successfulBulkDisable=true successfulBulkRestore=true sharedPhysicalCollapsed=true enableFailedClosed=true enableApprovalRestored=true storesRestored=true vendorRestoreTolerant=true legacyRecordRetired=true unknownTriggerVisible=true";
             }
             finally
             {
@@ -7417,7 +7605,16 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             if (meta.Length > 5 && !string.IsNullOrWhiteSpace(meta[5])) restored = DeserializeRegistryValue(UnB64(meta[5]), kind);
             using (var key = root.CreateSubKey(subKey))
             {
-                if (key.GetValueNames().Any(n => string.Equals(n, valueName, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException("A registry value now exists at the restore location; refusing to overwrite it: " + valueName);
+                if (key.GetValueNames().Any(n => string.Equals(n, valueName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    // A vendor installer or updater re-created this exact registration while it
+                    // was archived disabled.  The live value is authoritative (the retirement
+                    // rule in RetireDisabledRecordsMatchingLiveRoutes); the enable action must
+                    // retire the stale record instead of failing, so the user is never locked
+                    // out of re-enabling an app that re-registered itself.
+                    DisabledStoreService.Remove(item.Id);
+                    return;
+                }
                 key.SetValue(valueName, restored, kind);
             }
             DisabledStoreService.Remove(item.Id);
@@ -13134,6 +13331,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             if (windowClass.IndexOf("SystemTrayIcon", StringComparison.Ordinal) >= 0
                 || windowClass.IndexOf("TrayIcon", StringComparison.Ordinal) >= 0
                 || windowClass.IndexOf("NotifyIcon", StringComparison.Ordinal) >= 0
+                || windowClass.IndexOf("_Notification_Class", StringComparison.Ordinal) >= 0 // Process Lasso native tray host, aligned with the audit detector
                 || string.Equals(windowClass, "AutoHotkey", StringComparison.OrdinalIgnoreCase)) return true;
             // WinForms uses the same class family for ordinary Forms and its
             // NotifyIcon callback sink. Only the hidden, untitled sink proves a
@@ -14959,7 +15157,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 scriptRoutes++;
                 if (!StartupService.IsScriptApplicationIdentity(item.ApplicationIdentity)) scriptIdentityErrors++;
             }
-            int gameAutoRoutes = 0, gameAutoExpectedRows = 0, gameAutoNameRows = 0, gameAutoFitGirlRows = 0, gameAutoMissing = 0;
+            int gameAutoRoutes = 0, gameAutoExpectedRows = 0, gameAutoNameRows = 0, gameAutoFitGirlRows = 0, gameAutoMissing = 0, gameAutoFitGirlRequired = 0, gameAutoIdentityProbes = 0, gameAutoIdentityRows = 0;
             int qbittorrentRoutes = 0, qbittorrentExpectedRows = 0, qbittorrentRows = 0, qbittorrentMissing = 0;
             string firstSearchMissing = "";
             string firstAppsMissing = "";
@@ -15019,11 +15217,10 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                         foreach (var eligibleTab in new[] { eligibleOnApps ? "Apps" : null, eligibleOnEnabled && !eligibleOnApps ? "Enabled" : null, eligibleOnDisabled && !eligibleOnApps && !eligibleOnEnabled ? "Disabled" : null })
                         {
                             if (eligibleTab == null) continue;
-                            form.SetFilter(eligibleTab);
+                            form._filterMode = eligibleTab; // pure filter input; re-rendering the control per probe made this gate take minutes
                             var searchedRows = form.BuildVisibleRows(query);
                             if (searchedRows.Any(row => row.Routes != null && row.Routes.Any(route => string.Equals(route.Id, item.Id, StringComparison.OrdinalIgnoreCase)))) { found = true; break; }
                         }
-                        form.SetFilter("Apps");
                         if (!found)
                         {
                             searchMissing++;
@@ -15129,18 +15326,44 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     // interpreter and any child executable are implementation details and must
                     // never steal their identity. Prove the real GameAutoInstall project is one
                     // searchable app while direct qBittorrent startup remains a separate app.
-                    var liveGameAutoRoutes = scanned.Where(item => IsAppRoute(item) && IsGameAutoInstallRoute(item)).ToList();
-                    gameAutoRoutes = liveGameAutoRoutes.Count;
-                    if (gameAutoRoutes > 0)
-                    {
-                        var gameAutoIds = new HashSet<string>(liveGameAutoRoutes.Select(item => item.Id), StringComparer.OrdinalIgnoreCase);
-                        gameAutoExpectedRows = liveGameAutoRoutes.Select(ApplicationGroupIdentity).Distinct(StringComparer.OrdinalIgnoreCase).Count();
-                        var nameMatches = form.BuildVisibleRows("Game Auto Install").Where(row => row.Routes.Any(route => gameAutoIds.Contains(route.Id))).ToList();
-                        var fitGirlMatches = form.BuildVisibleRows("FitGirl").Where(row => row.Routes.Any(route => gameAutoIds.Contains(route.Id))).ToList();
+                    var liveGameAutoRoutes = scanned.Where(item => IsAppRoute(item) && IsGameAutoInstallRoute(item)).ToList(); 
+                    gameAutoRoutes = liveGameAutoRoutes.Count; 
+                    if (gameAutoRoutes > 0) 
+                    { 
+                        var gameAutoIds = new HashSet<string>(liveGameAutoRoutes.Select(item => item.Id), StringComparer.OrdinalIgnoreCase); 
+                        gameAutoExpectedRows = liveGameAutoRoutes.Select(ApplicationGroupIdentity).Distinct(StringComparer.OrdinalIgnoreCase).Count(); 
+                        var nameMatches = form.BuildVisibleRows("Game Auto Install").Where(row => row.Routes.Any(route => gameAutoIds.Contains(route.Id))).ToList(); 
                         gameAutoNameRows = nameMatches.Count;
-                        gameAutoFitGirlRows = fitGirlMatches.Count;
-                        var visibleIds = new HashSet<string>(nameMatches.SelectMany(row => row.Routes).Select(route => route.Id), StringComparer.OrdinalIgnoreCase);
-                        gameAutoMissing = gameAutoIds.Count(id => !visibleIds.Contains(id));
+                        // Identity probes are derived from the live routes themselves so the gate can 
+                        // never go stale: every registration-name token and every distributor tag 
+                        // present in the route text must find the application group by search. 
+                        var identityQueries = new SortedSet<string>(StringComparer.OrdinalIgnoreCase); 
+                        foreach (var route in liveGameAutoRoutes) 
+                        { 
+                            string routeName = (route.Name ?? "").Trim(); 
+                            if (routeName.Length > 0 && !string.Equals(routeName, "Game Auto Install", StringComparison.OrdinalIgnoreCase)) identityQueries.Add(routeName); 
+                            string locationLeaf = (route.Location ?? "").TrimEnd('\\'); 
+                            int lastSep = locationLeaf.LastIndexOf('\\'); 
+                            if (lastSep >= 0 && lastSep + 1 < locationLeaf.Length) identityQueries.Add(locationLeaf.Substring(lastSep + 1));
+                            foreach (string tag in new[] { "fitgirl", "rune" }) 
+                                if (SearchText(route).IndexOf(tag, StringComparison.OrdinalIgnoreCase) >= 0) identityQueries.Add(tag); 
+                        } 
+                        identityQueries.Remove("Game Auto Install"); 
+                        var coveredByIdentity = new HashSet<string>(StringComparer.OrdinalIgnoreCase); 
+                        foreach (string identityQuery in identityQueries) 
+                        { 
+                            gameAutoIdentityProbes++; 
+                            bool isFitGirl = string.Equals(identityQuery, "fitgirl", StringComparison.OrdinalIgnoreCase); 
+                            if (isFitGirl) gameAutoFitGirlRequired = 1;
+                            var identityMatches = form.BuildVisibleRows(identityQuery).Where(row => row.Routes.Any(route => gameAutoIds.Contains(route.Id))).ToList(); 
+                            if (isFitGirl) gameAutoFitGirlRows = identityMatches.Count; 
+                            if (identityMatches.Count == 0) continue; 
+                            gameAutoIdentityRows++; 
+                            foreach (var matched in identityMatches) foreach (var route in matched.Routes) if (gameAutoIds.Contains(route.Id)) coveredByIdentity.Add(route.Id); 
+                        } 
+                        var visibleIds = new HashSet<string>(nameMatches.SelectMany(row => row.Routes).Select(route => route.Id), StringComparer.OrdinalIgnoreCase); 
+                        visibleIds.UnionWith(coveredByIdentity); 
+                        gameAutoMissing = gameAutoIds.Count(id => !visibleIds.Contains(id)); 
                     }
 
                     var liveQbittorrentRoutes = scanned.Where(item => IsAppRoute(item) && IsDirectQbittorrentRoute(item)).ToList();
@@ -15167,7 +15390,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 && Regex.IsMatch(boot ?? "", @"(?:^|\s)gaps=0(?:\s|$)")
                 && Regex.IsMatch(boot ?? "", @"(?:^|\s)errors=0(?:\s|$)");
             bool logitechVisible = logitechRoutes == 0 || (logitechExpectedRows > 0 && logitechNameRows == logitechExpectedRows && logitechPathRows == logitechExpectedRows && logitechMissing == 0);
-            bool gameAutoVisible = gameAutoRoutes == 0 || (gameAutoExpectedRows == 1 && gameAutoNameRows == 1 && gameAutoFitGirlRows == 1 && gameAutoMissing == 0);
+            bool gameAutoVisible = gameAutoRoutes == 0 || (gameAutoExpectedRows == 1 && gameAutoNameRows == 1 && gameAutoIdentityProbes > 0 && gameAutoIdentityRows == gameAutoIdentityProbes && gameAutoFitGirlRows >= gameAutoFitGirlRequired && gameAutoMissing == 0);
             bool qbittorrentVisible = qbittorrentRoutes == 0 || (qbittorrentExpectedRows > 0 && qbittorrentRows == qbittorrentExpectedRows && qbittorrentMissing == 0);
             bool passed = scanned.Count > 0 && invalid == 0 && providerErrors == 0 && duplicateInventoryIds == 0 && duplicateSharedUserRegistryRoutes == 0
                 && uncoveredRoutes == 0 && missing == 0 && unexpected == 0 && duplicateRenderedIds == 0 && searchMissing == 0 && appsMissing == 0
@@ -15194,7 +15417,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 + " logitech_missing=" + logitechMissing + " logitech_visible=" + logitechVisible.ToString().ToLowerInvariant()
                 + " script_routes=" + scriptRoutes + " script_identity_errors=" + scriptIdentityErrors
                 + " game_auto_routes=" + gameAutoRoutes + " game_auto_expected_app_rows=" + gameAutoExpectedRows
-                + " game_auto_name_rows=" + gameAutoNameRows + " game_auto_fitgirl_rows=" + gameAutoFitGirlRows
+                + " game_auto_name_rows=" + gameAutoNameRows + " game_auto_fitgirl_rows=" + gameAutoFitGirlRows + " game_auto_fitgirl_required=" + gameAutoFitGirlRequired + " game_auto_identity_probes=" + gameAutoIdentityProbes + " game_auto_identity_rows=" + gameAutoIdentityRows
                 + " game_auto_missing=" + gameAutoMissing + " game_auto_visible=" + gameAutoVisible.ToString().ToLowerInvariant()
                 + " qbittorrent_routes=" + qbittorrentRoutes + " qbittorrent_expected_app_rows=" + qbittorrentExpectedRows
                 + " qbittorrent_rows=" + qbittorrentRows + " qbittorrent_missing=" + qbittorrentMissing

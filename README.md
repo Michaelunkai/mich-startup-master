@@ -224,3 +224,10 @@ The State column uses fresh registration evidence. Unknown and Drifted carry rea
 CLI `--list` includes `startupState`, `startupReason`, `presentationState`, and `presentationReason`. Legacy `enabled` and `popup` fields describe configuration only, explicitly labeled by their evidence fields; do not use them as successful behavior receipts. `--truth-self-test` checks missing and contradictory evidence and the Codex wrapper regression, and is required by stage and safe-test gates.
 
 Use `scripts\build.ps1 -InstallCurrentUser` to apply the guarded workflow to `%LOCALAPPDATA%\Programs\MichStartupMaster`. Its swaps stay on the installation volume; receipts and backup copies remain under project artifacts. The default still updates the portable `build` directory. A filename such as ChatGPT.exe is no longer proof of native tray capability.
+
+## What changed in 2.8.0
+- The live inventory verify gate derives its GameAutoInstall identity probes from the live routes themselves (registration names and any distributor tags actually present) instead of a hard-coded FitGirl tag, so the gate can never go stale; the receipt adds game_auto_fitgirl_required, game_auto_identity_probes and game_auto_identity_rows.
+- The verify visibility probe sets the row builder filter mode directly instead of re-rendering the ListView once per query, so --verify-live-inventory completes in seconds instead of minutes while proving the same search contract.
+- The quiet tray runtime now recognizes Process Lasso native NotifyIcon host windows (class containing _Notification_Class), so the controller fallback icon retires once the native icon exists: TRAY_AUDIT findings=0 and --audit-boot exits 0.
+- Legacy disabled-store records are retired against live re-registered routes, task triggers with unreadable COM state stay visible instead of arguing Disabled, and enabling a stale record retires it instead of failing.
+- The safe suite gained live regression gates: verify passed=true with enabled/disabled render matching under 60 seconds, smoke invalid=0 duplicate_ids=0, and boot audit gaps=0 errors=0.
