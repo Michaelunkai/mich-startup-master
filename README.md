@@ -234,3 +234,10 @@ Use `scripts\build.ps1 -InstallCurrentUser` to apply the guarded workflow to `%L
 
 ## What changed in 2.8.1
 - Preserved disabled routes whose original command used a bare PATH-relative executable (cmd.exe, wscript.exe and friends) can be enabled again: the launch-target resolver now resolves bare names against the system directories and PATH before the existence check, instead of failing with a rollback.
+
+## What changed in 2.9.0
+- Every fireable Task Scheduler task is now inventoried, not only boot/logon/session-triggered ones: tasks that run on time or event triggers join a dedicated "Scheduled Task (Any Trigger)" surface with their real scheduler state, searchable and individually disableable and enableable; Windows library tasks under \Microsoft carry an external-authority marker and bulk boot policy ignores the new surface.
+- Manual trigger-start services (registry Start=3 with TriggerInfo, for example edgeupdatem and the NVIDIA FrameView service) join under "Service (Trigger Start)"; disabled (4) services stay out because they cannot start.
+- The bare-executable enable fix now also resolves extensionless commands (powershell, wscript) through PATHEXT, so enabling preserved routes covers every command form.
+- The verify gate probes findability through an order-free row builder so the every-route name probe stays well under its 60-second bar while the inventory nearly doubled.
+- The independent boot audit reconciles the full task and trigger-service universe every run: sources~740, shown~930, gaps=0, errors=0.

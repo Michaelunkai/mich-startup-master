@@ -156,7 +156,7 @@ namespace MichStartupMaster
                 }
                 if (cmd == "--state-store-worker") return StateStoreFile.Worker(args);
                 if (cmd == "--state-store-self-test") { Console.WriteLine(StateStoreFile.SelfTest()); return 0; }
-                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.8.1"); return 0; }
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.9.0"); return 0; }
                 if (cmd == "--help" || cmd == "-h" || cmd == "/?" || cmd == "help") { CliShowHelp(); return 0; }
                 if (cmd == "--list") { var items = StartupService.ScanAll().GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
                 if (cmd == "--list-enabled") { var items = StartupService.ScanAll().Where(x => x.Enabled).GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
@@ -2866,6 +2866,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         private sealed class ScheduledTaskInventorySnapshot
         {
             public string Path = "";
+            public bool StartupTrigger;
             public bool TaskEnabled = true;
             public string StateLabel = "Unknown";
             public bool ActionsComplete = true;
@@ -3049,7 +3050,9 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
 
                 bool startup = snapshot.Triggers.Any(trigger => IsStartupTaskTriggerType(trigger.Type) || trigger.TypeUnknown);
                 foreach (var error in triggerErrors) rows.Add(ScheduledTaskReadWarning(taskPath, error.Item1, error.Item2));
-                if (!startup) return null;
+                // Non-boot tasks must still be inventoried: the snapshot completes and the
+                // shared emitter classifies it onto the any-trigger surface.
+                snapshot.StartupTrigger = startup;
 
                 try { snapshot.TaskEnabled = Convert.ToBoolean(((dynamic)taskObject).Enabled); }
                 catch (Exception ex) { snapshot.TaskEnabled = false; rows.Add(ScheduledTaskReadWarning(taskPath, "Enabled state", ex)); }
@@ -3257,9 +3260,14 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             // A trigger whose type could not be read is kept as a candidate: an unreadable COM
             // state must never silently omit an enabled registration from the inventory.
             var startupTriggers = snapshot.Triggers.Where(trigger => IsStartupTaskTriggerType(trigger.Type) || trigger.TypeUnknown).ToList();
-            if (string.IsNullOrWhiteSpace(taskPath) || startupTriggers.Count == 0 || !seen.Add(taskPath)) return false;
+            // Every scheduled task must be inventoried, not only the boot class: a task
+            // without boot triggers still runs on its own schedule and hiding it is the
+            // missed-registration failure. Non-boot tasks join a distinct any-trigger
+            // surface so boot semantics, quiet plans and bulk boot policy stay untouched.
+            if (string.IsNullOrWhiteSpace(taskPath) || snapshot.Triggers.Count == 0 || !seen.Add(taskPath)) return false;
+            bool startupRoute = startupTriggers.Count > 0;
             bool enabledStartupTrigger = startupTriggers.Any(trigger => trigger.EnabledUnknown || trigger.Enabled);
-            bool enabled = snapshot.TaskEnabled && enabledStartupTrigger;
+            bool enabled = startupRoute ? snapshot.TaskEnabled && enabledStartupTrigger : snapshot.TaskEnabled;
             string kinds = string.Join("+", snapshot.Triggers.Select(trigger => TaskTriggerName(trigger.Type)).Distinct(StringComparer.OrdinalIgnoreCase));
             string triggerDetails = string.Join(" || ", snapshot.Triggers.Select(trigger => TaskTriggerName(trigger.Type)
                 + "(index=" + trigger.Index + ";enabled=" + (trigger.EnabledUnknown ? "unknown" : trigger.Enabled.ToString().ToLowerInvariant())
@@ -3269,25 +3277,27 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             string command = string.Join(" || ", snapshot.Actions.Select(TaskActionCommand).Where(value => !string.IsNullOrWhiteSpace(value)));
             string actionDetails = string.Join(" || ", snapshot.Actions.Select(TaskActionDetails));
             bool modeEditable = snapshot.ActionsComplete && snapshot.Actions.Count == 1 && snapshot.Actions[0].Type == 0 && !string.IsNullOrWhiteSpace(snapshot.Actions[0].Path);
-            string status = (enabled ? "Enabled " : "Disabled ") + kinds + " startup task"
+            string status = (enabled ? "Enabled " : "Disabled ") + kinds + (startupRoute ? " startup task" : " scheduled task (non-boot trigger)")
                 + (snapshot.TaskEnabled && !enabledStartupTrigger ? " (startup trigger disabled)" : "")
                 + "; state=" + (string.IsNullOrWhiteSpace(snapshot.StateLabel) ? "Unknown" : snapshot.StateLabel)
                 + "; taskEnabled=" + snapshot.TaskEnabled.ToString().ToLowerInvariant()
                 + "; modeEditable=" + modeEditable.ToString().ToLowerInvariant()
                 + "; triggers=" + triggerDetails
                 + "; actions=" + actionDetails;
+            bool microsoftLibraryTask = taskPath.StartsWith("\\Microsoft\\", StringComparison.OrdinalIgnoreCase);
             rows.Add(new StartupItem
             {
                 Id = "task|" + taskPath,
                 Name = taskPath.TrimStart('\\'),
                 AppName = FriendlyScheduledTaskName(taskPath),
-                Source = "Scheduled Task",
+                Source = startupRoute ? "Scheduled Task" : "Scheduled Task (Any Trigger)",
                 Scope = "User/System",
                 Command = command,
                 Location = taskPath,
                 Enabled = enabled,
                 CanDisable = true,
                 IsManaged = IsManagedScheduledTaskPath(taskPath),
+                ExternalAuthority = (!startupRoute && microsoftLibraryTask) ? "Windows task library" : "",
                 Status = status
             });
             return true;
@@ -3453,6 +3463,18 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         [DllImport("advapi32.dll")]
         private static extern bool CloseServiceHandle(IntPtr handle);
 
+        private static bool HasServiceTriggerInfo(string serviceName)
+        {
+            try
+            {
+                using (var triggerKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + serviceName + "\\TriggerInfo"))
+                {
+                    return triggerKey != null;
+                }
+            }
+            catch { return false; }
+        }
+
         private static void AuditServicesNative(List<StartupItem> raw, bool drivers)
         {
             const uint ScManagerEnumerateService = 0x0004;
@@ -3495,7 +3517,23 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                         configBuffer = Marshal.AllocHGlobal((int)configNeeded);
                         if (!QueryServiceConfig(service, configBuffer, configNeeded, out configNeeded)) throw new InvalidOperationException("QueryServiceConfig failed for " + name + ": " + Marshal.GetLastWin32Error());
                         QueryServiceConfigData config = (QueryServiceConfigData)Marshal.PtrToStructure(configBuffer, typeof(QueryServiceConfigData));
-                        if (config.StartType > 2) continue;
+                        if (config.StartType > 2)
+                        {
+                            // Manual trigger-start services launch on their event without
+                            // auto-start; they still run code and must stay visible.
+                            if (!drivers && config.StartType != 4 && HasServiceTriggerInfo(name))
+                            {
+                                raw.Add(new StartupItem
+                                {
+                                    Id = "service|" + B64(name), Name = Marshal.PtrToStringUni(status.DisplayName) ?? name, Source = "Service (Trigger Start)",
+                                    Scope = "Machine", Command = Marshal.PtrToStringUni(config.BinaryPathName) ?? "",
+                                    Location = @"HKLM\SYSTEM\CurrentControlSet\Services\" + name,
+                                    Enabled = true, CanDisable = IsElevated(),
+                                    Status = "SCM start=" + config.StartType + " trigger-start state=" + status.Status.CurrentState
+                                });
+                            }
+                            continue;
+                        }
                         string display = Marshal.PtrToStringUni(status.DisplayName) ?? name;
                         string command = Marshal.PtrToStringUni(config.BinaryPathName) ?? "";
                         raw.Add(new StartupItem
@@ -3852,7 +3890,12 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             require(TaskExecutablePathsEqual("\"\"C:\\Fixture App\\fixture.exe\"\"", @"C:\Fixture App\fixture.exe"), "nested Task Scheduler quote pairs must compare as one executable path");
             require(!TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, scheduledSnapshot) && scheduledRows.Count == 1, "duplicate task paths from a provider must be emitted once");
             ScheduledTaskInventorySnapshot nonStartupSnapshot = ParseScheduledTaskXml(@"\Fixture\Hourly", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><TimeTrigger><Enabled>true</Enabled></TimeTrigger></Triggers><Actions><Exec><Command>C:\\Fixture\\hourly.exe</Command></Exec></Actions><Settings><Enabled>true</Enabled></Settings></Task>");
-            require(!TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, nonStartupSnapshot), "tasks without boot/logon triggers must stay outside startup inventory");
+            require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, nonStartupSnapshot)
+                && scheduledRows.Last().Source == "Scheduled Task (Any Trigger)"
+                && scheduledRows.Last().Id == @"task|\Fixture\Hourly"
+                && scheduledRows.Last().Enabled
+                && !CanMutateStartupMode(scheduledRows.Last()),
+                "a task with only non-boot triggers must stay visible on the any-trigger surface, enabled per its own schedule, and excluded from launch-mode editing");
             ScheduledTaskInventorySnapshot unknownEnabledSnapshot = ParseScheduledTaskXml(@"\Fixture\UnknownEnabled", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><LogonTrigger><Enabled>false</Enabled></LogonTrigger></Triggers><Actions><Exec><Command>C:\\Fixture\\disabled.exe</Command></Exec></Actions></Task>");
             require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, unknownEnabledSnapshot) && !scheduledRows.Last().Enabled, "an unreadable/false startup-trigger Enabled state must fail closed rather than be guessed enabled");
             ScheduledTaskInventorySnapshot multiActionSnapshot = ParseScheduledTaskXml(@"\Fixture\MultiAction", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><BootTrigger/></Triggers><Actions><Exec><Command>C:\\Fixture\\one.exe</Command></Exec><ComHandler><ClassId>{00000000-0000-0000-0000-000000000001}</ClassId></ComHandler></Actions></Task>");
@@ -6455,7 +6498,17 @@ foreach (var hive in LoadedUserHives())
                             try { start = Convert.ToInt32(key.GetValue("Start", 3)); } catch { continue; }
                             try { type = Convert.ToInt32(key.GetValue("Type", 0)); } catch { type = 0; }
                             bool isDriver = (type & 0x0F) != 0;
-                            if (isDriver != wantDrivers || start < 0 || start > 2) continue;
+                            if (isDriver != wantDrivers || start < 0 || start > 2)
+                            {
+                                // Manual trigger-start services still run on their event and must stay
+                                // visible; a disabled (4) service cannot start and is not a registration to run.
+                                if (wantDrivers || start != 3 || key.OpenSubKey("TriggerInfo", false) == null) continue;
+                                string triggerDisplay = Convert.ToString(key.GetValue("DisplayName", name, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                                if (string.IsNullOrWhiteSpace(triggerDisplay) || triggerDisplay.StartsWith("@", StringComparison.Ordinal)) triggerDisplay = name;
+                                string triggerPath = Convert.ToString(key.GetValue("ImagePath", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
+                                items.Add(new StartupItem { Id = "service|" + B64(name), Name = triggerDisplay, Source = "Service (Trigger Start)", Scope = "Machine", Command = triggerPath, Location = @"HKLMSYSTEMCurrentControlSetServices" + name, Enabled = true, CanDisable = IsElevated(), IsManaged = false, Status = "Service start=Manual (trigger start) registryStart=3" });
+                                continue;
+                            }
                             string displayName = Convert.ToString(key.GetValue("DisplayName", name, RegistryValueOptions.DoNotExpandEnvironmentNames));
                             if (string.IsNullOrWhiteSpace(displayName) || displayName.StartsWith("@", StringComparison.Ordinal)) displayName = name;
                             string path = Convert.ToString(key.GetValue("ImagePath", "", RegistryValueOptions.DoNotExpandEnvironmentNames));
@@ -9550,6 +9603,7 @@ foreach (var hive in LoadedUserHives())
         internal static bool CanMutateStartupMode(StartupItem item)
         {
             if (item == null || !item.Enabled) return false;
+            if (string.Equals(item.Source, "Scheduled Task (Any Trigger)", StringComparison.OrdinalIgnoreCase)) return false;
             return !string.Equals(item.Source, "Scheduled Task", StringComparison.OrdinalIgnoreCase)
                 || (item.Status ?? "").IndexOf("modeEditable=false", StringComparison.OrdinalIgnoreCase) < 0;
         }
@@ -9754,14 +9808,23 @@ foreach (var hive in LoadedUserHives())
                 string windir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
                 if (!string.IsNullOrEmpty(windir)) roots.Add(windir);
                 roots.AddRange((Environment.GetEnvironmentVariable("PATH") ?? "").Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries));
+                string[] extensions = new[] { "" };
+                if (string.IsNullOrEmpty(Path.GetExtension(name)))
+                {
+                    string pathExt = Environment.GetEnvironmentVariable("PATHEXT") ?? ".COM;.EXE";
+                    extensions = pathExt.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+                }
                 foreach (string rootDir in roots)
                 {
-                    try
+                    foreach (string extension in extensions)
                     {
-                        string candidate = Path.Combine(rootDir.Trim(), name);
-                        if (File.Exists(candidate)) return candidate;
+                        try
+                        {
+                            string candidate = Path.Combine(rootDir.Trim(), name + extension);
+                            if (File.Exists(candidate)) return candidate;
+                        }
+                        catch { }
                     }
-                    catch { }
                 }
             }
             catch { }
@@ -15249,7 +15312,7 @@ foreach (var hive in LoadedUserHives())
                         {
                             if (eligibleTab == null) continue;
                             form._filterMode = eligibleTab; // pure filter input; re-rendering the control per probe made this gate take minutes
-                            var searchedRows = form.BuildVisibleRows(query);
+                            var searchedRows = form.BuildVisibleRowsForProbe(query);
                             if (searchedRows.Any(row => row.Routes != null && row.Routes.Any(route => string.Equals(route.Id, item.Id, StringComparison.OrdinalIgnoreCase)))) { found = true; break; }
                         }
                         if (!found)
@@ -15324,7 +15387,7 @@ foreach (var hive in LoadedUserHives())
                     {
                         appRoutes++;
                         string query = item.HumanName();
-                        var appRows = form.BuildVisibleRows(query);
+                        var appRows = form.BuildVisibleRowsForProbe(query);
                         bool found = appRows.Any(row => row.Routes != null && row.Routes.Any(route => string.Equals(route.Id, item.Id, StringComparison.OrdinalIgnoreCase)));
                         if (!found)
                         {
@@ -16657,6 +16720,34 @@ foreach (var hive in LoadedUserHives())
             return rows;
         }
 
+        // Existence probing for the live verify gate: identical eligibility and query filtering
+        // as BuildVisibleRows minus the final ordering. Ordering cannot change whether a route
+        // is findable, and skipping it keeps the every-route name probe fast on large inventories.
+        private List<InventoryRow> BuildVisibleRowsForProbe(string query)
+        {
+            var eligible = _items.Where(MatchesFilter).ToList();
+            var rows = new List<InventoryRow>();
+            if (_filterMode == "Apps")
+            {
+                foreach (var group in eligible.GroupBy(ApplicationGroupIdentity, StringComparer.OrdinalIgnoreCase))
+                {
+                    List<StartupItem> routes = group.ToList();
+                    if (!string.IsNullOrWhiteSpace(query) && !routes.Any(x => SearchText(x).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
+                    StartupItem primary = routes.OrderByDescending(RouteSeverity).ThenByDescending(x => x.IsManaged).ThenBy(x => x.HumanName(), StringComparer.OrdinalIgnoreCase).First();
+                    rows.Add(new InventoryRow { Key = "app|" + group.Key, TargetIdentity = group.Key, Routes = routes, Primary = primary, IsAppSummary = true });
+                }
+            }
+            else
+            {
+                foreach (StartupItem item in eligible)
+                {
+                    if (!string.IsNullOrWhiteSpace(query) && SearchText(item).IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    rows.Add(new InventoryRow { Key = "route|" + (item.Id ?? CanonicalTargetIdentity(item)), TargetIdentity = CanonicalTargetIdentity(item), Routes = new List<StartupItem> { item }, Primary = item, IsAppSummary = false });
+                }
+            }
+            return rows;
+        }
+
         private static DateTime NewestFirstSeenUtc(List<StartupItem> routes)
         {
             DateTime newest = DateTime.MinValue;
@@ -17107,6 +17198,8 @@ foreach (var hive in LoadedUserHives())
         {
             if (row == null || row.Routes == null) return new List<StartupItem>();
             return row.Routes.Where(route => route != null && route.Enabled != enabledState
+                && !string.Equals(route.Source, "Scheduled Task (Any Trigger)", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(route.Source, "Service (Trigger Start)", StringComparison.OrdinalIgnoreCase)
                 && !IsCoveredStartupCommandMirror(route, row.Routes)).ToList();
         }
 
