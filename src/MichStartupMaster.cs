@@ -156,7 +156,7 @@ namespace MichStartupMaster
                 }
                 if (cmd == "--state-store-worker") return StateStoreFile.Worker(args);
                 if (cmd == "--state-store-self-test") { Console.WriteLine(StateStoreFile.SelfTest()); return 0; }
-                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.8.0"); return 0; }
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.8.1"); return 0; }
                 if (cmd == "--help" || cmd == "-h" || cmd == "/?" || cmd == "help") { CliShowHelp(); return 0; }
                 if (cmd == "--list") { var items = StartupService.ScanAll().GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
                 if (cmd == "--list-enabled") { var items = StartupService.ScanAll().Where(x => x.Enabled).GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
@@ -9734,7 +9734,38 @@ foreach (var hive in LoadedUserHives())
                 ResolveShortcut(targetPath, out targetPath, out shortcutArguments);
                 arguments = MergeArguments(shortcutArguments, commandArguments);
             }
+            if (targetPath.IndexOf('\\') < 0 && targetPath.IndexOf('/') < 0 && targetPath.IndexOf(':') < 0)
+            {
+                string resolvedBare = ResolveBareExecutable(targetPath);
+                if (!string.IsNullOrEmpty(resolvedBare)) targetPath = resolvedBare;
+            }
             if (!File.Exists(targetPath) || !IsSupportedStartupTarget(targetPath)) throw new FileNotFoundException("Resolved startup target is not a supported startup target", targetPath);
+        }
+        // Bare PATH-relative executables (cmd.exe, wscript.exe, ...) are a legitimate startup
+        // command form. Preserved disabled records and run-now both resolve them through PATH
+        // and the system directories so enable never fails on a healthy command.
+        private static string ResolveBareExecutable(string name)
+        {
+            try
+            {
+                var roots = new List<string> { Environment.SystemDirectory };
+                string wow64 = Environment.GetFolderPath(Environment.SpecialFolder.SystemX86);
+                if (!string.IsNullOrEmpty(wow64)) roots.Add(wow64);
+                string windir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+                if (!string.IsNullOrEmpty(windir)) roots.Add(windir);
+                roots.AddRange((Environment.GetEnvironmentVariable("PATH") ?? "").Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries));
+                foreach (string rootDir in roots)
+                {
+                    try
+                    {
+                        string candidate = Path.Combine(rootDir.Trim(), name);
+                        if (File.Exists(candidate)) return candidate;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return null;
         }
 
         internal static bool TryDecodeTrayPayload(string command, out string targetPath, out string arguments)

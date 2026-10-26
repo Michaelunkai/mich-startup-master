@@ -231,3 +231,6 @@ Use `scripts\build.ps1 -InstallCurrentUser` to apply the guarded workflow to `%L
 - The quiet tray runtime now recognizes Process Lasso native NotifyIcon host windows (class containing _Notification_Class), so the controller fallback icon retires once the native icon exists: TRAY_AUDIT findings=0 and --audit-boot exits 0.
 - Legacy disabled-store records are retired against live re-registered routes, task triggers with unreadable COM state stay visible instead of arguing Disabled, and enabling a stale record retires it instead of failing.
 - The safe suite gained live regression gates: verify passed=true with enabled/disabled render matching under 60 seconds, smoke invalid=0 duplicate_ids=0, and boot audit gaps=0 errors=0.
+
+## What changed in 2.8.1
+- Preserved disabled routes whose original command used a bare PATH-relative executable (cmd.exe, wscript.exe and friends) can be enabled again: the launch-target resolver now resolves bare names against the system directories and PATH before the existence check, instead of failing with a rollback.
