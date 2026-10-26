@@ -241,3 +241,7 @@ Use `scripts\build.ps1 -InstallCurrentUser` to apply the guarded workflow to `%L
 - The bare-executable enable fix now also resolves extensionless commands (powershell, wscript) through PATHEXT, so enabling preserved routes covers every command form.
 - The verify gate probes findability through an order-free row builder so the every-route name probe stays well under its 60-second bar while the inventory nearly doubled.
 - The independent boot audit reconciles the full task and trigger-service universe every run: sources~740, shown~930, gaps=0, errors=0.
+
+## What changed in 2.9.1
+- Disabling an autostart service or driver now sets demand start instead of hard Disabled: the service no longer consumes boot resources but remains fully usable on demand (proven live with WSLService - wsl.exe cold-started the demand service, and re-enabling restored Automatic exactly).
+- The restore path accepts both the new demand-start state and legacy hard-disabled values, so older preserved records still re-enable correctly.

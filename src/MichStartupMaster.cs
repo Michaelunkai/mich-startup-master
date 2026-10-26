@@ -156,7 +156,7 @@ namespace MichStartupMaster
                 }
                 if (cmd == "--state-store-worker") return StateStoreFile.Worker(args);
                 if (cmd == "--state-store-self-test") { Console.WriteLine(StateStoreFile.SelfTest()); return 0; }
-                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.9.0"); return 0; }
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.9.1"); return 0; }
                 if (cmd == "--help" || cmd == "-h" || cmd == "/?" || cmd == "help") { CliShowHelp(); return 0; }
                 if (cmd == "--list") { var items = StartupService.ScanAll().GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
                 if (cmd == "--list-enabled") { var items = StartupService.ScanAll().Where(x => x.Enabled).GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
@@ -7714,7 +7714,11 @@ foreach (var hive in LoadedUserHives())
             int originalStart = ReadServiceStartValue(name, -1);
             if (originalStart < 0 || originalStart > 3) throw new InvalidOperationException("Could not read the exact startup type for service " + name + "; nothing was changed");
             string disabledId = DisabledStoreService.Add(type, item.Name, item.Scope, item.Command, item.Location, name + "\t" + originalStart.ToString());
-            try { SetServiceStartValue(name, 4); }
+            // Disable-at-boot must keep the thing usable on demand: demand start (3) means the
+            // service no longer consumes boot resources but still starts when the user invokes
+            // it (wsl, docker and friends). A hard Disabled (4) would make it permanently
+            // unstartable, which is not what disabling an autostart means here.
+            try { SetServiceStartValue(name, 3); }
             catch { DisabledStoreService.Remove(disabledId); throw; }
         }
 
@@ -7727,7 +7731,8 @@ foreach (var hive in LoadedUserHives())
             int current = ReadServiceStartValue(meta[0], -1);
             if (current < 0 || current > 4) throw new InvalidOperationException("Could not read the current service startup type; nothing was changed");
             if (current == start) { DisabledStoreService.Remove(item.Id); return; }
-            if (current != 4) throw new InvalidOperationException("Service startup type changed externally; refusing to overwrite it (current=" + current + ")");
+            if (current != 3 && current != 4) throw new InvalidOperationException("Service startup type changed externally; refusing to overwrite it (current=" + current + ")");
+            // current 3 is our demand-start disable; 4 is a legacy hard disable. Both restore.
             SetServiceStartValue(meta[0], start);
             DisabledStoreService.Remove(item.Id);
         }
