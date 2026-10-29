@@ -156,7 +156,7 @@ namespace MichStartupMaster
                 }
                 if (cmd == "--state-store-worker") return StateStoreFile.Worker(args);
                 if (cmd == "--state-store-self-test") { Console.WriteLine(StateStoreFile.SelfTest()); return 0; }
-                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.9.1"); return 0; }
+                if (cmd == "--version") { Console.WriteLine("MichStartupMaster 2.10.0"); return 0; }
                 if (cmd == "--help" || cmd == "-h" || cmd == "/?" || cmd == "help") { CliShowHelp(); return 0; }
                 if (cmd == "--list") { var items = StartupService.ScanAll().GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
                 if (cmd == "--list-enabled") { var items = StartupService.ScanAll().Where(x => x.Enabled).GroupBy(x => (x.AppName ?? "") + "|" + (x.Source ?? "") + "|" + (x.Command ?? "")).Select(g => g.First()).ToList(); Console.WriteLine(StartupService.ToJson(items)); return 0; }
@@ -751,6 +751,10 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
     // stores after a crash and prevents one writer from silently discarding another writer's row.
     internal static class StateStoreFile
     {
+        // Bumped after every in-process write so readers that cache a store can tell their
+        // snapshot is stale even when the file timestamp has not visibly moved yet.
+        internal static long Generation;
+
         private static string MutexName(string path)
         {
             string full = Path.GetFullPath(path ?? "").ToLowerInvariant();
@@ -781,7 +785,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         private static void Recover(string path)
         {
             string backup = path + ".bak";
-            if (!File.Exists(path) && File.Exists(backup)) File.Move(backup, path);
+            if (!File.Exists(path) && File.Exists(backup)) { File.Move(backup, path); System.Threading.Interlocked.Increment(ref Generation); }
             else if (File.Exists(path) && File.Exists(backup)) { try { File.Delete(backup); } catch { } }
         }
 
@@ -814,7 +818,8 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 if (!File.Exists(path)) return 0;
                 if (File.ReadAllLines(path, Encoding.UTF8).Length != 0)
                     throw new InvalidOperationException("Refusing to remove a nonempty state store: " + path);
-                File.Delete(path);
+                try { File.Delete(path); }
+                finally { System.Threading.Interlocked.Increment(ref Generation); }
                 if (File.Exists(path)) throw new IOException("Empty state store could not be removed: " + path);
                 return 0;
             });
@@ -843,7 +848,11 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 }
                 else File.Move(temp, path);
             }
-            finally { if (File.Exists(temp)) { try { File.Delete(temp); } catch { } } }
+            finally
+            {
+                System.Threading.Interlocked.Increment(ref Generation);
+                if (File.Exists(temp)) { try { File.Delete(temp); } catch { } }
+            }
         }
 
         public static int Worker(string[] args)
@@ -962,7 +971,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
         public string PopupLabel()
         {
             if ((Id ?? "").StartsWith("error|", StringComparison.OrdinalIgnoreCase)) return "N/A";
-            if (Source == "Windows Service" || Source == "System Driver" || Source == "Winlogon Autostart" || Source == "Winlogon Notification" || Source == "AppInit DLLs" || Source == "AppCert DLLs" || Source == "LSA Startup Package" || Source == "Active Setup" || Source == "Boot Execute" || Source == "Image Hijack" || Source == "Known DLL" || Source == "Network Provider" || Source == "Winsock Provider" || Source == "Print Monitor" || Source == "Media Codec" || Source == "WMI Event Consumer" || Source == "Group Policy Script" || Source == "Explorer Startup Extension" || Source == "Explorer Shell Extension" || Source == "Internet Explorer Add-on" || Source == "Startup Approval" || Source == "Stale Startup Metadata") return "N/A";
+            if (Source == "Windows Service" || Source == "System Driver" || Source == "Winlogon Autostart" || Source == "Winlogon Notification" || Source == "AppInit DLLs" || Source == "AppCert DLLs" || Source == "LSA Startup Package" || Source == "Active Setup" || Source == "Boot Execute" || Source == "Image Hijack" || Source == "Known DLL" || Source == "Network Provider" || Source == "Winsock Provider" || Source == "Print Monitor" || Source == "Print Provider" || Source == "Security Provider" || Source == "Terminal Server Startup" || Source == "Icon Service Library" || Source == "URL Search Hook" || Source == "Service Dependency" || Source == "Media Codec" || Source == "WMI Event Consumer" || Source == "Group Policy Script" || Source == "Explorer Startup Extension" || Source == "Explorer Shell Extension" || Source == "Internet Explorer Add-on" || Source == "Startup Approval" || Source == "Stale Startup Metadata") return "N/A";
             if (!Enabled) return "Disabled";
             return StartupService.IsQuietLaunch(Command, Location) ? "Disabled" : "Enabled";
         }
@@ -1123,7 +1132,9 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             {
                 foreach (Process process in processes)
                 {
-                    if (clock.ElapsedMilliseconds >= Math.Max(50, maximumMilliseconds)) break;
+                    // Never drop a process once the budget is spent (under load that made running
+                    // tray apps look missing); only the slow command-line read is skipped after it.
+                    bool withinBudget = clock.ElapsedMilliseconds < Math.Max(50, maximumMilliseconds);
                     int pid;
                     try { pid = process.Id; } catch { continue; }
                     var row = new NativeProcessInfo { ProcessId = pid, ParentProcessId = 0, ExecutablePath = "", CommandLine = "" };
@@ -1134,7 +1145,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                         if (handle != IntPtr.Zero)
                         {
                             row.ExecutablePath = ReadImagePath(handle);
-                            row.CommandLine = ReadCommandLine(handle);
+                            if (withinBudget) row.CommandLine = ReadCommandLine(handle);
                             row.ParentProcessId = ReadParentProcessId(handle);
                         }
                     }
@@ -2117,7 +2128,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                     for (int i = 1; i <= (int)definition.Triggers.Count; i++)
                     {
                         dynamic trigger = definition.Triggers.Item(i);
-                        if (!(bool)trigger.Enabled || !IsStartupTaskTriggerType((int)trigger.Type)) continue;
+                        if (!(bool)trigger.Enabled) continue;
                         activeTrigger = true;
                     }
                     bool enabled = Convert.ToBoolean(task.Enabled) && activeTrigger;
@@ -2244,7 +2255,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             // a cache-consistent omission into a false clean bill of health. Native Run/folder
             // registrations are audited independently above; the WMI projection remains visible
             // in the main inventory only as explicitly unverified metadata.
-            AddIsolatedProvider(raw, "task-audit", "Independent Scheduled Task", "Task definition catalog", 15000);
+            AddIsolatedProvider(raw, "task-audit", "Independent Scheduled Task", "Task definition catalog", 30000);
             AddIsolatedProvider(raw, "service-audit", "Independent Windows Service", "Service Control Manager", 10000);
             AddIsolatedProvider(raw, "driver-audit", "Independent System Driver", "Service Control Manager", 10000);
             AuditAdvancedRegistrySources(raw);
@@ -2286,7 +2297,27 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
 
         private static void AddIsolatedProvider(List<StartupItem> destination, string kind, string source, string location, int timeoutMs)
         {
-            try
+            // A slow machine (another scan, an installer, Defender) must not make a whole surface
+            // vanish behind one "Read failed" row: retry once with double the budget before reporting.
+            Exception last = null;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                var rows = new List<StartupItem>();
+                try
+                {
+                    TryRunIsolatedProvider(rows, kind, attempt == 0 ? timeoutMs : timeoutMs * 2);
+                    destination.AddRange(rows);
+                    if (rows.Count == 0 && (kind == "task-main" || kind == "task-audit" || kind == "service-audit" || kind == "driver-audit"))
+                        destination.Add(ErrorItem(source, "System", location, new InvalidOperationException("Provider returned zero rows; coverage is not assumed")));
+                    return;
+                }
+                catch (Exception ex) { last = ex; }
+            }
+            destination.Add(ErrorItem(source, "System", location, last));
+        }
+
+        private static void TryRunIsolatedProvider(List<StartupItem> destination, string kind, int timeoutMs)
+        {
             {
                 string executable = Environment.ProcessPath;
                 if (string.IsNullOrWhiteSpace(executable)) executable = Process.GetCurrentProcess().MainModule.FileName;
@@ -2302,19 +2333,14 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 string[] lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
                 if (!lines.Any(line => string.Equals(line.Trim(), "MSM_PROVIDER_V1", StringComparison.Ordinal)))
                     throw new InvalidOperationException("Provider worker returned no protocol header");
-                int parsed = 0;
                 foreach (string line in lines)
                 {
                     if (string.Equals(line.Trim(), "MSM_PROVIDER_V1", StringComparison.Ordinal)) continue;
                     StartupItem row;
                     if (!TryParseProviderRow(line, out row)) throw new InvalidDataException("Provider worker returned a malformed protocol row");
                     destination.Add(row);
-                    parsed++;
                 }
-                if (parsed == 0 && (kind == "task-main" || kind == "task-audit" || kind == "service-audit" || kind == "driver-audit"))
-                    destination.Add(ErrorItem(source, "System", location, new InvalidOperationException("Provider returned zero rows; coverage is not assumed")));
             }
-            catch (Exception ex) { destination.Add(ErrorItem(source, "System", location, ex)); }
         }
 
         private static string SerializeProviderRow(StartupItem row)
@@ -3264,11 +3290,18 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             // without boot triggers still runs on its own schedule and hiding it is the
             // missed-registration failure. Non-boot tasks join a distinct any-trigger
             // surface so boot semantics, quiet plans and bulk boot policy stay untouched.
-            if (string.IsNullOrWhiteSpace(taskPath) || snapshot.Triggers.Count == 0 || !seen.Add(taskPath)) return false;
+            if (string.IsNullOrWhiteSpace(taskPath) || !seen.Add(taskPath)) return false;
             bool startupRoute = startupTriggers.Count > 0;
             bool enabledStartupTrigger = startupTriggers.Any(trigger => trigger.EnabledUnknown || trigger.Enabled);
-            bool enabled = startupRoute ? snapshot.TaskEnabled && enabledStartupTrigger : snapshot.TaskEnabled;
+            // The task-level flag is the one switch Task Scheduler, schtasks and every other tool use,
+            // so the row state follows it exactly: a task whose boot/logon trigger is disabled but whose
+            // Time/Event trigger is live must still show Enabled, and one click on Disable/Enable must
+            // always round-trip. Trigger detail is reported in the status text instead of the state.
+            var liveTriggers = snapshot.Triggers.Where(trigger => trigger.EnabledUnknown || trigger.Enabled).ToList();
+            bool enabled = snapshot.TaskEnabled;
+            string liveKinds = string.Join("+", liveTriggers.Select(trigger => TaskTriggerName(trigger.Type)).Distinct(StringComparer.OrdinalIgnoreCase));
             string kinds = string.Join("+", snapshot.Triggers.Select(trigger => TaskTriggerName(trigger.Type)).Distinct(StringComparer.OrdinalIgnoreCase));
+            if (snapshot.Triggers.Count == 0) kinds = "No-trigger (on-demand)";
             string triggerDetails = string.Join(" || ", snapshot.Triggers.Select(trigger => TaskTriggerName(trigger.Type)
                 + "(index=" + trigger.Index + ";enabled=" + (trigger.EnabledUnknown ? "unknown" : trigger.Enabled.ToString().ToLowerInvariant())
                 + (string.IsNullOrWhiteSpace(trigger.Id) ? "" : ";id=" + TaskDetailValue(trigger.Id))
@@ -3277,8 +3310,9 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             string command = string.Join(" || ", snapshot.Actions.Select(TaskActionCommand).Where(value => !string.IsNullOrWhiteSpace(value)));
             string actionDetails = string.Join(" || ", snapshot.Actions.Select(TaskActionDetails));
             bool modeEditable = snapshot.ActionsComplete && snapshot.Actions.Count == 1 && snapshot.Actions[0].Type == 0 && !string.IsNullOrWhiteSpace(snapshot.Actions[0].Path);
-            string status = (enabled ? "Enabled " : "Disabled ") + kinds + (startupRoute ? " startup task" : " scheduled task (non-boot trigger)")
-                + (snapshot.TaskEnabled && !enabledStartupTrigger ? " (startup trigger disabled)" : "")
+            string status = (enabled ? "Enabled " : "Disabled ") + kinds + (startupRoute ? " startup task" : snapshot.Triggers.Count == 0 ? " scheduled task (no trigger; starts only when another program or service runs it)" : " scheduled task (non-boot trigger)")
+                + (snapshot.TaskEnabled && snapshot.Triggers.Count > 0 && liveTriggers.Count == 0 ? " (all triggers disabled; runs only when started on demand)" : "")
+                + (snapshot.TaskEnabled && startupRoute && !enabledStartupTrigger && liveTriggers.Count > 0 ? " (boot/logon trigger disabled; still runs on " + liveKinds + ")" : "")
                 + "; state=" + (string.IsNullOrWhiteSpace(snapshot.StateLabel) ? "Unknown" : snapshot.StateLabel)
                 + "; taskEnabled=" + snapshot.TaskEnabled.ToString().ToLowerInvariant()
                 + "; modeEditable=" + modeEditable.ToString().ToLowerInvariant()
@@ -3592,6 +3626,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             AuditNetworkProviderEntries(raw);
             AuditWinsockProviderEntries(raw);
             AuditPrintMonitorEntries(raw);
+            AuditLogonExtensionPoints(raw);
             AuditMediaCodecEntries(raw);
         }
 
@@ -3897,7 +3932,11 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
                 && !CanMutateStartupMode(scheduledRows.Last()),
                 "a task with only non-boot triggers must stay visible on the any-trigger surface, enabled per its own schedule, and excluded from launch-mode editing");
             ScheduledTaskInventorySnapshot unknownEnabledSnapshot = ParseScheduledTaskXml(@"\Fixture\UnknownEnabled", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><LogonTrigger><Enabled>false</Enabled></LogonTrigger></Triggers><Actions><Exec><Command>C:\\Fixture\\disabled.exe</Command></Exec></Actions></Task>");
-            require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, unknownEnabledSnapshot) && !scheduledRows.Last().Enabled, "an unreadable/false startup-trigger Enabled state must fail closed rather than be guessed enabled");
+            require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, unknownEnabledSnapshot) && scheduledRows.Last().Enabled && scheduledRows.Last().Status.Contains("all triggers disabled", StringComparison.Ordinal), "a task enabled at task level must show Enabled even when its triggers are disabled, with the trigger state explained");
+            ScheduledTaskInventorySnapshot mixedTriggerSnapshot = ParseScheduledTaskXml(@"\Fixture\MixedTriggers", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><LogonTrigger><Enabled>false</Enabled></LogonTrigger><TimeTrigger><Enabled>true</Enabled></TimeTrigger></Triggers><Actions><Exec><Command>C:\\Fixture\\mixed.exe</Command></Exec></Actions><Settings><Enabled>true</Enabled></Settings></Task>");
+            require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, mixedTriggerSnapshot) && scheduledRows.Last().Enabled && scheduledRows.Last().Status.Contains("still runs on", StringComparison.Ordinal), "a task whose boot/logon trigger is disabled but whose other trigger is live must show Enabled so it can be disabled with one click");
+            ScheduledTaskInventorySnapshot noTriggerSnapshot = ParseScheduledTaskXml(@"\Fixture\NoTrigger", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Actions><Exec><Command>C:\\Fixture\\ondemand.exe</Command></Exec></Actions><Settings><Enabled>true</Enabled></Settings></Task>");
+            require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, noTriggerSnapshot) && scheduledRows.Last().Enabled && scheduledRows.Last().Status.Contains("No-trigger", StringComparison.Ordinal), "a trigger-less task must be inventoried with its own Settings.Enabled flag");
             ScheduledTaskInventorySnapshot multiActionSnapshot = ParseScheduledTaskXml(@"\Fixture\MultiAction", "<Task xmlns='http://schemas.microsoft.com/windows/2004/02/mit/task'><Triggers><BootTrigger/></Triggers><Actions><Exec><Command>C:\\Fixture\\one.exe</Command></Exec><ComHandler><ClassId>{00000000-0000-0000-0000-000000000001}</ClassId></ComHandler></Actions></Task>");
             require(TryAppendScheduledTaskSnapshot(scheduledRows, scheduledSeen, multiActionSnapshot) && scheduledRows.Last().CanDisable && !CanMutateStartupMode(scheduledRows.Last()), "multi-action/COM-handler tasks must remain enable-disable capable but fail closed for launch-mode editing");
             StartupItem taskWarningFixture = ScheduledTaskReadWarning(@"\Fixture\Broken", "Definition", new InvalidOperationException("fixture read failure"));
@@ -4267,7 +4306,7 @@ visible in the app, and vice versa. The GUI uses the same underlying data stores
             try
             {
                 var rows = QuietAuditRows();
-                var procs = NativeProcessCatalog.Snapshot().Select(p => Tuple.Create(p.ProcessId, p.ExecutablePath ?? "", p.CommandLine ?? "")).ToList(); // pid, exe, commandline
+                var procs = NativeProcessCatalog.Snapshot(15000).Select(p => Tuple.Create(p.ProcessId, p.ExecutablePath ?? "", p.CommandLine ?? "")).ToList(); // pid, exe, commandline
                 var wins = SnapshotTopLevelWindows();
                 var findings = new List<string>();
                 var uncertain = new List<string>();
@@ -5862,6 +5901,7 @@ foreach (var hive in LoadedUserHives())
             AddNetworkProviderEntries(items);
             AddWinsockProviderEntries(items);
             AddPrintMonitorEntries(items);
+            AddLogonExtensionPoints(items);
             AddMediaCodecEntries(items);
         }
 
@@ -5933,6 +5973,129 @@ foreach (var hive in LoadedUserHives())
         {
             const string monitors = @"SYSTEM\CurrentControlSet\Control\Print\Monitors";
             AddRegistryExtensionSubkeyValue(items, Registry.LocalMachine, monitors, "Machine", "Print Monitor", "print-monitor", "Driver", "Print Spooler loads this monitor DLL when the spooler service starts", NativeRegistryViewLabel(), true);
+        }
+
+        // Autoruns-parity logon/boot extension points that load code for every session but have
+        // no Run-key shape: the RDP startup-program list, the icon codec service library, the
+        // LSA security-provider list, print providers and the IE URL search hooks. They are
+        // listed read-only like the other system extension points so nothing that executes at
+        // sign-in or spooler start can exist without a visible row.
+        private static void AddLogonExtensionPoints(List<StartupItem> items) { CollectLogonExtensionPoints(items); }
+
+        private static void AuditLogonExtensionPoints(List<StartupItem> raw) { CollectLogonExtensionPoints(raw); }
+
+        private static void CollectLogonExtensionPoints(List<StartupItem> items)
+        {
+            AddRegistryExtensionListValue(items, Registry.LocalMachine, @"SYSTEM\CurrentControlSet\Control\Terminal Server\Wds\rdpwd", "Machine", "Terminal Server Startup", "terminal-server-startup", "StartupPrograms", "Programs started in every Remote Desktop session at sign-in", NativeRegistryViewLabel());
+            AddRegistryExtensionListValue(items, Registry.LocalMachine, @"SYSTEM\CurrentControlSet\Control\SecurityProviders", "Machine", "Security Provider", "security-provider", "SecurityProviders", "Security package loaded by the Local Security Authority", NativeRegistryViewLabel());
+            foreach (RegistryView view in StartupRegistryViews())
+            using (var root = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+                AddRegistryExtensionValue(items, root, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", "Machine", "Icon Service Library", "icon-service-library", "IconServiceLib", "Icon codec library loaded into every interactive process", RegistryViewLabel(view), true);
+            AddRegistryExtensionSubkeyValue(items, Registry.LocalMachine, @"SYSTEM\CurrentControlSet\Control\Print\Providers", "Machine", "Print Provider", "print-provider", "Name", "Print Spooler loads this provider DLL when the spooler service starts", NativeRegistryViewLabel(), true);
+            AddUrlSearchHookEntries(items);
+            AddServiceDependencyEntries(items);
+        }
+
+        private static void AddRegistryExtensionListValue(List<StartupItem> items, RegistryKey root, string subKey, string scope, string source, string kind, string valueName, string status, string viewLabel)
+        {
+            try
+            {
+                using (var key = root.OpenSubKey(subKey, false))
+                {
+                    if (key == null) return;
+                    string raw = RegistryValueText(key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                    string[] parts = (raw ?? "").Split(new[] { ',', ';', '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(part => part.Trim()).Where(part => part.Length > 0).ToArray();
+                    for (int i = 0; i < parts.Length; i++)
+                        items.Add(ReadOnlyExtensionItem(kind, root, subKey, valueName + (parts.Length > 1 ? "#" + (i + 1) : ""), scope, source, ExpandSystemModulePath(parts[i]), status, viewLabel));
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem(source, scope, root.Name + @"\" + subKey + @"\" + valueName, ex)); }
+        }
+
+        private static void AddUrlSearchHookEntries(List<StartupItem> items)
+        {
+            const string hooks = @"Software\Microsoft\Internet Explorer\UrlSearchHooks";
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(hooks, false))
+                {
+                    if (key == null) return;
+                    foreach (string clsid in key.GetValueNames().OrderBy(name => name, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (string.IsNullOrWhiteSpace(clsid)) continue;
+                        string server = "";
+                        foreach (RegistryView view in StartupRegistryViews())
+                        {
+                            try
+                            {
+                                using (var machine = OpenRegistryRoot(RegistryHive.LocalMachine, view))
+                                using (var inproc = machine.OpenSubKey(@"SOFTWARE\Classes\CLSID\" + clsid + @"\InprocServer32", false))
+                                    server = RegistryValueText(inproc == null ? null : inproc.GetValue("", null, RegistryValueOptions.DoNotExpandEnvironmentNames));
+                            }
+                            catch { }
+                            if (!string.IsNullOrWhiteSpace(server)) break;
+                        }
+                        items.Add(ReadOnlyExtensionItem("url-search-hook", Registry.CurrentUser, hooks, clsid, "User", "URL Search Hook",
+                            string.IsNullOrWhiteSpace(server) ? clsid : ExpandSystemModulePath(server), "Internet Explorer URL search hook (COM class " + clsid + ")", NativeRegistryViewLabel()));
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem("URL Search Hook", "User", Registry.CurrentUser.Name + @"\" + hooks, ex)); }
+        }
+
+        // A Manual service or driver is pulled in at boot when an auto-start service depends on it
+        // (for example the SMB redirector under LanmanWorkstation). It runs code at every boot with
+        // no registration of its own, so it is listed read-only with the service that causes it.
+        private static void AddServiceDependencyEntries(List<StartupItem> items)
+        {
+            const string servicesPath = @"SYSTEM\CurrentControlSet\Services";
+            try
+            {
+                using (var services = Registry.LocalMachine.OpenSubKey(servicesPath, false))
+                {
+                    if (services == null) return;
+                    var info = new Dictionary<string, Tuple<int, int, string[], string>>(StringComparer.OrdinalIgnoreCase);
+                    foreach (string name in services.GetSubKeyNames())
+                    {
+                        using (var key = services.OpenSubKey(name, false))
+                        {
+                            if (key == null) continue;
+                            int start, type;
+                            try { start = Convert.ToInt32(key.GetValue("Start", 3)); } catch { continue; }
+                            try { type = Convert.ToInt32(key.GetValue("Type", 0)); } catch { type = 0; }
+                            string[] depends = key.GetValue("DependOnService") as string[] ?? new string[0];
+                            info[name] = Tuple.Create(start, type, depends, Convert.ToString(key.GetValue("ImagePath", "", RegistryValueOptions.DoNotExpandEnvironmentNames)));
+                        }
+                    }
+                    var causedBy = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    var pending = new Queue<KeyValuePair<string, string>>();
+                    foreach (var pair in info)
+                        if (pair.Value.Item1 >= 0 && pair.Value.Item1 <= 2 && (pair.Value.Item2 & 0x0F) != 0x0F)
+                            foreach (string dep in pair.Value.Item3) pending.Enqueue(new KeyValuePair<string, string>(dep, pair.Key));
+                    while (pending.Count > 0)
+                    {
+                        var next = pending.Dequeue();
+                        string dep = (next.Key ?? "").Trim();
+                        if (dep.Length == 0 || dep[0] == '+' || causedBy.ContainsKey(dep)) continue;
+                        Tuple<int, int, string[], string> depInfo;
+                        if (!info.TryGetValue(dep, out depInfo)) continue;
+                        if (depInfo.Item1 >= 0 && depInfo.Item1 <= 2) { foreach (string inner in depInfo.Item3) pending.Enqueue(new KeyValuePair<string, string>(inner, next.Value)); continue; }
+                        if (depInfo.Item1 != 3) continue;
+                        causedBy[dep] = next.Value;
+                        foreach (string inner in depInfo.Item3) pending.Enqueue(new KeyValuePair<string, string>(inner, next.Value));
+                    }
+                    foreach (var pair in causedBy.OrderBy(p => p.Key, StringComparer.OrdinalIgnoreCase))
+                    {
+                        var depInfo = info[pair.Key];
+                        bool driver = (depInfo.Item2 & 0x0F) != 0;
+                        var item = ReadOnlyExtensionItem("service-dependency", Registry.LocalMachine, servicesPath + @"\" + pair.Key, "Start", "Machine", "Service Dependency", depInfo.Item4,
+                            (driver ? "Driver" : "Service") + " " + pair.Key + " is set to Manual but starts at every boot because auto-start service " + pair.Value + " depends on it; disable " + pair.Value + " to stop it", NativeRegistryViewLabel());
+                        item.Name = pair.Key + " (needed by " + pair.Value + ")";
+                        items.Add(item);
+                    }
+                }
+            }
+            catch (Exception ex) { items.Add(ErrorItem("Service Dependency", "Machine", @"HKLM\" + servicesPath, ex)); }
         }
 
         private static void AddMediaCodecEntries(List<StartupItem> items)
@@ -6468,7 +6631,7 @@ foreach (var hive in LoadedUserHives())
 
         private static void AddLogonTasks(List<StartupItem> items)
         {
-            AddIsolatedProvider(items, "task-main", "Scheduled Task", "Task Scheduler COM", 15000);
+            AddIsolatedProvider(items, "task-main", "Scheduled Task", "Task Scheduler COM", 30000);
         }
 
         private static void AddAutoServices(List<StartupItem> items)
@@ -9252,7 +9415,11 @@ foreach (var hive in LoadedUserHives())
                 if (File.Exists(path)) File.Replace(temp, path, null, true);
                 else File.Move(temp, path);
             }
-            finally { if (File.Exists(temp)) { try { File.Delete(temp); } catch { } } }
+            finally
+            {
+                System.Threading.Interlocked.Increment(ref StateStoreFile.Generation);
+                if (File.Exists(temp)) { try { File.Delete(temp); } catch { } }
+            }
         }
 
         private static EnabledStartupService.Row FindEquivalentLiveManagedRoute(string targetPath, string arguments, string equivalentTarget, string equivalentArguments)
@@ -10895,10 +11062,40 @@ foreach (var hive in LoadedUserHives())
             try
             {
                 if (string.IsNullOrWhiteSpace(taskLocation)) return false;
-                return Load().Any(r => string.Equals(string.IsNullOrWhiteSpace(r.TaskLocation) ? (r.Location ?? "") : r.TaskLocation, taskLocation, StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(r.Mode, "tray", StringComparison.OrdinalIgnoreCase));
+                return QuietTaskLocations().Contains(taskLocation);
             }
             catch { return false; }
+        }
+
+        // Every rendered row asks whether its task is in quiet mode, so reading the locked
+        // store once per row made each list render (and every search keystroke) perform
+        // about a thousand mutex-guarded file reads. The snapshot is reused only while the
+        // file, this process's write generation and a two-second freshness window agree.
+        private static readonly object QuietCacheGate = new object();
+        private static HashSet<string> _quietTasks;
+        private static string _quietStamp = "";
+        private static long _quietLoadedAt;
+
+        private static HashSet<string> QuietTaskLocations()
+        {
+            string path = StorePath;
+            string stamp = path + "|" + System.Threading.Interlocked.Read(ref StateStoreFile.Generation);
+            try
+            {
+                var info = new FileInfo(path);
+                stamp += info.Exists ? "|" + info.LastWriteTimeUtc.Ticks + "|" + info.Length + "|" + info.CreationTimeUtc.Ticks : "|missing";
+            }
+            catch { stamp += "|unreadable"; }
+            long now = Environment.TickCount64;
+            lock (QuietCacheGate)
+            {
+                if (_quietTasks != null && string.Equals(_quietStamp, stamp, StringComparison.Ordinal) && now - _quietLoadedAt >= 0 && now - _quietLoadedAt < 2000) return _quietTasks;
+            }
+            var quiet = new HashSet<string>(Load()
+                .Where(r => string.Equals(r.Mode, "tray", StringComparison.OrdinalIgnoreCase))
+                .Select(r => string.IsNullOrWhiteSpace(r.TaskLocation) ? (r.Location ?? "") : r.TaskLocation), StringComparer.OrdinalIgnoreCase);
+            lock (QuietCacheGate) { _quietTasks = quiet; _quietStamp = stamp; _quietLoadedAt = now; }
+            return quiet;
         }
 
         private static void Save(List<Row> rows)
@@ -14919,6 +15116,29 @@ foreach (var hive in LoadedUserHives())
     {
         [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int valueSize);
         [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] private static extern int SetWindowTheme(IntPtr hwnd, string subAppName, string subIdList);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr SendMessage(IntPtr hwnd, int message, IntPtr wParam, string lParam);
+        [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam);
+
+        internal static void SetCueBanner(TextBox box, string text)
+        {
+            if (box == null || SystemInformation.HighContrast) return;
+            try { if (!box.IsHandleCreated) box.CreateControl(); SendMessage(box.Handle, 0x1501, new IntPtr(1), text); }
+            catch { }
+        }
+
+        // The details-view header sits above the scrollbar column and otherwise paints a
+        // light filler block there; theme it with the same dark class as the list itself.
+        internal static void ThemeListHeader(ListView list)
+        {
+            if (list == null || SystemInformation.HighContrast) return;
+            try
+            {
+                if (!list.IsHandleCreated) list.CreateControl();
+                IntPtr header = SendMessage(list.Handle, 0x101F, IntPtr.Zero, IntPtr.Zero);
+                if (header != IntPtr.Zero) SetWindowTheme(header, "DarkMode_ItemsView", null);
+            }
+            catch { }
+        }
         internal static readonly Color Bg = Color.FromArgb(15, 18, 22);
         internal static readonly Color Surface = Color.FromArgb(24, 28, 34);
         internal static readonly Color Surface2 = Color.FromArgb(34, 40, 48);
@@ -14980,7 +15200,7 @@ foreach (var hive in LoadedUserHives())
             return path;
         }
 
-        internal static void PaintButton(Control control, PaintEventArgs e, string text, Font font, bool enabled, bool hovered, bool pressed, bool selected, bool focused, Color tone, Color foreground, Color border)
+        internal static void PaintButton(Control control, PaintEventArgs e, string text, Font font, bool enabled, bool hovered, bool pressed, bool selected, bool focused, Color tone, Color foreground, Color border, bool keyboardCues = true)
         {
             if (SystemInformation.HighContrast)
             {
@@ -14998,19 +15218,84 @@ foreach (var hive in LoadedUserHives())
             else if (enabled && hovered) back = Mix(back, Color.White, 8);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.Clear(control.Parent == null ? Bg : control.Parent.BackColor);
-            using (GraphicsPath path = RoundedPath(new Rectangle(Point.Empty, control.ClientSize), 7))
+            using (GraphicsPath path = RoundedPath(new Rectangle(Point.Empty, control.ClientSize), 6))
             using (var fill = new SolidBrush(back))
             using (var pen = new Pen(edge))
             {
                 e.Graphics.FillPath(fill, path);
                 e.Graphics.DrawPath(pen, path);
             }
-            TextRenderer.DrawText(e.Graphics, text, font, Rectangle.Inflate(control.ClientRectangle, -8, -3), textColor, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            TextRenderer.DrawText(e.Graphics, text, font, Rectangle.Inflate(control.ClientRectangle, -8, -3), textColor, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | (keyboardCues ? TextFormatFlags.Default : TextFormatFlags.HidePrefix));
             if (focused)
             {
                 Rectangle focus = Rectangle.Inflate(control.ClientRectangle, -4, -4);
                 ControlPaint.DrawFocusRectangle(e.Graphics, focus, textColor, back);
             }
+        }
+    }
+
+    // A drop-down list whose closed state is painted like the themed buttons beside it: same
+    // height, rounded border, muted chevron. The open list keeps the owner-drawn items.
+    internal sealed class ThemedComboBox : ComboBox
+    {
+        private bool _hovered;
+        internal string Placeholder = "";
+
+        internal ThemedComboBox()
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList; DrawMode = DrawMode.OwnerDrawFixed; FlatStyle = FlatStyle.Flat;
+            BackColor = StartupUiTheme.Surface2; ForeColor = StartupUiTheme.TextMain; Cursor = Cursors.Hand;
+        }
+
+        internal void FitRowHeight(int dpi)
+        {
+            try { ItemHeight = Math.Max(20, (int)Math.Round(25 * Math.Max(96, dpi) / 96.0)); } catch { }
+        }
+
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); FitRowHeight(DeviceDpi); }
+        protected override void OnDpiChangedAfterParent(EventArgs e) { base.OnDpiChangedAfterParent(e); FitRowHeight(DeviceDpi); }
+        protected override void OnMouseEnter(EventArgs e) { _hovered = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { _hovered = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+        protected override void OnSelectedIndexChanged(EventArgs e) { Invalidate(); base.OnSelectedIndexChanged(e); }
+        protected override void OnDropDownClosed(EventArgs e) { Invalidate(); base.OnDropDownClosed(e); }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == 0x000F && !SystemInformation.HighContrast && IsHandleCreated)
+            {
+                try { using (Graphics g = Graphics.FromHwnd(Handle)) PaintClosed(g); } catch { }
+            }
+        }
+
+        private void PaintClosed(Graphics g)
+        {
+            Rectangle bounds = ClientRectangle;
+            if (bounds.Width <= 2 || bounds.Height <= 2) return;
+            Color parent = Parent == null ? StartupUiTheme.Bg : Parent.BackColor;
+            Color back = Enabled ? (_hovered || DroppedDown ? StartupUiTheme.Mix(StartupUiTheme.Surface2, Color.White, 8) : StartupUiTheme.Surface2) : StartupUiTheme.DisabledBack;
+            Color edge = Focused || DroppedDown ? StartupUiTheme.Accent : StartupUiTheme.Border;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var clear = new SolidBrush(parent)) g.FillRectangle(clear, bounds);
+            using (GraphicsPath path = StartupUiTheme.RoundedPath(bounds, 6))
+            using (var fill = new SolidBrush(back))
+            using (var pen = new Pen(edge))
+            {
+                g.FillPath(fill, path);
+                g.DrawPath(pen, path);
+            }
+            float scale = Math.Max(1f, DeviceDpi / 96f);
+            int arrowZone = (int)Math.Round(26 * scale);
+            string text = SelectedIndex >= 0 && SelectedIndex < Items.Count ? GetItemText(Items[SelectedIndex]) : Placeholder;
+            Color fore = !Enabled ? StartupUiTheme.DisabledText : (SelectedIndex >= 0 ? StartupUiTheme.TextMain : StartupUiTheme.Muted);
+            var textBounds = new Rectangle(bounds.X + (int)Math.Round(10 * scale), bounds.Y, Math.Max(1, bounds.Width - arrowZone - (int)Math.Round(10 * scale)), bounds.Height);
+            TextRenderer.DrawText(g, text, Font, textBounds, fore, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            float cx = bounds.Right - arrowZone / 2f - 2 * scale, cy = bounds.Top + bounds.Height / 2f;
+            float w = 4.5f * scale, h = 2.5f * scale;
+            using (var chevron = new Pen(Enabled ? StartupUiTheme.Muted : StartupUiTheme.DisabledText, 1.6f * scale) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                g.DrawLines(chevron, new[] { new PointF(cx - w, cy - h), new PointF(cx, cy + h), new PointF(cx + w, cy - h) });
         }
     }
 
@@ -15041,7 +15326,7 @@ foreach (var hive in LoadedUserHives())
         protected override void OnEnabledChanged(EventArgs e) { Cursor = Enabled ? Cursors.Hand : Cursors.Default; Invalidate(); base.OnEnabledChanged(e); }
         protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
         protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
-        protected override void OnPaint(PaintEventArgs e) { StartupUiTheme.PaintButton(this, e, Text, Font, Enabled, _hovered, _pressed, false, Focused && ShowFocusCues, Tone, ToneForeground, ToneBorder); }
+        protected override void OnPaint(PaintEventArgs e) { StartupUiTheme.PaintButton(this, e, Text, Font, Enabled, _hovered, _pressed, false, Focused && ShowFocusCues, Tone, ToneForeground, ToneBorder, ShowKeyboardCues); }
     }
 
     internal sealed class ThemedFilterButton : CheckBox
@@ -15069,7 +15354,7 @@ foreach (var hive in LoadedUserHives())
         {
             Color tone = Tone == Color.Empty ? StartupUiTheme.Surface2 : Tone;
             Color border = tone == StartupUiTheme.Surface || tone == StartupUiTheme.Surface2 ? StartupUiTheme.Border : tone;
-            StartupUiTheme.PaintButton(this, e, Checked ? "✓  " + Text : Text, Font, Enabled, _hovered, _pressed, Checked, Focused && ShowFocusCues, tone, StartupUiTheme.ForegroundFor(tone), border);
+            StartupUiTheme.PaintButton(this, e, Checked ? "✓  " + Text : Text, Font, Enabled, _hovered, _pressed, Checked, Focused && ShowFocusCues, tone, StartupUiTheme.ForegroundFor(tone), border, ShowKeyboardCues);
         }
     }
 
@@ -15083,7 +15368,8 @@ foreach (var hive in LoadedUserHives())
         private List<StartupItem> _items = new List<StartupItem>();
         private ListView _list;
         private TextBox _search;
-        private ComboBox _sortBy;
+        private System.Windows.Forms.Timer _searchDebounce;
+        private ThemedComboBox _sortBy;
         private Label _summary, _visibleValue, _enabledValue, _disabledValue, _reviewValue, _managedValue, _hint;
         private Label _selectionTitle, _selectionMeta, _detailTitle, _detailBody, _emptyTitle, _emptyBody;
         private Button _refresh, _disable, _enable, _add, _editSelected, _clearSearch, _sortDirection, _quietSelected, _launchSelected, _copySelected, _copyMarked, _selectAllVisible, _clearMarked, _tools, _retry, _emptyPrimary, _emptySecondary;
@@ -15258,6 +15544,7 @@ foreach (var hive in LoadedUserHives())
             }
             int gameAutoRoutes = 0, gameAutoExpectedRows = 0, gameAutoNameRows = 0, gameAutoFitGirlRows = 0, gameAutoMissing = 0, gameAutoFitGirlRequired = 0, gameAutoIdentityProbes = 0, gameAutoIdentityRows = 0;
             int qbittorrentRoutes = 0, qbittorrentExpectedRows = 0, qbittorrentRows = 0, qbittorrentMissing = 0;
+            long searchRenderMs = -1;
             string firstSearchMissing = "";
             string firstAppsMissing = "";
             try
@@ -15476,6 +15763,15 @@ foreach (var hive in LoadedUserHives())
                         var visibleIds = new HashSet<string>(matches.SelectMany(row => row.Routes).Select(route => route.Id), StringComparer.OrdinalIgnoreCase);
                         qbittorrentMissing = qbittorrentIds.Count(id => !visibleIds.Contains(id));
                     }
+
+                    // Each keystroke in the search box re-renders the list. Time one real typed
+                    // render over the largest live view so keystroke latency is on every receipt.
+                    form.SetFilter("Enabled");
+                    var typed = System.Diagnostics.Stopwatch.StartNew();
+                    form._search.Text = "e";
+                    typed.Stop();
+                    searchRenderMs = typed.ElapsedMilliseconds;
+                    form._search.Text = "";
                 }
             }
             catch (Exception ex)
@@ -15523,6 +15819,7 @@ foreach (var hive in LoadedUserHives())
                 + " qbittorrent_visible=" + qbittorrentVisible.ToString().ToLowerInvariant()
                 + (firstSearchMissing.Length == 0 ? "" : " first_search_missing=" + firstSearchMissing)
                 + (firstAppsMissing.Length == 0 ? "" : " first_apps_missing=" + firstAppsMissing)
+                + " search_render_ms=" + searchRenderMs
                 + " boot_audit_clean=" + bootClean.ToString().ToLowerInvariant();
             return passed;
         }
@@ -16088,6 +16385,7 @@ foreach (var hive in LoadedUserHives())
         {
             base.OnHandleCreated(e);
             StartupUiTheme.ApplyNativeDarkChrome(this, _list);
+            StartupUiTheme.ThemeListHeader(_list);
             if (_dpiLayoutReady) ApplyInitialDpiGeometry();
         }
 
@@ -16232,7 +16530,21 @@ foreach (var hive in LoadedUserHives())
             findRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70f)); findRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); findRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100f));
             findRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
             findRow.Controls.Add(new Label { Text = "Find", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Muted, Font = new Font(Font, FontStyle.Bold) }, 0, 0);
-            _search = StyledTextBox(); _search.Dock = DockStyle.Fill; _search.Margin = new Padding(0, 2, 8, 2); _search.AccessibleName = "Search startup inventory"; _search.AccessibleDescription = "Filter by application, entry, source, path, command, or status."; _search.TextChanged += (s, e) => RenderList(); findRow.Controls.Add(_search, 1, 0);
+            _search = StyledTextBox(); _search.BorderStyle = BorderStyle.None; _search.Dock = DockStyle.Fill; _search.Margin = new Padding(0); _search.AccessibleName = "Search startup inventory"; _search.AccessibleDescription = "Filter by application, entry, source, path, command, or status."; _search.TextChanged += (s, e) => SearchTextChanged();
+            _searchDebounce = new System.Windows.Forms.Timer { Interval = 110 };
+            _searchDebounce.Tick += (s, e) => { _searchDebounce.Stop(); RenderList(); };
+            Disposed += (s, e) => _searchDebounce.Dispose();
+            var searchFrame = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 8, 0), Padding = new Padding(12, 7, 10, 3), BackColor = _search.BackColor };
+            searchFrame.Paint += (s, e) =>
+            {
+                if (SystemInformation.HighContrast) return;
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                using (GraphicsPath path = StartupUiTheme.RoundedPath(new Rectangle(Point.Empty, searchFrame.ClientSize), 6))
+                using (var pen = new Pen(_search.Focused ? Accent : StartupUiTheme.Mix(Border, Bg, 30))) e.Graphics.DrawPath(pen, path);
+            };
+            _search.GotFocus += (s, e) => searchFrame.Invalidate(); _search.LostFocus += (s, e) => searchFrame.Invalidate();
+            _search.HandleCreated += (s, e) => StartupUiTheme.SetCueBanner(_search, "Search applications, tasks, services, paths or commands");
+            searchFrame.Controls.Add(_search); findRow.Controls.Add(searchFrame, 1, 0);
             _clearSearch = Button("C&lear", Surface2, 90); _clearSearch.Height = 32; _clearSearch.Margin = new Padding(4, 0, 0, 0); _clearSearch.Click += (s, e) => { _routeTargetFilter = null; _search.Clear(); RenderList(); _search.Focus(); }; findRow.Controls.Add(_clearSearch, 2, 0);
             findArea.Controls.Add(findRow, 0, 0);
             var filters = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0), Padding = new Padding(0) };
@@ -16241,7 +16553,8 @@ foreach (var hive in LoadedUserHives())
             _showDisabled = FilterButton("&Disabled", 108, "Disabled");
             filters.Controls.Add(_showAll); filters.Controls.Add(_showEnabled); filters.Controls.Add(_showDisabled);
             filters.Controls.Add(new Label { Text = "Sort by", Width = 52, Height = 30, TextAlign = ContentAlignment.MiddleRight, ForeColor = Muted, Margin = new Padding(4, 0, 4, 0), AccessibleName = "Sort by label" });
-            _sortBy = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 132, Height = 30, BackColor = Surface2, ForeColor = TextMain, FlatStyle = FlatStyle.Flat, AccessibleName = "Sort by", AccessibleDescription = "Choose any inventory column to sort. Alt S focuses this control.", Margin = new Padding(0, 1, 6, 0) };
+            _sortBy = new ThemedComboBox { Width = 150, Placeholder = "Default order", AccessibleName = "Sort by", AccessibleDescription = "Choose any inventory column to sort. Alt S focuses this control.", Margin = new Padding(0, 1, 6, 0) };
+            _sortBy.DrawItem += DrawSortItem;
             _sortBy.Items.AddRange(new object[] { "Application", "Status", "Mode", "Source", "Risk", "Startup entry" });
             _sortBy.SelectedIndexChanged += (s, e) => { if (!_syncingSortControls && _sortBy.SelectedIndex >= 0) SetColumnSort(_sortBy.SelectedIndex, true); };
             _sortDirection = Button("&Ascending", Surface2, 104); _sortDirection.Height = 30; _sortDirection.Margin = new Padding(0); _sortDirection.Click += (s, e) => ToggleSortDirection();
@@ -16323,7 +16636,7 @@ foreach (var hive in LoadedUserHives())
             _tooltip.SetToolTip(_add, "Add an executable, shortcut, or script to Windows startup.");
             _tooltip.SetToolTip(_refresh, "Read every startup source again. Refresh never changes startup settings.");
             _tooltip.SetToolTip(_tools, "Coverage, explicit repair, protection, and startup-folder tools.");
-            _tooltip.SetToolTip(_search, "Filter by application, registration, source, path, command, or status. Ctrl+F focuses search.");
+            _tooltip.SetToolTip(_search, "Filter by application, registration, source, path, command, or status. Ctrl+F focuses search; Down moves into the results.");
             _tooltip.SetToolTip(_showAll, "Summarize every route owned by one installed app, including app-owned automatic services. One enabled route means the app is enabled at startup.");
             _tooltip.SetToolTip(_showEnabled, "Show all enabled startup routes across every source.");
             _tooltip.SetToolTip(_showDisabled, "Show all disabled startup routes across every source.");
@@ -16429,14 +16742,25 @@ foreach (var hive in LoadedUserHives())
             catch { }
         }
 
+        private void DrawSortItem(object sender, DrawItemEventArgs e)
+        {
+            bool edit = (e.State & DrawItemState.ComboBoxEdit) != 0;
+            bool hot = !edit && (e.State & DrawItemState.Selected) != 0;
+            Color back = hot ? StartupUiTheme.SelectedRow : Surface2;
+            using (var b = new SolidBrush(back)) e.Graphics.FillRectangle(b, e.Bounds);
+            string text = e.Index >= 0 && e.Index < _sortBy.Items.Count ? Convert.ToString(_sortBy.Items[e.Index]) : "Default order";
+            Color fore = e.Index >= 0 ? TextMain : Muted;
+            TextRenderer.DrawText(e.Graphics, text, _sortBy.Font, new Rectangle(e.Bounds.X + 6, e.Bounds.Y, e.Bounds.Width - 8, e.Bounds.Height), fore, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        }
+
         private void DrawColumnHeader(object sender, DrawListViewColumnHeaderEventArgs e)
         {
             Color background = SystemInformation.HighContrast ? SystemColors.Control : Surface2;
-            Color foreground = SystemInformation.HighContrast ? SystemColors.ControlText : TextMain;
+            Color foreground = SystemInformation.HighContrast ? SystemColors.ControlText : (_sortColumn == e.ColumnIndex ? TextMain : Muted);
             using (var b = new SolidBrush(background)) e.Graphics.FillRectangle(b, e.Bounds);
             using (var p = new Pen(SystemInformation.HighContrast ? SystemColors.ControlDark : Border)) e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
             string headerText = e.Header.Text + (_sortColumn == e.ColumnIndex ? (_sortAscending ? "  ▲" : "  ▼") : "");
-            using (var font = new Font(_list.Font, FontStyle.Bold)) TextRenderer.DrawText(e.Graphics, headerText, font, new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height), foreground, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+            using (var font = new Font(_list.Font.FontFamily, _list.Font.SizeInPoints * .92f, FontStyle.Bold)) TextRenderer.DrawText(e.Graphics, headerText, font, new Rectangle(e.Bounds.X + 10, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height), foreground, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
         }
 
         private void DrawSubItem(object sender, DrawListViewSubItemEventArgs e)
@@ -16446,11 +16770,17 @@ foreach (var hive in LoadedUserHives())
             bool selected = e.Item.Selected;
             Color row = SystemInformation.HighContrast
                 ? (selected ? SystemColors.Highlight : SystemColors.Window)
-                : (selected ? StartupUiTheme.SelectedRow : (e.ItemIndex % 2 == 0 ? Color.FromArgb(19, 23, 29) : Color.FromArgb(22, 27, 33)));
+                : (selected ? StartupUiTheme.SelectedRow : Color.FromArgb(19, 23, 29));
             Color foreground = SystemInformation.HighContrast
                 ? (selected ? SystemColors.HighlightText : SystemColors.WindowText)
                 : TextMain;
             using (var b = new SolidBrush(row)) e.Graphics.FillRectangle(b, e.Bounds);
+            if (!SystemInformation.HighContrast)
+            {
+                using (var hairline = new Pen(Color.FromArgb(31, 37, 45))) e.Graphics.DrawLine(hairline, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+                if (selected && e.ColumnIndex == 0 && !(item.RiskLevel() == "Critical" || item.AdviceLevel() == "Cleanup"))
+                    using (var bar = new SolidBrush(Accent)) e.Graphics.FillRectangle(bar, new Rectangle(e.Bounds.X, e.Bounds.Y + 5, 3, Math.Max(1, e.Bounds.Height - 10)));
+            }
             if (!SystemInformation.HighContrast && e.ColumnIndex == 0 && (item.RiskLevel() == "Critical" || item.AdviceLevel() == "Cleanup"))
             {
                 using (var marker = new SolidBrush(item.RiskLevel() == "Critical" ? Danger : Warn)) e.Graphics.FillRectangle(marker, new Rectangle(e.Bounds.X, e.Bounds.Y + 5, 3, Math.Max(1, e.Bounds.Height - 10)));
@@ -16635,8 +16965,25 @@ foreach (var hive in LoadedUserHives())
             UpdateButtons();
         }
 
+        // A burst of keystrokes renders once instead of once per character, so typing stays
+        // fluid on a thousand-route inventory. Programmatic changes and clearing the box are
+        // not typing and render at once; any render cancels a pending one.
+        private void SearchTextChanged()
+        {
+            if (_searchDebounce == null || _search == null || !_search.Focused || string.IsNullOrEmpty(_search.Text)) { RenderList(); return; }
+            _searchDebounce.Stop();
+            _searchDebounce.Start();
+        }
+
+        private void FlushPendingSearch()
+        {
+            if (_searchDebounce != null && _searchDebounce.Enabled) RenderList();
+        }
+
         private void RenderList(string selectionId = null)
         {
+            if (_searchDebounce != null) _searchDebounce.Stop();
+            _probeIndex.Clear();
             if (_list == null) return;
             InventoryRow selectedBefore = SelectedRow();
             bool explicitSelection = selectionId != null;
@@ -16730,27 +17077,60 @@ foreach (var hive in LoadedUserHives())
         // is findable, and skipping it keeps the every-route name probe fast on large inventories.
         private List<InventoryRow> BuildVisibleRowsForProbe(string query)
         {
-            var eligible = _items.Where(MatchesFilter).ToList();
+            bool filtered = !string.IsNullOrWhiteSpace(query);
             var rows = new List<InventoryRow>();
+            foreach (ProbeGroup group in ProbeGroupsForCurrentFilter())
+            {
+                if (filtered && !group.Texts.Any(text => text.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
+                StartupItem primary = group.IsApp
+                    ? group.Routes.OrderByDescending(RouteSeverity).ThenByDescending(x => x.IsManaged).ThenBy(x => x.HumanName(), StringComparer.OrdinalIgnoreCase).First()
+                    : group.Routes[0];
+                rows.Add(new InventoryRow { Key = group.Key, TargetIdentity = group.TargetIdentity, Routes = new List<StartupItem>(group.Routes), Primary = primary, IsAppSummary = group.IsApp });
+            }
+            return rows;
+        }
+
+        // The grouping, target identity and search text of every route are fixed for one
+        // inventory snapshot and one view, so the verify gate builds them once per view
+        // instead of once per probe (the old per-probe rebuild made the gate quadratic and
+        // took several minutes on a thousand-route machine). Any real render clears it.
+        private sealed class ProbeGroup
+        {
+            internal string Key;
+            internal string TargetIdentity;
+            internal List<StartupItem> Routes;
+            internal string[] Texts;
+            internal bool IsApp;
+        }
+
+        private readonly Dictionary<string, List<ProbeGroup>> _probeIndex = new Dictionary<string, List<ProbeGroup>>(StringComparer.Ordinal);
+        private List<StartupItem> _probeIndexItems;
+
+        private List<ProbeGroup> ProbeGroupsForCurrentFilter()
+        {
+            if (!ReferenceEquals(_probeIndexItems, _items)) { _probeIndex.Clear(); _probeIndexItems = _items; }
+            string key = (_filterMode ?? "") + "|" + (_routeTargetFilter ?? "") + "|" + _items.Count;
+            if (_probeIndex.TryGetValue(key, out List<ProbeGroup> cached)) return cached;
+            var eligible = _items.Where(MatchesFilter).ToList();
+            var groups = new List<ProbeGroup>();
             if (_filterMode == "Apps")
             {
                 foreach (var group in eligible.GroupBy(ApplicationGroupIdentity, StringComparer.OrdinalIgnoreCase))
                 {
                     List<StartupItem> routes = group.ToList();
-                    if (!string.IsNullOrWhiteSpace(query) && !routes.Any(x => SearchText(x).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
-                    StartupItem primary = routes.OrderByDescending(RouteSeverity).ThenByDescending(x => x.IsManaged).ThenBy(x => x.HumanName(), StringComparer.OrdinalIgnoreCase).First();
-                    rows.Add(new InventoryRow { Key = "app|" + group.Key, TargetIdentity = group.Key, Routes = routes, Primary = primary, IsAppSummary = true });
+                    groups.Add(new ProbeGroup { Key = "app|" + group.Key, TargetIdentity = group.Key, Routes = routes, Texts = routes.Select(SearchText).ToArray(), IsApp = true });
                 }
             }
             else
             {
                 foreach (StartupItem item in eligible)
                 {
-                    if (!string.IsNullOrWhiteSpace(query) && SearchText(item).IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                    rows.Add(new InventoryRow { Key = "route|" + (item.Id ?? CanonicalTargetIdentity(item)), TargetIdentity = CanonicalTargetIdentity(item), Routes = new List<StartupItem> { item }, Primary = item, IsAppSummary = false });
+                    string identity = CanonicalTargetIdentity(item);
+                    groups.Add(new ProbeGroup { Key = "route|" + (item.Id ?? identity), TargetIdentity = identity, Routes = new List<StartupItem> { item }, Texts = new[] { SearchText(item) }, IsApp = false });
                 }
             }
-            return rows;
+            _probeIndex[key] = groups;
+            return groups;
         }
 
         private static DateTime NewestFirstSeenUtc(List<StartupItem> routes)
@@ -16993,7 +17373,7 @@ foreach (var hive in LoadedUserHives())
             // startup route (LGHUB is a real example). Product ownership is backed by an exact
             // executable path and is never inferred from a coincidentally similar display name.
             if (source == "Windows Service") return (item.ApplicationIdentity ?? "").StartsWith("installed-product:", StringComparison.OrdinalIgnoreCase);
-            return source != "System Driver" && source != "Winlogon Autostart" && source != "Winlogon Notification" && source != "AppInit DLLs" && source != "Active Setup" && source != "Boot Execute" && source != "Image Hijack" && source != "Known DLL" && source != "Network Provider" && source != "Winsock Provider" && source != "Print Monitor" && source != "Media Codec" && source != "WMI Event Consumer" && source != "Group Policy Script" && source != "Explorer Startup Extension" && source != "Explorer Shell Extension" && source != "Internet Explorer Add-on" && source != "AppCert DLLs" && source != "LSA Startup Package" && source != "Stale Startup Metadata";
+            return source != "System Driver" && source != "Winlogon Autostart" && source != "Winlogon Notification" && source != "AppInit DLLs" && source != "Active Setup" && source != "Boot Execute" && source != "Image Hijack" && source != "Known DLL" && source != "Network Provider" && source != "Winsock Provider" && source != "Print Monitor" && source != "Print Provider" && source != "Security Provider" && source != "Terminal Server Startup" && source != "Icon Service Library" && source != "URL Search Hook" && source != "Service Dependency" && source != "Media Codec" && source != "WMI Event Consumer" && source != "Group Policy Script" && source != "Explorer Startup Extension" && source != "Explorer Shell Extension" && source != "Internet Explorer Add-on" && source != "AppCert DLLs" && source != "LSA Startup Package" && source != "Stale Startup Metadata";
         }
 
         private static bool IsLogitechRoute(StartupItem item)
@@ -17055,6 +17435,15 @@ foreach (var hive in LoadedUserHives())
 
         private void MainFormKeyDown(object sender, KeyEventArgs e)
         {
+            if (_search != null && _search.Focused && (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Down)) FlushPendingSearch();
+            if (_search != null && _search.Focused && e.KeyCode == Keys.Down && !e.Control && !e.Alt && _list.Items.Count > 0)
+            {
+                // Down from the search box moves straight into the results.
+                if (_list.SelectedItems.Count == 0) { _list.Items[0].Selected = true; _list.Items[0].Focused = true; }
+                _list.Focus();
+                e.Handled = true; e.SuppressKeyPress = true;
+                return;
+            }
             bool editingText = ActiveControl is TextBox;
             if (editingText && (e.KeyCode == Keys.Delete || e.KeyCode == Keys.Enter || (e.Control && e.KeyCode == Keys.C))) return;
             if (e.Alt && e.KeyCode == Keys.S) { _sortBy.Focus(); e.Handled = true; e.SuppressKeyPress = true; return; }

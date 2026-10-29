@@ -245,3 +245,13 @@ Use `scripts\build.ps1 -InstallCurrentUser` to apply the guarded workflow to `%L
 ## What changed in 2.9.1
 - Disabling an autostart service or driver now sets demand start instead of hard Disabled: the service no longer consumes boot resources but remains fully usable on demand (proven live with WSLService - wsl.exe cold-started the demand service, and re-enabling restored Automatic exactly).
 - The restore path accepts both the new demand-start state and legacy hard-disabled values, so older preserved records still re-enable correctly.
+
+## What changed in 2.10.0
+- Scheduled tasks with no triggers at all are inventoried as "No-trigger (on-demand)", so the row count matches Task Scheduler exactly; a task row is Enabled exactly when Task Scheduler will run it, and partially disabled triggers are spelled out in the status text instead of flipping the row to Disabled.
+- Five more Autoruns-parity surfaces are read: Terminal Server startup programs, security providers, icon service libraries, print providers and URL search hooks.
+- Services pulled in at boot only because an automatic service depends on them appear as read-only "Service Dependency" rows naming the parent to disable, so nothing that starts at boot is missing from the list.
+- The scheduled-task readers get a 30-second budget and one automatic retry at double that budget, so a busy machine can no longer make every task disappear behind a single "Read failed" row.
+- Interface polish: keyboard underlines appear only when Alt is held, the search box carries a placeholder inside a rounded frame, Sort by shows "Default order" in a dark owner-drawn list, the light block above the list scrollbar is gone, rows use hairline separators with an accent bar on the selected row, and column headers are quieter except for the sorted column.
+- Running processes are never dropped from the snapshot when the machine is under load, so a tray app that is running always shows as running.
+- Search stays fluid on a thousand-route inventory: a burst of keystrokes renders the list once, the quiet-mode lookup is read once per render instead of once per row, and Down moves from the search box straight into the results.
+- `--verify-live-inventory` finishes in seconds instead of minutes (it indexes each view once instead of rebuilding it for every probe) and reports `search_render_ms`, the time one typed search takes over the largest live view.
