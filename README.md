@@ -255,3 +255,11 @@ Use `scripts\build.ps1 -InstallCurrentUser` to apply the guarded workflow to `%L
 - Running processes are never dropped from the snapshot when the machine is under load, so a tray app that is running always shows as running.
 - Search stays fluid on a thousand-route inventory: a burst of keystrokes renders the list once, the quiet-mode lookup is read once per render instead of once per row, and Down moves from the search box straight into the results.
 - `--verify-live-inventory` finishes in seconds instead of minutes (it indexes each view once instead of rebuilding it for every probe) and reports `search_render_ms`, the time one typed search takes over the largest live view.
+
+## What changed in 2.10.1
+- A drive that stops answering can no longer freeze the app. Process image names are read in their native form, which needs no volume I/O, and mapped back to drive letters from the device links. Every process read and every dashboard scan runs under a hard deadline. Before this, one stalled media drive stopped every scan, and with it new-item detection, until the drive came back.
+- Run keys in the SYSTEM, LOCAL SERVICE and NETWORK SERVICE profiles are listed like any other profile, so entries such as the OneDrive bootstrapper in the service profiles are shown. The .DEFAULT alias of SYSTEM is no longer listed twice.
+- Startup-folder entries reported by Windows under the shortcut name, or with 8.3 short paths, match their real shortcut, so they no longer show up as unexplained extra rows.
+- Row names follow the registration itself: COM class names, network provider display names and the DLL that rundll32 or regsvr32 loads. Windows system files keep their exact file names (WS2_32, iyuv_32), and task folders repeated at the start of the task name are stated once.
+- Media codec registrations, Internet Explorer toolbars and search hooks, Explorer shell hooks and URL search hooks now have a one-click Disable that removes only that single registry value after saving its exact data, and Enable writes it back unchanged. Entries that Windows needs to boot or sign in (known system libraries, network, print and security providers, Winsock) stay protected and say why.
+- `--list` returns each route once, and the smoke gate no longer trips over a type-initialization race.
