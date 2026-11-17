@@ -616,7 +616,7 @@ pub fn disable_core(item: &StartupItem) -> Result<(), String> {
         return disable_startup_folder(item);
     }
     if lower.starts_with("task|") {
-        msm_core::managed::run_checked("schtasks.exe", &format!("/Change /TN {} /Disable", q(&item.location)), 30_000)?;
+        task_change_with_system_fallback(&item.location, "Disable")?;
         if !item.location.trim().is_empty() {
             protected_quiet::unprotect_task(&item.location);
         }
@@ -684,7 +684,7 @@ pub fn enable_core(item: &StartupItem) -> Result<(), String> {
         return restore_wmi_binding(item);
     }
     if lower.starts_with("task|") {
-        msm_core::managed::run_checked("schtasks.exe", &format!("/Change /TN {} /Enable", q(&item.location)), 30_000)?;
+        task_change_with_system_fallback(&item.location, "Enable")?;
         upsert_item_checked(item)?;
         protected_disabled::unprotect(item);
         if lower.starts_with("task|") && msm_core::quiet_plan::is_quiet_launch(&item.command, &item.location) && !item.location.trim().is_empty() {
@@ -1313,4 +1313,28 @@ impl RegistryValueStateExt for RegistryValueState {
     fn normalized(self, kind: RegKind) -> RegistryValueState {
         self
     }
+}
+
+/// Enable/disable a scheduled task; when Windows refuses the caller (TrustedInstaller-owned
+/// system tasks) retry once as SYSTEM through a one-shot task, then verify and clean up.
+fn task_change_with_system_fallback(location: &str, verb: &str) -> Result<(), String> {
+    let direct = msm_core::managed::run_checked("schtasks.exe", &format!("/Change /TN {} /{}", q(location), verb), 30_000);
+    let Err(first) = direct else { return Ok(()) };
+    if !first.to_lowercase().contains("denied") { return Err(first); }
+    let helper = format!("MichSysHelper{}", std::process::id());
+    let inner = format!("schtasks.exe /Change /TN \\\"{}\\\" /{}", location, verb);
+    let _ = msm_core::managed::run_checked("schtasks.exe", &format!("/Create /F /TN {} /RU SYSTEM /SC ONCE /ST 00:00 /TR \"{}\"", q(&helper), inner), 30_000);
+    let _ = msm_core::managed::run_checked("schtasks.exe", &format!("/Run /TN {}", q(&helper)), 30_000);
+    let want_disabled = verb.eq_ignore_ascii_case("Disable");
+    let mut ok = false;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        use std::os::windows::process::CommandExt;
+        if let Ok(out) = std::process::Command::new("schtasks.exe").raw_arg(format!("/Query /TN {} /FO LIST", q(location))).creation_flags(0x08000000).output() {
+            let disabled = String::from_utf8_lossy(&out.stdout).to_lowercase().contains("disabled");
+            if disabled == want_disabled { ok = true; break; }
+        }
+    }
+    let _ = msm_core::managed::run_checked("schtasks.exe", &format!("/Delete /F /TN {}", q(&helper)), 30_000);
+    if ok { Ok(()) } else { Err(format!("{} (SYSTEM retry did not change it)", first)) }
 }

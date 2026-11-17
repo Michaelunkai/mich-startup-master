@@ -23,16 +23,23 @@ impl InventoryRow {
         self.routes.len() > 1
     }
 
+    /// Routes that decide the row state: WMI mirrors covered by a native route never count.
+    fn counted(&self) -> Vec<&StartupItem> {
+        let real: Vec<&StartupItem> = self.routes.iter()
+            .filter(|x| !is_covered_startup_command_mirror(x, &self.routes)).collect();
+        if real.is_empty() { self.routes.iter().collect() } else { real }
+    }
+
     pub fn all_enabled(&self) -> bool {
-        !self.routes.is_empty() && self.routes.iter().all(|x| display_state(x) == "Enabled")
+        !self.routes.is_empty() && self.counted().iter().all(|x| display_state(x) == "Enabled")
     }
 
     pub fn all_disabled(&self) -> bool {
-        !self.routes.is_empty() && self.routes.iter().all(|x| display_state(x) == "Disabled")
+        !self.routes.is_empty() && self.counted().iter().all(|x| display_state(x) == "Disabled")
     }
 
     pub fn any_enabled(&self) -> bool {
-        self.routes.iter().any(|x| display_state(x) == "Enabled")
+        self.counted().iter().any(|x| display_state(x) == "Enabled")
     }
 
     pub fn effective_enabled(&self) -> bool {
@@ -114,7 +121,6 @@ pub fn display_state(item: &StartupItem) -> &'static str {
     match item.state_text() {
         "Enabled" => "Enabled",
         "Disabled" => "Disabled",
-        "Drifted" => "Drifted",
         _ => if item.enabled { "Enabled" } else { "Disabled" },
     }
 }
@@ -301,8 +307,19 @@ pub fn build_visible_rows_sorted(items: &[StartupItem], filter: &str, query: &st
     if filter == "Apps" && !hidden_view {
         // Stable grouping by application identity.
         let mut groups: Vec<(String, Vec<StartupItem>)> = Vec::new();
+        let natives: Vec<(String, String)> = visible.iter()
+            .filter(|i| i.source == "Startup Folder")
+            .map(|i| {
+                let n = i.name.trim().to_lowercase();
+                (n.rsplit_once('.').map(|(stem, _)| stem.to_string()).unwrap_or(n), application_group_identity(i))
+            }).collect();
         for item in visible {
-            let identity = application_group_identity(item);
+            // A WMI Startup Command projection joins the row of the Startup-folder shortcut it mirrors.
+            let mirror_name = item.name.trim().to_lowercase();
+            let identity = if item.source == "Startup Command" {
+                natives.iter().find(|(stem, _)| *stem == mirror_name).map(|(_, id)| id.clone())
+                    .unwrap_or_else(|| application_group_identity(item))
+            } else { application_group_identity(item) };
             match groups.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(&identity)) {
                 Some((_, group)) => group.push(item.clone()),
                 None => groups.push((identity, vec![item.clone()])),
@@ -428,6 +445,15 @@ pub fn target_disambiguator(identity: &str) -> String {
 /// C# `IsCoveredStartupCommandMirror` + `BulkStateCandidates` + `CanBulkSetEnabled`.
 pub fn is_covered_startup_command_mirror(route: &StartupItem, group: &[StartupItem]) -> bool {
     if route.source != "Startup Command" { return false; }
+    // A Startup-folder shortcut/script registers under the same name as the WMI projection:
+    // that native route is the authority, the projection is its mirror.
+    let mirror_name = route.name.trim().to_lowercase();
+    let named_by_native = !mirror_name.is_empty() && group.iter().any(|other| {
+        if other.source != "Startup Folder" { return false; }
+        let n = other.name.trim().to_lowercase();
+        n == mirror_name || n.rsplit_once('.').map(|(stem, _)| stem == mirror_name).unwrap_or(false)
+    });
+    if named_by_native { return true; }
     let mirror_command = msm_core::dedupe::norm_boot_key(&route.command);
     if mirror_command.len() <= 8 { return false; }
     group.iter().any(|other| {
@@ -449,8 +475,6 @@ fn route_command_covers_mirror(candidate: &StartupItem, mirror_command: &str) ->
 pub fn bulk_state_candidates(row: &InventoryRow, enabled_state: bool) -> Vec<StartupItem> {
     row.routes.iter()
         .filter(|route| route.enabled != enabled_state
-            && !eq_ci(&route.source, "Scheduled Task (Any Trigger)")
-            && !eq_ci(&route.source, "Service (Trigger Start)")
             && !is_covered_startup_command_mirror(route, &row.routes))
         .cloned()
         .collect()

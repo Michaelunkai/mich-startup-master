@@ -90,6 +90,8 @@ fn dispatch(args: &[String]) -> i32 {
         "--add-startup" => { attach_console(); add_startup(&rest) }
         "--add-from-path" => { attach_console(); add_from_path(&rest) }
         "--purge" => { attach_console(); purge_key(&rest) }
+        "--list-mixed" => { attach_console(); list_mixed() }
+        "--set-app-enabled" => { attach_console(); set_app_enabled(&rest) }
         "--hidden-list" => { attach_console(); hidden_list() }
         "--hidden-restore" => { attach_console(); hidden_restore(&rest) }
         "--add-test-task" | "--add-test-task-tray" | "--add-test-task-normal" => { attach_console(); add_test_task(&rest, cmd != "--add-test-task-normal") }
@@ -461,7 +463,10 @@ fn purge_key(args: &[String]) -> i32 {
     let roots: Vec<String> = matches.iter().map(|m| m.application_root.trim().to_lowercase()).filter(|r| !r.is_empty()).collect();
     if !roots.is_empty() {
         for x in msm_core::scan::scan_all() {
-            if roots.contains(&x.application_root.trim().to_lowercase()) && !matches.iter().any(|m| m.id.eq_ignore_ascii_case(&x.id)) {
+            let cmd = x.command.to_lowercase();
+            let in_root = roots.contains(&x.application_root.trim().to_lowercase())
+                || roots.iter().any(|r| r.len() > 8 && cmd.contains(&format!("{}\\", r.trim_end_matches('\\'))));
+            if in_root && !matches.iter().any(|m| m.id.eq_ignore_ascii_case(&x.id)) {
                 matches.push(x);
             }
         }
@@ -950,4 +955,42 @@ fn log_crash(message: &str) {
     if let Ok(mut stream) = std::fs::OpenOptions::new().create(true).append(true).open(&crash_path) {
         let _ = writeln!(stream, "[{}] {}", now_stamp(), message);
     }
+}
+
+/// `--set-app-enabled <name-substring> <true|false>` — exactly the UI one-click row toggle.
+fn set_app_enabled(args: &[String]) -> i32 {
+    if args.len() < 2 { println!("usage: --set-app-enabled <name> <true|false>"); return 2; }
+    let enable = args[1].eq_ignore_ascii_case("true");
+    let needle = args[0].to_lowercase();
+    let find = |items: &[msm_core::model::StartupItem]| {
+        msm_ui::view::build_visible_rows_sorted(items, "Apps", "", msm_ui::view::SortMode::Smart)
+            .into_iter().find(|r| r.display_name.to_lowercase().contains(&needle))
+    };
+    let items = msm_core::scan::scan_all();
+    let Some(row) = find(&items) else { println!("row not found: {}", args[0]); return 4 };
+    let candidates = msm_ui::view::bulk_state_candidates(&row, enable);
+    let (done, failures) = msm_actions::set_routes_best_effort(&candidates, enable);
+    let after = msm_core::scan::scan_all();
+    let rows_after = msm_ui::view::build_visible_rows_sorted(&after, "Apps", "", msm_ui::view::SortMode::Smart);
+    let status = rows_after.iter().filter(|r| r.display_name.to_lowercase().contains(&needle))
+        .map(|r| format!("[{} | {} | off={} on={} routes={}]", r.display_name, r.status_text(), r.all_disabled(), r.all_enabled(), r.routes.len())).collect::<Vec<_>>().join(" ");
+    println!("SET_APP row={} applied={} failures={} AFTER: {}", row.display_name, done, failures.len(), status);
+    for f in failures.iter().take(8) { println!("FAIL {}", f); }
+    0
+}
+
+/// `--list-mixed` — every visible row that is not uniformly On/Off, with per-route state.
+fn list_mixed() -> i32 {
+    let items = msm_core::scan::scan_all();
+    let rows = msm_ui::view::build_visible_rows_sorted(&items, "Apps", "", msm_ui::view::SortMode::Smart);
+    let mut n = 0;
+    for r in rows.iter().filter(|r| !r.all_enabled() && !r.all_disabled()) {
+        n += 1;
+        println!("MIXED {} | {}", r.display_name, r.status_text());
+        for x in &r.routes {
+            println!("   route src={} state={} enabled={} can_disable={} ext={} name={}", x.source, x.state_text(), x.enabled, x.can_disable, x.external_authority, x.name);
+        }
+    }
+    println!("MIXED_COUNT={} of {} rows", n, rows.len());
+    0
 }
