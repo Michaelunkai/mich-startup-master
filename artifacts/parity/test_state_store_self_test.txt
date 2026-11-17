@@ -1,0 +1,1 @@
+STATE_STORE_SELF_TEST workers=12 atomic=ok recovery=ok

@@ -1,0 +1,68 @@
+MichStartupMaster CLI - Startup Management Commands
+====================================================
+
+INVENTORY & QUERY:
+  --list                   List all startup items as JSON
+  --list-enabled           List only enabled startup items
+  --list-disabled          List only disabled startup items
+  --list-sources           List all unique startup source types
+  --search <query>         Search startup items by name, path, or command
+  --get-item <id>          Get details for a specific startup item
+  --export                 Export all startup data as TSV (paste-ready)
+  --detect-new             Detect newly added startup items since last check
+
+ENABLE/DISABLE:
+  --set-enabled <id> <true|false>   Enable or disable a startup item
+  --toggle-popup <id>               Toggle quiet (tray) mode for an item
+
+ADD/REMOVE/EDIT:
+  --add-startup <name> <path> [args] [normal|tray]   Add a new startup item
+  --remove-task <name>                                Remove a managed scheduled task
+  --edit-startup <id> <name> <path> [args] [normal|tray]  Edit an existing startup item
+
+RUN/OPEN:
+  --run-now <id>            Run a startup item now
+  --open-location <id>      Open the folder containing the startup item
+  --open-folders            Open user and common startup folders
+
+PROTECTION & REPAIR:
+  --protect-disabled       Protect currently disabled items from being re-enabled
+  --enforce-disabled       Enforce all protected disabled items
+  --enforce-quiet          Enforce all protected quiet (tray) items
+  --enforce-enabled        Enforce all managed enabled items
+  --repair-rules           Repair all startup rules (disabled + quiet + enabled)
+  --reconcile-managed-startups [prefix]   Reconcile managed startup routes
+
+AUDIT & VERIFY:
+  --audit-boot             Audit boot coverage (completeness check)
+  --audit-tray             Audit tray icon coverage
+  --verify-live-inventory  Verify live inventory matches rendered UI
+  --smoke                  Quick smoke test of inventory
+
+AGENT & BACKGROUND:
+  --register-agent         Register the boot agent
+  --verify-agent           Verify agent registration
+  --start-in-tray          Start the app minimized to tray
+  --agent                  Start as background agent
+
+GUI:
+  --ui-contract            Show the UI contract as JSON
+  --ui-self-test           Run UI self-tests
+
+SELF-TESTS:
+  --truth-self-test                Run truth verification tests
+  --inventory-self-test            Run inventory self-tests
+  --managed-startup-dedupe-self-test   Run managed startup deduplication tests
+  --state-store-self-test          Run state store self-tests
+  --release-gate-self-test         Run release gate security tests
+  --quiet-policy-probe             Probe quiet (tray) policy
+  --quiet-lineage-self-test        Run quiet lineage tests
+  --quiet-performance-probe        Probe quiet performance
+  --quiet-plan <base64>            Create a quiet launch plan
+
+INTERNAL:
+  --version                Show version
+  --help                   Show this help message
+  --shell-open <payload>   Open a file with shell execute
+  --state-store-worker     State store worker process
+  --tray-run               Run the tray application

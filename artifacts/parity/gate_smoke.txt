@@ -1,0 +1,1 @@
+SMOKE passed=true inventory=1069 invalid=0 duplicate_ids=0 provider_errors=0 type_init_failures=0 user=Admin appdata=C:\Users\Admin\AppData\Local\MichStartupMaster

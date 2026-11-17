@@ -1,0 +1,33 @@
+SOURCES count=32
+  Active Setup
+  Boot Execute
+  Context Menu Handler
+  Explorer Shell Extension
+  Explorer Startup Extension
+  Icon Service Library
+  Internet Explorer Add-on
+  Known DLL
+  LSA Startup Package
+  Media Codec
+  Network Provider
+  Packaged Startup Task
+  Print Monitor
+  Print Provider
+  Protocol Handler
+  Registry Run
+  Registry RunOnce
+  Scheduled Task
+  Scheduled Task (Any Trigger)
+  Security Provider
+  Service (Trigger Start)
+  Service Dependency
+  Stale Startup Metadata
+  Startup Approval
+  Startup Command
+  Startup Folder
+  System Driver
+  Terminal Server Startup
+  URL Search Hook
+  Windows Service
+  Winlogon Autostart
+  Winsock Provider

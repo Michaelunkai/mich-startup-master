@@ -1,0 +1,1 @@
+DETECT_NEW count=1 first=WinHttpAutoProxySvc (needed by iphlpsvc)

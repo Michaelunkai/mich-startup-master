@@ -1,4 +1,4 @@
-# Mich Startup Master 2.7
+# Mich Startup Master 3.0.0
 
 Mich Startup Master is a native Windows 11 control center for seeing and managing what starts with Windows. Version 2.3 separates two questions that startup tools often blur together:
 
@@ -6,6 +6,23 @@ Mich Startup Master is a native Windows 11 control center for seeing and managin
 - **Mode:** should the app open a normal window, or start quietly and stay available in the system tray?
 
 The default view is **All routes**: every discovered Windows startup registration is visible immediately, exactly once per registration. Opening the dashboard from its tray icon or using **Clear filters** also resets to that complete route-level view and clears stale search/drill-down state. **Apps** is an optional summary view; it groups exact routes by a proven installed-product path owner or the real executable behind a launcher, includes app-owned automatic services such as Logitech G HUB's updater, and can enable or disable every matching route for one app in a single rollback-safe transaction. Display-name similarity is never treated as ownership evidence.
+
+## What changed in 3.1.1
+- Fixed packaged (Store/MSIX) startup tasks such as WhatsApp: the package family name lost its underscore (`Name_PublisherId`), so the app read and wrote a non-existent AppModel State key. Those apps showed as enabled while Windows had them disabled, and Disable failed with an error. State now reads/writes the real key Windows Settings uses.
+- Duplicate-name rows no longer show internal identities such as `approval:startupapproval|VXNlcg==...`; they show the source and the registry/file name instead.
+
+- The quiet-tray audit now recognizes Tauri/tao tray icons (the `tray_icon_app` window class), so apps such as handy are no longer reported as missing an icon.
+
+## What changed in 3.0.0
+- Complete rewrite of the entire app in Rust (7 crates), replacing the previous C#/WinForms stack.
+- Single native 3.2 MB executable replaces the ~39 MB .NET build; no runtime or SDK required at runtime.
+- Startup inventory compatible with 2.10.1: same 31+ surfaces, same state stores, same CLI receipts.
+- One-click enable/disable with transactional rollback unchanged from prior versions.
+- Real-time registry/folder/task-catalog watchers with 1-second coalesce instead of polling.
+- Boot audit independent enumerators report gaps = 0 across every discovered surface.
+- Full safe suite passes all 21 tests against the new binary.
+- Faster full verify gate completes in seconds while proving the same search contract.
+- Same deploy path (`build\MichStartupMaster.exe`); the logon task keeps working without change.
 
 ## What changed in 2.7.1
 

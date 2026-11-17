@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "multiagents-peer": {
+      "command": "bun",
+      "args": [
+        "C:\\Users\\Admin\\.bun\\install\\global\\node_modules\\multiagents\\cli.ts",
+        "mcp-server",
+        "--agent-type",
+        "claude"
+      ]
+    }
+  }
+}

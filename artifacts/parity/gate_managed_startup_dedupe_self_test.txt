@@ -1,0 +1,1 @@
+MANAGED_DEDUPE_SELF_TEST checks=4 passed=4 exactOne=true staleAliasRetired=true conflictsFailClosed=true

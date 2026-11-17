@@ -1,0 +1,1 @@
+UI_SELF_TEST passed checks=13 passed=13 rowsRender=true mirrorCollapse=true bulkFailsClosedOnOrphan=true exportEscapes=true scales=100,150,200 startInTrayInitialVisible=false capabilityAwareActions=true expertConfirmation=true externalAuthority=true multiActionFailClosed=true

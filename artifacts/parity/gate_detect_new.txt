@@ -1,0 +1,1 @@
+DETECT_NEW count=45 first=Microsoft Windows Media Player

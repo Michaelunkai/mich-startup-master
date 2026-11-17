@@ -1,0 +1,1 @@
+{"passed":true,"exactArgv":false,"sameExecutableDifferentArgumentsIgnored":true,"argumentCaseDifferenceIgnored":true,"quotedArgumentBoundaryPreserved":true,"extraArgumentIgnored":true,"launchHashPathCaseInsensitive":true,"launchHashArgumentCaseSensitive":true,"launchHashQuotedBoundaryPreserved":true,"snapshotCalls":1,"tracked":[4100,4101,4102,4103],"externalProcessesStarted":0}

@@ -1,0 +1,1 @@
+RELEASE_GATE_SELF_TEST_OK passed=true normalOrder=true unauthorizedRejected=true childBypass=true heldGateRequired=true eventRequired=true oneShot=true tokenLeak=false boundedWaitMs=30000 externalProcessesStarted=0

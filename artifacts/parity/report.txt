@@ -1,0 +1,49 @@
+============================================================
+PARITY REPORT
+============================================================
+C# count : 1066
+Rust count: 1066
+
+C# dup-ID entries : 0
+Rust dup-ID entries: 0
+
+SOURCE HISTOGRAM:
+Source                                         C#     Rust     Diff
+Active Setup                                   18       18 +++++++0
+Boot Execute                                    3        3 +++++++0
+Context Menu Handler                           34       34 +++++++0
+Explorer Shell Extension                        2        2 +++++++0
+Explorer Startup Extension                      8        8 +++++++0
+Icon Service Library                            2        2 +++++++0
+Internet Explorer Add-on                        7        7 +++++++0
+Known DLL                                      38       38 +++++++0
+LSA Startup Package                             9        9 +++++++0
+Media Codec                                    72       72 +++++++0
+Network Provider                                4        4 +++++++0
+Packaged Startup Task                           4        4 +++++++0
+Print Monitor                                   6        6 +++++++0
+Print Provider                                  2        2 +++++++0
+Protocol Handler                               24       24 +++++++0
+Registry Run                                   21       21 +++++++0
+Registry RunOnce                                6        6 +++++++0
+Scheduled Task                                142      142 +++++++0
+Scheduled Task (Any Trigger)                  248      248 +++++++0
+Security Provider                               1        1 +++++++0
+Service (Trigger Start)                        89       89 +++++++0
+Service Dependency                             11       11 +++++++0
+Stale Startup Metadata                          3        3 +++++++0
+Startup Approval                                1        1 +++++++0
+Startup Command                                 1        1 +++++++0
+Startup Folder                                  5        5 +++++++0
+System Driver                                 166      166 +++++++0
+Terminal Server Startup                         1        1 +++++++0
+URL Search Hook                                 1        1 +++++++0
+Windows Service                               105      105 +++++++0
+Winlogon Autostart                              4        4 +++++++0
+Winsock Provider                               28       28 +++++++0
+
+IDs only in C# (first 0) : []
+IDs only in Rust (first 0): []
+
+
+============================================================

@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/msm-core",
+    "crates/msm-state",
+    "crates/msm-actions",
+    "crates/msm-watch",
+    "crates/msm-quiet",
+    "crates/msm-ui",
+    "crates/msm-app",
+]
+
+[workspace.package]
+version = "3.1.1"
+edition = "2021"
+rust-version = "1.85"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[workspace.dependencies]
+msm-core = { path = "crates/msm-core" }
+msm-state = { path = "crates/msm-state" }
+msm-actions = { path = "crates/msm-actions" }
+msm-watch = { path = "crates/msm-watch" }
+msm-quiet = { path = "crates/msm-quiet" }
+msm-ui = { path = "crates/msm-ui" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+base64 = "0.22"
+regex = "1"
+once_cell = "1"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Variant",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_Storage_FileSystem",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_Networking_WinSock",
+] }
+eframe = { version = "0.32", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "web_screen_reader", "x11"] }
+egui = { version = "0.32", features = ["accesskit"] }
+egui_extras = { version = "0.32", default-features = false }
+wmi = { version = "0.17", default-features = false }

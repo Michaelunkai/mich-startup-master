@@ -1,0 +1,16 @@
+[package]
+name = "msm-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+msm-core.workspace = true
+msm-state.workspace = true
+msm-actions.workspace = true
+msm-watch.workspace = true
+msm-quiet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+windows.workspace = true

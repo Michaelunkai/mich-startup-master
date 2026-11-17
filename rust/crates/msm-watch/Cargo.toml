@@ -1,0 +1,10 @@
+[package]
+name = "msm-watch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+msm-core.workspace = true
+msm-state.workspace = true
+once_cell.workspace = true
+windows.workspace = true
