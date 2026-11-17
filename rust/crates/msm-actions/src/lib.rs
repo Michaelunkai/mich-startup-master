@@ -6,6 +6,7 @@ pub mod managed;
 pub mod agent;
 pub mod reconcile;
 pub mod purge;
+pub mod erase;
 
 pub use mutation::*;
 

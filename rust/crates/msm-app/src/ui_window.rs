@@ -998,7 +998,7 @@ unsafe fn draw_list_row(item: &windows::Win32::UI::Controls::DRAWITEMSTRUCT) {
 
     // Impact (right-aligned before the toggle).
     let impact_color = match impact.as_str() {
-        "High impact" => DANGER, "Review" => ACCENT, _ => TEXT_MUTED,
+        "High impact" => DANGER, "Medium impact" => ACCENT, _ => TEXT_MUTED,
     };
     let _ = SetTextColor(context, COLORREF(impact_color));
     let iw = text_width(context, &impact, fonts.small);

@@ -59,6 +59,30 @@ impl StartupItem {
         }
     }
 
+    /// Estimated boot cost in ms (heuristic, not a trace): source base cost plus
+    /// ~4 ms per MB of the launched executable, 0 when not enabled.
+    pub fn boot_impact_ms(&self) -> u32 {
+        if !self.enabled || self.id.starts_with("error|") { return 0; }
+        let base: u32 = match self.source.as_str() {
+            "Windows Service" | "Service (Trigger Start)" => 120,
+            "System Driver" | "Boot Execute" | "LSA Startup Package" => 80,
+            "Scheduled Task" | "Packaged Startup Task" => 150,
+            "Registry Run" | "Startup Folder" | "Startup Command" | "Startup Approval" => 200,
+            "Registry RunOnce" | "Registry RunOnceEx" | "Active Setup" => 60,
+            "AppInit DLLs" | "Winlogon Autostart" | "Winlogon Notification" => 150,
+            _ => 30,
+        };
+        let mut mb = 0u64;
+        let cmd = self.command.trim();
+        let exe = crate::humans::try_split_command(cmd).map(|x| x.0).unwrap_or_else(|| cmd.to_string());
+        if let Ok(m) = std::fs::metadata(exe.trim_matches('"')) { mb = m.len() / (1024 * 1024); }
+        base + (mb.min(200) as u32) * 4
+    }
+
+    pub fn boot_impact_label(&self) -> &'static str {
+        match self.boot_impact_ms() { 0 => "None", 1..=149 => "Low", 150..=299 => "Medium", _ => "High" }
+    }
+
     pub fn human_name(&self) -> &str {
         if !self.app_name.trim().is_empty() {
             return &self.app_name;

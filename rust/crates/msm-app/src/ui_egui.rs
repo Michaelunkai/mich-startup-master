@@ -287,6 +287,8 @@ impl MsmApp {
 
     fn rebuild_rows(&mut self) {
         self.rows = view::build_visible_rows_sorted(&self.items, self.filter, &self.query, self.sort);
+        let base = self.items.iter().map(|x| msm_state::first_seen::utc_of(x)).filter(|v| *v > 0).min().unwrap_or(0);
+        BASELINE_NS.store(base as u64, std::sync::atomic::Ordering::Relaxed);
         if let Some(key) = &self.selected_key {
             if !self.rows.iter().any(|r| &r.key == key) {
                 self.selected_key = None;
@@ -396,13 +398,9 @@ impl MsmApp {
                 count, if count == 1 { "entry" } else { "entries" }, label),
             Some(undo_routes),
             move || {
-                let result = if enable_requested {
-                    msm_actions::enable_all_routes(&candidates, true)
-                        .or_else(|_| candidates.iter().filter(|c| !c.enabled).map(msm_actions::enable_forced).collect::<Result<Vec<_>, _>>().map(|v| v.len()))
-                } else {
-                    msm_actions::disable_all_routes(&candidates, true)
-                        .or_else(|_| candidates.iter().filter(|c| c.enabled).map(msm_actions::disable_forced).collect::<Result<Vec<_>, _>>().map(|v| v.len()))
-                };
+                // Best effort per route: one stubborn route never leaves the rest half done (no Mixed).
+                let (done, failures) = msm_actions::set_routes_best_effort(&candidates, enable_requested);
+                let result: Result<usize, String> = if done == 0 && !failures.is_empty() { Err(failures.join(" | ")) } else { Ok(done) };
                 result.map(|applied| (format!("{} {} startup {} for {}.", if enable_requested { "Enabled" } else { "Disabled" }, applied,
                     if applied == 1 { "entry" } else { "entries" }, label),
                     Some(UndoAction::Toggle { routes: candidates.clone(), now_enabled: enable_requested })))
@@ -704,6 +702,17 @@ impl eframe::App for MsmApp {
     }
 }
 
+/// Earliest first-seen stamp (ns): rows first seen later than this + 60 s are "new".
+static PURGE_ARMED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static BASELINE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn is_new_row(row: &InventoryRow) -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let base = BASELINE_NS.load(std::sync::atomic::Ordering::Relaxed) as u128;
+    let seen = row.routes.iter().map(msm_state::first_seen::utc_of).max().unwrap_or(0);
+    seen > 0 && seen > base + 60_000_000_000 && now.saturating_sub(seen) < 86_400_000_000_000
+}
+
 impl MsmApp {
     fn global_keys(&mut self, ctx: &Context) {
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
@@ -716,6 +725,14 @@ impl MsmApp {
         }
         if ctrl && ctx.input(|i| i.key_pressed(egui::Key::V)) && !text_focused {
             self.paste_and_add(ctx);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F5)) || (ctrl && ctx.input(|i| i.key_pressed(egui::Key::R))) {
+            self.kick_scan(ctx);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) && !text_focused {
+            if let Some(index) = self.selected_index() {
+                self.toggle_row(ctx, index);
+            }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !text_focused {
             if let Some(index) = self.selected_index() {
@@ -982,7 +999,13 @@ impl MsmApp {
             Pos2::new(rect.min.x + c.schedule_x - 110.0, rect.min.y + c.row_h));
         let clip = ui.painter().with_clip_rect(text_zone);
         let name_galley = elide(ui, &row.display_name, FontId::new(14.5, f_semi()), TEXT_MAIN, text_zone.width());
+        let name_w = name_galley.size().x;
         clip.galley(Pos2::new(text_zone.min.x, text_zone.min.y), name_galley, TEXT_MAIN);
+        if is_new_row(row) && name_w + 44.0 < text_zone.width() {
+            let b = Rect::from_min_size(Pos2::new(text_zone.min.x + name_w + 8.0, text_zone.min.y + 2.0), Vec2::new(34.0, 17.0));
+            painter.rect_filled(b, 5.0, mix(SURFACE_2, ACCENT, 0.35));
+            painter.text(b.center(), Align2::CENTER_CENTER, "NEW", FontId::new(10.5, f_semi()), TEXT_MAIN);
+        }
         let entry_text = entry_hint(row.primary_item());
         let entry_galley = elide(ui, &entry_text, FontId::new(12.0, f_mono()), TEXT_MUTED, text_zone.width());
         clip.galley(Pos2::new(text_zone.min.x, text_zone.min.y + 26.0), entry_galley, TEXT_MUTED);
@@ -1028,7 +1051,7 @@ impl MsmApp {
 
         // Impact, right-aligned before the toggle (aligned with its header).
         let impact = row.aggregate_impact_text();
-        let impact_color = match impact.as_str() { "High impact" => DANGER, "Review" => ACCENT, _ => TEXT_MUTED };
+        let impact_color = match impact.as_str() { "High impact" => DANGER, "Medium impact" => ACCENT, _ => TEXT_MUTED };
         let iw = measure(ui, &impact, FontId::new(11.5, f_medium()));
         painter.text(Pos2::new(rect.min.x + c.toggle_x - 26.0 - iw, center_y - 7.0), Align2::LEFT_TOP,
             &impact, FontId::new(11.5, f_medium()), impact_color);
@@ -1187,11 +1210,18 @@ impl MsmApp {
             self.hide_row(ctx, row);
             ui.close_menu();
         }
-        let purge_label = egui::RichText::new("Purge everywhere \u{2014} gone for good")
+        // Two-click confirm: first click arms, second click erases everything.
+        let armed = PURGE_ARMED.lock().map(|k| *k == row.key).unwrap_or(false);
+        let purge_label = egui::RichText::new(if armed { "Click again: DELETE EVERYTHING for this app" } else { "Delete everything \u{2014} gone for good" })
             .family(f_medium()).color(DANGER);
         if ui.add(egui::Button::new(purge_label)).clicked() {
-            self.purge_row(ctx, row);
-            ui.close_menu();
+            if armed {
+                if let Ok(mut k) = PURGE_ARMED.lock() { k.clear(); }
+                self.purge_row(ctx, row);
+                ui.close_menu();
+            } else if let Ok(mut k) = PURGE_ARMED.lock() {
+                *k = row.key.clone();
+            }
         }
     }
 

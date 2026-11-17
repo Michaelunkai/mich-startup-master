@@ -151,6 +151,10 @@ pub fn purge_all(routes: &[StartupItem], label: &str) -> Result<PurgeReceipt, St
         .map_err(|e| format!("Purge completed but the backup could not be written: {}", e))
         .and_then(|json| std::fs::write(&path, json).map_err(|e| format!("Purge completed but the backup could not be written: {}", e)))?;
     receipt.backup_id = backup_id;
+    // Phase 5: permanent erase of everything left in Windows (folders, services, registry).
+    for line in super::erase::erase_traces(&owned) {
+        if line.starts_with("FAILED") { receipt.errors.push(line); } else { receipt.removed += 1; }
+    }
     if receipt.removed == 0 && receipt.errors.len() == owned.len() {
         return Err(format!("Nothing could be purged. {}", receipt.errors.join(" | ")));
     }

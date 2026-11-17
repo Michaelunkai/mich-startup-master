@@ -18,8 +18,8 @@ pub fn to_json(items: &[StartupItem]) -> String {
             esc(&x.source), esc(&x.scope), esc(&x.registry_view), esc(&x.location), b(x.enabled), b(x.can_disable)));
         out.push_str(&format!(",\"mutationCapability\":\"{}\",\"mutationReason\":\"{}\",\"requiresExpertConfirmation\":{},\"requiresElevation\":{},\"requiresReboot\":{},\"externalAuthority\":\"{}\"",
             esc(&x.mutation_capability), esc(&x.mutation_reason), b(x.requires_expert_confirmation), b(x.requires_elevation), b(x.requires_reboot), esc(&x.external_authority)));
-        out.push_str(&format!(",\"command\":\"{}\",\"status\":\"{}\",\"popup\":\"{}\",\"risk\":\"{}\",\"riskLabel\":\"{}\",\"riskReason\":\"{}\",\"advice\":\"{}\",\"adviceLabel\":\"{}\",\"adviceReason\":\"{}\"}}",
-            esc(&x.command), esc(&x.status), x.popup_label(), esc(x.risk_level()), esc(x.risk_label()), esc(x.risk_reason()), esc(x.advice_level()), esc(x.advice_label()), esc(&x.advice_reason())));
+        out.push_str(&format!(",\"bootImpact\":\"{}\",\"bootImpactMs\":{},\"command\":\"{}\",\"status\":\"{}\",\"popup\":\"{}\",\"risk\":\"{}\",\"riskLabel\":\"{}\",\"riskReason\":\"{}\",\"advice\":\"{}\",\"adviceLabel\":\"{}\",\"adviceReason\":\"{}\"}}",
+            x.boot_impact_label(), x.boot_impact_ms(), esc(&x.command), esc(&x.status), x.popup_label(), esc(x.risk_level()), esc(x.risk_label()), esc(x.risk_reason()), esc(x.advice_level()), esc(x.advice_label()), esc(&x.advice_reason())));
     }
     out.push(']');
     out

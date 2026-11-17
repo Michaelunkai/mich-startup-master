@@ -79,7 +79,7 @@ impl InventoryRow {
     }
 
     pub fn aggregate_impact_text(&self) -> String {
-        let highest = self.routes.iter().max_by_key(|x| route_severity(x)).unwrap_or(&self.routes[0]);
+        let highest = self.routes.iter().max_by_key(|x| x.boot_impact_ms()).unwrap_or(&self.routes[0]);
         impact_text(highest)
     }
 
@@ -166,11 +166,11 @@ fn mode_text(item: &StartupItem) -> String {
 }
 
 fn impact_text(item: &StartupItem) -> String {
-    match item.risk_level() {
-        "Critical" => "High impact".into(),
-        "Review" => "Review".into(),
-        "System" => "System".into(),
-        _ => "Normal".into(),
+    match item.boot_impact_label() {
+        "High" => "High impact".into(),
+        "Medium" => "Medium impact".into(),
+        "Low" => "Low impact".into(),
+        _ => "None".into(),
     }
 }
 
@@ -353,7 +353,7 @@ pub fn build_visible_rows_sorted(items: &[StartupItem], filter: &str, query: &st
         };
     }
     let first_seen_of = |row: &InventoryRow| row.routes.iter().map(msm_state::first_seen::utc_of).max().unwrap_or(0);
-    let impact_rank = |row: &InventoryRow| row.routes.iter().map(route_severity).max().unwrap_or(1);
+    let impact_rank = |row: &InventoryRow| row.routes.iter().map(|x| x.boot_impact_ms()).max().unwrap_or(0);
     match sort {
         SortMode::Name => rows.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase())
             .then_with(|| a.target_identity.to_lowercase().cmp(&b.target_identity.to_lowercase()))),

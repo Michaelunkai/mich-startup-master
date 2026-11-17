@@ -241,7 +241,47 @@ fn list_sources() -> i32 {
     sources.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
     sources.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     println!("SOURCES count={}", sources.len());
-    for source in sources { println!("  {}", source); }
+    for source in &sources { println!("  {}", source); }
+    // Coverage vs Autoruns categories: scanner implemented + live item count + live registry probe.
+    use msm_core::reg::{open_subkey, native_registry_view, RegRoot};
+    let view = native_registry_view();
+    let probe = |root: RegRoot, sub: &str| -> String {
+        match open_subkey(root, sub, view) {
+            Some(k) => format!("key present, {} values, {} subkeys", k.value_names().len(), k.subkey_names().len()),
+            None => "key absent".to_string(),
+        }
+    };
+    let count = |names: &[&str]| items.iter().filter(|x| names.iter().any(|n| x.source.eq_ignore_ascii_case(n))).count();
+    let hklm = RegRoot::LocalMachine; let hkcu = RegRoot::CurrentUser;
+    let rows: Vec<(&str, &[&str], String)> = vec![
+        ("Logon: Run (HKLM)", &["Registry Run"], probe(hklm, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")),
+        ("Logon: Run (HKCU)", &["Registry Run"], probe(hkcu, r"Software\Microsoft\Windows\CurrentVersion\Run")),
+        ("Logon: RunOnce", &["Registry RunOnce", "Registry RunOnceEx"], probe(hklm, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce")),
+        ("Logon: Startup folders", &["Startup Folder", "Startup Approval"], probe(hkcu, r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder")),
+        ("Logon: Winlogon Shell/Userinit", &["Winlogon Autostart", "Winlogon Notification"], probe(hklm, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon")),
+        ("Logon: Active Setup", &["Active Setup"], probe(hklm, r"SOFTWARE\Microsoft\Active Setup\Installed Components")),
+        ("Scheduled Tasks", &["Scheduled Task", "Scheduled Task (Any Trigger)", "Packaged Startup Task"], "Task Scheduler COM".to_string()),
+        ("Services", &["Windows Service", "Service (Trigger Start)", "Service Dependency"], probe(hklm, r"SYSTEM\CurrentControlSet\Services")),
+        ("Drivers", &["System Driver"], probe(hklm, r"SYSTEM\CurrentControlSet\Services")),
+        ("Boot Execute", &["Boot Execute"], probe(hklm, r"SYSTEM\CurrentControlSet\Control\Session Manager")),
+        ("Image Hijacks (IFEO)", &["Image Hijack"], probe(hklm, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options")),
+        ("AppInit DLLs", &["AppInit DLLs"], probe(hklm, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows")),
+        ("AppCert DLLs", &["AppCert DLLs"], probe(hklm, r"SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls")),
+        ("Known DLLs", &["Known DLL"], probe(hklm, r"SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs")),
+        ("Explorer shell extensions", &["Explorer Shell Extension", "Explorer Startup Extension", "Context Menu Handler", "Protocol Handler"], probe(hklm, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved")),
+        ("Browser helper objects / IE", &["Internet Explorer Add-on", "URL Search Hook"], probe(hklm, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects")),
+        ("Winsock providers", &["Winsock Provider"], probe(hklm, r"SYSTEM\CurrentControlSet\Services\WinSock2\Parameters\Protocol_Catalog9")),
+        ("Print monitors/providers", &["Print Monitor", "Print Provider"], probe(hklm, r"SYSTEM\CurrentControlSet\Control\Print\Monitors")),
+        ("LSA / security / network providers", &["LSA Startup Package", "Security Provider", "Network Provider"], probe(hklm, r"SYSTEM\CurrentControlSet\Control\Lsa")),
+        ("Codecs", &["Media Codec"], probe(hklm, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Drivers32")),
+        ("WMI event consumers", &["WMI Event Consumer"], "WMI root-subscription".to_string()),
+        ("Group Policy scripts", &["Group Policy Script"], probe(hklm, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\Scripts")),
+        ("Terminal Server startup", &["Terminal Server Startup"], probe(hklm, r"SYSTEM\CurrentControlSet\Control\Terminal Server\Wds-rdpwd")),
+    ];
+    println!("COVERAGE categories={} (scanner=implemented; live_items = items found by scan_all now)", rows.len());
+    for (cat, srcs, p) in &rows {
+        println!("  {} | scanner=yes | live_items={} | {}", cat, count(srcs), p);
+    }
     0
 }
 
@@ -417,6 +457,15 @@ fn purge_key(args: &[String]) -> i32 {
             .collect();
     }
     if matches.is_empty() { println!("startup item not found: {}", key); return 4; }
+    // Same application = same install root: pull in every other route of it (tasks, services, ...).
+    let roots: Vec<String> = matches.iter().map(|m| m.application_root.trim().to_lowercase()).filter(|r| !r.is_empty()).collect();
+    if !roots.is_empty() {
+        for x in msm_core::scan::scan_all() {
+            if roots.contains(&x.application_root.trim().to_lowercase()) && !matches.iter().any(|m| m.id.eq_ignore_ascii_case(&x.id)) {
+                matches.push(x);
+            }
+        }
+    }
     let label = matches[0].human_name().to_string();
     match msm_actions::purge::purge_all(&matches, &label) {
         Ok(receipt) => {
@@ -424,6 +473,7 @@ fn purge_key(args: &[String]) -> i32 {
                 .filter(|x| matches.iter().any(|m| x.id.eq_ignore_ascii_case(&m.id))).count();
             println!("PURGE label={} removed={} backup={} denied_keys={} remaining={} errors={}",
                 receipt.label, receipt.removed, receipt.backup_id, receipt.errors.is_empty(), remaining, receipt.errors.len());
+            for e in &receipt.errors { println!("PURGE_ERROR {}", e); }
             if remaining == 0 { 0 } else { 3 }
         }
         Err(e) => { println!("PURGE_FAILED error={}", e); 3 }

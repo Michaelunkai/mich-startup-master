@@ -1226,6 +1226,21 @@ fn bulk_component_index(item: &StartupItem) -> i64 {
     -1
 }
 
+/// Best-effort one-click verb: every route is attempted independently (forced, snapshot+rollback
+/// per route), so one stubborn route can never leave the others half done. Returns (applied, failures).
+pub fn set_routes_best_effort(routes: &[StartupItem], enabled_state: bool) -> (usize, Vec<String>) {
+    let mut applied = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for route in routes.iter().filter(|r| r.enabled != enabled_state) {
+        let result = if enabled_state { enable_forced(route) } else { disable_forced(route) };
+        match result {
+            Ok(()) => applied += 1,
+            Err(error) => failures.push(format!("{}: {}", if route.location.is_empty() { &route.id } else { &route.location }, error)),
+        }
+    }
+    (applied, failures)
+}
+
 pub fn disable_all_routes(routes: &[StartupItem], expert_confirmed: bool) -> Result<usize, String> {
     set_all_routes_enabled(routes, false, expert_confirmed)
 }
